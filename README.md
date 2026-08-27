@@ -11,6 +11,8 @@
 - `market.hithink_limit_down_pool`：每个采集节点的官方跌停池。
 - `market.hithink_market_state`：每个成功节点聚合成一行的全市场状态。
 - `market.trading_calendar`：同花顺交易日历的本地事实缓存。
+- `market.hithink_sector_index_snapshot`：同编号板块指数的外部事实快照。
+- `market.hithink_concept_state`、`market.hithink_industry_state`、`market.hithink_style_state`：按同编号聚合的三类板块状态。
 
 所有快照层统一使用 `collection_id`：
 
@@ -21,6 +23,8 @@ YYYYMMDD001 ... YYYYMMDD254
 编号与计划时间永久一一对应。节点失败时，计划表保留失败编号，数据表不补空行，下一节点仍使用自己的编号。跨表聚合只按同一个 `collection_id` 关联。
 
 完整字段和派生口径见 [全市场状态表派生逻辑](docs/hithink_market_state_derivation.md)，DDL 见 [ClickHouse 结构](sql/hithink_snapshot.sql)。
+
+板块体系同样使用既有 `collection_id`，不另建时间轴。完整口径见 [板块状态派生逻辑](docs/hithink_sector_state_derivation.md)。
 
 ## 常驻运行
 

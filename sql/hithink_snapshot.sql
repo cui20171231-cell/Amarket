@@ -397,6 +397,135 @@ ENGINE = ReplacingMergeTree(version_time)
 PARTITION BY toYYYYMM(trade_date)
 ORDER BY (trade_date, scheduled_time);
 
+CREATE TABLE IF NOT EXISTS market.hithink_sector_index_snapshot
+(
+    trade_date Date,
+    collection_id FixedString(11),
+    scheduled_time DateTime64(3, 'Asia/Shanghai'),
+    source_timestamp UInt64,
+    source_time DateTime64(3, 'Asia/Shanghai'),
+    session LowCardinality(String),
+    batch_id String,
+    sector_code String,
+    sector_name String,
+    sector_type LowCardinality(String),
+    source_tag LowCardinality(String),
+    last_price Nullable(Float64),
+    price_change Nullable(Float64),
+    price_change_ratio_pct Nullable(Float64),
+    open_price Nullable(Float64),
+    high_price Nullable(Float64),
+    low_price Nullable(Float64),
+    prev_price Nullable(Float64),
+    volume Nullable(UInt64),
+    turnover Nullable(Float64),
+    ingest_time DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3),
+    version_time DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree(version_time)
+PARTITION BY toYYYYMM(trade_date)
+ORDER BY (trade_date, collection_id, sector_type, sector_code);
+
+CREATE TABLE IF NOT EXISTS market.hithink_concept_state
+(
+    trade_date Date,
+    collection_id FixedString(11),
+    scheduled_time DateTime64(3, 'Asia/Shanghai'),
+    stock_source_time DateTime64(3, 'Asia/Shanghai'),
+    index_source_time Nullable(DateTime64(3, 'Asia/Shanghai')),
+    session LowCardinality(String),
+    sector_code String,
+    sector_name String,
+    member_total UInt32,
+    valid_member_count UInt32,
+    valid_member_ratio Float64,
+    index_last_price Nullable(Float64),
+    index_change_ratio_pct Nullable(Float64),
+    index_change_1m_pct Nullable(Float64),
+    up_count UInt32,
+    down_count UInt32,
+    flat_count UInt32,
+    up_ratio Float64,
+    down_ratio Float64,
+    limit_up_count Nullable(UInt32),
+    up_5_to_limit_count Nullable(UInt32),
+    up_1_to_5_count UInt32,
+    up_0_to_1_count UInt32,
+    down_0_to_1_count UInt32,
+    down_1_to_5_count UInt32,
+    down_5_to_limit_count Nullable(UInt32),
+    limit_down_count Nullable(UInt32),
+    turnover_total Float64,
+    turnover_delta_1m_total Nullable(Float64),
+    prev_turnover_delta_1m_total Nullable(Float64),
+    turnover_growth_1m Nullable(Float64),
+    volume_total UInt64,
+    volume_delta_1m_total Nullable(Int64),
+    turnover_market_share_pct Nullable(Float64),
+    turnover_1m_market_share_pct Nullable(Float64),
+    prev_day_same_time_turnover Nullable(Float64),
+    turnover_vs_prev_day_delta Nullable(Float64),
+    turnover_vs_prev_day_pct Nullable(Float64),
+    turnover_accel_count Nullable(UInt32),
+    turnover_decel_count Nullable(UInt32),
+    turnover_accel_50_count Nullable(UInt32),
+    turnover_accel_100_count Nullable(UInt32),
+    volume_expand_count Nullable(UInt32),
+    volume_contract_count Nullable(UInt32),
+    volume_ratio_1_5_count Nullable(UInt32),
+    volume_ratio_2_count Nullable(UInt32),
+    volume_ratio_3_count Nullable(UInt32),
+    new_high_count Nullable(UInt32),
+    new_low_count Nullable(UInt32),
+    new_high_ratio Nullable(Float64),
+    new_low_ratio Nullable(Float64),
+    price_up_1m_count Nullable(UInt32),
+    price_down_1m_count Nullable(UInt32),
+    price_flat_1m_count Nullable(UInt32),
+    volume_price_up_count Nullable(UInt32),
+    volume_price_down_count Nullable(UInt32),
+    contract_price_up_count Nullable(UInt32),
+    contract_price_down_count Nullable(UInt32),
+    turnover_1m_top1_share_pct Nullable(Float64),
+    turnover_1m_top3_share_pct Nullable(Float64),
+    turnover_1m_top5_share_pct Nullable(Float64),
+    up_count_delta_1m Nullable(Int32),
+    down_count_delta_1m Nullable(Int32),
+    new_high_count_delta_1m Nullable(Int32),
+    new_low_count_delta_1m Nullable(Int32),
+    volume_price_up_delta_1m Nullable(Int32),
+    volume_price_down_delta_1m Nullable(Int32),
+    turnover_market_share_delta_1m Nullable(Float64),
+    turnover_1m_market_share_delta_1m Nullable(Float64),
+    calculated_at DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3),
+    version_time DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree(version_time)
+PARTITION BY toYYYYMM(trade_date)
+ORDER BY (trade_date, collection_id, sector_code);
+
+CREATE TABLE IF NOT EXISTS market.hithink_industry_state AS market.hithink_concept_state;
+CREATE TABLE IF NOT EXISTS market.hithink_style_state AS market.hithink_concept_state;
+
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_index_status LowCardinality(String) DEFAULT '' AFTER limit_down_api_duration_ms;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_index_received_count Nullable(UInt32) AFTER sector_index_status;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_index_api_duration_ms Nullable(UInt32) AFTER sector_index_received_count;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_state_status LowCardinality(String) DEFAULT '' AFTER sector_index_api_duration_ms;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_state_row_count Nullable(UInt32) AFTER sector_state_status;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_state_duration_ms Nullable(UInt32) AFTER sector_state_row_count;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_error_code Nullable(String) AFTER sector_state_duration_ms;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_error_message Nullable(String) AFTER sector_error_code;
+
+ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN last_price Nullable(Float64);
+ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN price_change Nullable(Float64);
+ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN price_change_ratio_pct Nullable(Float64);
+ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN open_price Nullable(Float64);
+ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN high_price Nullable(Float64);
+ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN low_price Nullable(Float64);
+ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN prev_price Nullable(Float64);
+ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN volume Nullable(UInt64);
+ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN turnover Nullable(Float64);
+
 ALTER TABLE market.hithink_limit_up_pool ADD COLUMN IF NOT EXISTS collection_id Nullable(FixedString(11)) AFTER trade_date;
 ALTER TABLE market.hithink_limit_up_pool ADD COLUMN IF NOT EXISTS scheduled_time Nullable(DateTime64(3, 'Asia/Shanghai')) AFTER collection_id;
 ALTER TABLE market.hithink_limit_up_pool ADD COLUMN IF NOT EXISTS batch_id Nullable(String) AFTER scheduled_time;

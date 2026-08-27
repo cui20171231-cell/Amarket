@@ -9,7 +9,7 @@ from typing import Any
 
 import clickhouse_connect
 
-from app.hithink.api import LimitPoolSnapshot
+from app.hithink.api import LimitPoolSnapshot, SectorIndexSnapshot
 from app.hithink.models import DerivedSnapshot, RawSnapshot
 from app.hithink.schedule import ScheduleNode
 
@@ -21,6 +21,12 @@ LIMIT_UP_POOL = "market.hithink_limit_up_pool"
 LIMIT_DOWN_POOL = "market.hithink_limit_down_pool"
 CALENDAR = "market.trading_calendar"
 DAILY_STATUS = "market.hithink_daily_sync_status"
+SECTOR_INDEX = "market.hithink_sector_index_snapshot"
+SECTOR_STATES = {
+    "concept": "market.hithink_concept_state",
+    "industry": "market.hithink_industry_state",
+    "style": "market.hithink_style_state",
+}
 
 
 class ClickHouseWriter:
@@ -273,10 +279,392 @@ class ClickHouseWriter:
         ]
         return self._insert_once(LIMIT_DOWN_POOL, rows, columns, batch_id=pool_batch)
 
+    def active_sector_catalog(self) -> list[tuple[str, str, str, str]]:
+        result = self.client.query(
+            """
+            SELECT sector_code, sector_name, sector_type, source_tag
+            FROM market.sector_catalog FINAL
+            WHERE is_active = 1 AND sector_type IN ('concept', 'industry', 'style')
+            ORDER BY sector_type, sector_code
+            """
+        )
+        return [(str(code), str(name), str(kind), str(tag)) for code, name, kind, tag in result.result_rows]
+
+    def insert_sector_index_once(
+        self,
+        node: ScheduleNode,
+        sectors: list[tuple[str, str, str, str]],
+        snapshot: SectorIndexSnapshot,
+    ) -> tuple[int, int]:
+        records = {str(record.item["thscode"]): record for record in snapshot.items}
+        if set(records) != {sector[0] for sector in sectors}:
+            raise RuntimeError("Sector index records do not match active sector catalog")
+        rows = []
+        for sector_code, sector_name, sector_type, source_tag in sectors:
+            record = records[sector_code]
+            item = record.item
+            rows.append(
+                (
+                    node.trade_date,
+                    node.collection_id,
+                    node.scheduled_time,
+                    record.source_timestamp,
+                    record.source_time,
+                    node.session,
+                    f"{node.collection_id}-sector-index",
+                    sector_code,
+                    sector_name,
+                    sector_type,
+                    source_tag,
+                    _optional_float(item.get("last_price")),
+                    _optional_float(item.get("price_change")),
+                    _optional_float(item.get("price_change_ratio_pct")),
+                    _optional_float(item.get("open_price")),
+                    _optional_float(item.get("high_price")),
+                    _optional_float(item.get("low_price")),
+                    _optional_float(item.get("prev_price")),
+                    _optional_int(item.get("volume")),
+                    _optional_float(item.get("turnover")),
+                )
+            )
+        columns = [
+            "trade_date", "collection_id", "scheduled_time", "source_timestamp", "source_time",
+            "session", "batch_id", "sector_code", "sector_name", "sector_type", "source_tag",
+            "last_price", "price_change", "price_change_ratio_pct", "open_price", "high_price",
+            "low_price", "prev_price", "volume", "turnover",
+        ]
+        return self._insert_once(
+            SECTOR_INDEX, rows, columns, batch_id=f"{node.collection_id}-sector-index"
+        )
+
     def limit_pool_collected(self, node: ScheduleNode) -> bool:
         return bool(
             self._scalar(
                 f"SELECT count() FROM {SCHEDULE} FINAL WHERE collection_id = {{collection_id:String}} AND limit_pool_collected = 1",
+                {"collection_id": node.collection_id},
+            )
+        )
+
+    def upsert_sector_state(
+        self, node: ScheduleNode, sector_type: str, limit_pool_available: bool
+    ) -> None:
+        try:
+            state_table = SECTOR_STATES[sector_type]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported sector type: {sector_type}") from exc
+        self.client.command(
+            f"""
+            INSERT INTO {state_table}
+            (
+                trade_date, collection_id, scheduled_time, stock_source_time, index_source_time,
+                session, sector_code, sector_name, member_total, valid_member_count,
+                valid_member_ratio, index_last_price, index_change_ratio_pct, index_change_1m_pct,
+                up_count, down_count, flat_count, up_ratio, down_ratio,
+                limit_up_count, up_5_to_limit_count, up_1_to_5_count, up_0_to_1_count,
+                down_0_to_1_count, down_1_to_5_count, down_5_to_limit_count, limit_down_count,
+                turnover_total, turnover_delta_1m_total, prev_turnover_delta_1m_total,
+                turnover_growth_1m, volume_total, volume_delta_1m_total,
+                turnover_market_share_pct, turnover_1m_market_share_pct,
+                prev_day_same_time_turnover, turnover_vs_prev_day_delta, turnover_vs_prev_day_pct,
+                turnover_accel_count, turnover_decel_count, turnover_accel_50_count,
+                turnover_accel_100_count, volume_expand_count, volume_contract_count,
+                volume_ratio_1_5_count, volume_ratio_2_count, volume_ratio_3_count,
+                new_high_count, new_low_count, new_high_ratio, new_low_ratio,
+                price_up_1m_count, price_down_1m_count, price_flat_1m_count,
+                volume_price_up_count, volume_price_down_count, contract_price_up_count,
+                contract_price_down_count, turnover_1m_top1_share_pct,
+                turnover_1m_top3_share_pct, turnover_1m_top5_share_pct,
+                up_count_delta_1m, down_count_delta_1m, new_high_count_delta_1m,
+                new_low_count_delta_1m, volume_price_up_delta_1m,
+                volume_price_down_delta_1m, turnover_market_share_delta_1m,
+                turnover_1m_market_share_delta_1m
+            )
+            WITH
+                previous AS
+                (
+                    SELECT * FROM {state_table} FINAL
+                    WHERE collection_id = {{previous_collection_id:String}}
+                ),
+                previous_trade_day AS
+                (
+                    SELECT sector_code, turnover_total
+                    FROM {state_table} FINAL
+                    WHERE collection_id = concat(
+                        formatDateTime(
+                            (
+                                SELECT max(trade_date)
+                                FROM {CALENDAR} FINAL
+                                WHERE trade_date < {{date:Date}} AND is_trading_day = 1
+                            ),
+                            '%Y%m%d'
+                        ),
+                        leftPad(toString({{sequence_no:UInt16}}), 3, '0')
+                    )
+                ),
+                member_rows AS
+                (
+                    SELECT
+                        catalog.sector_code AS sector_code,
+                        catalog.sector_name AS sector_name,
+                        membership.thscode AS member_thscode,
+                        derived.thscode AS snapshot_thscode,
+                        derived.source_time AS source_time,
+                        derived.price_change_ratio_pct AS price_change_ratio_pct,
+                        derived.turnover AS turnover,
+                        derived.volume AS volume,
+                        derived.turnover_delta_1m AS turnover_delta_1m,
+                        derived.volume_delta_1m AS volume_delta_1m,
+                        derived.turnover_growth_1m AS turnover_growth_1m,
+                        derived.volume_ratio_1m AS volume_ratio_1m,
+                        derived.new_high_flag AS new_high_flag,
+                        derived.new_low_flag AS new_low_flag,
+                        derived.price_delta_1m AS price_delta_1m
+                    FROM
+                    (
+                        SELECT * FROM market.sector_catalog FINAL
+                    ) AS catalog
+                    LEFT JOIN
+                    (
+                        SELECT * FROM market.sector_membership_history FINAL
+                    ) AS membership
+                        ON membership.sector_type = catalog.sector_type
+                        AND membership.sector_code = catalog.sector_code
+                        AND membership.observed_from <= {{date:Date}}
+                        AND (membership.observed_to > {{date:Date}} OR membership.observed_to IS NULL)
+                    LEFT JOIN
+                    (
+                        SELECT * FROM {DERIVED}
+                        WHERE collection_id = {{collection_id:String}}
+                    ) AS derived
+                        ON derived.collection_id = {{collection_id:String}}
+                        AND derived.thscode = membership.thscode
+                    WHERE catalog.sector_type = {{sector_type:String}}
+                      AND catalog.is_active = 1
+                ),
+                sector_current AS
+                (
+                    SELECT
+                        sector_code,
+                        any(sector_name) AS sector_name,
+                        max(source_time) AS stock_source_time,
+                        toUInt32(countIf(member_thscode IS NOT NULL)) AS member_total,
+                        toUInt32(countIf(price_change_ratio_pct IS NOT NULL)) AS valid_member_count,
+                        toUInt32(countIf(price_change_ratio_pct > 0)) AS up_count,
+                        toUInt32(countIf(price_change_ratio_pct < 0)) AS down_count,
+                        toUInt32(countIf(price_change_ratio_pct = 0)) AS flat_count,
+                        if({{pool_available:UInt8}} = 1,
+                            toUInt32(countIf(snapshot_thscode IN (SELECT DISTINCT thscode FROM {LIMIT_UP_POOL} FINAL WHERE collection_id = {{collection_id:String}}))),
+                            CAST(NULL, 'Nullable(UInt32)')) AS limit_up_count,
+                        if({{pool_available:UInt8}} = 1,
+                            toUInt32(countIf(price_change_ratio_pct >= 5 AND snapshot_thscode NOT IN (SELECT DISTINCT thscode FROM {LIMIT_UP_POOL} FINAL WHERE collection_id = {{collection_id:String}}))),
+                            CAST(NULL, 'Nullable(UInt32)')) AS up_5_to_limit_count,
+                        toUInt32(countIf(price_change_ratio_pct >= 1 AND price_change_ratio_pct < 5)) AS up_1_to_5_count,
+                        toUInt32(countIf(price_change_ratio_pct > 0 AND price_change_ratio_pct < 1)) AS up_0_to_1_count,
+                        toUInt32(countIf(price_change_ratio_pct < 0 AND price_change_ratio_pct > -1)) AS down_0_to_1_count,
+                        toUInt32(countIf(price_change_ratio_pct <= -1 AND price_change_ratio_pct > -5)) AS down_1_to_5_count,
+                        if({{pool_available:UInt8}} = 1,
+                            toUInt32(countIf(price_change_ratio_pct <= -5 AND snapshot_thscode NOT IN (SELECT DISTINCT thscode FROM {LIMIT_DOWN_POOL} FINAL WHERE collection_id = {{collection_id:String}}))),
+                            CAST(NULL, 'Nullable(UInt32)')) AS down_5_to_limit_count,
+                        if({{pool_available:UInt8}} = 1,
+                            toUInt32(countIf(snapshot_thscode IN (SELECT DISTINCT thscode FROM {LIMIT_DOWN_POOL} FINAL WHERE collection_id = {{collection_id:String}}))),
+                            CAST(NULL, 'Nullable(UInt32)')) AS limit_down_count,
+                        toFloat64(sum(turnover)) AS turnover_total,
+                        if(countIf(turnover_delta_1m IS NOT NULL) = 0,
+                            CAST(NULL, 'Nullable(Float64)'), toFloat64(sum(turnover_delta_1m))) AS turnover_delta_1m_total,
+                        toUInt64(sum(volume)) AS volume_total,
+                        if(countIf(volume_delta_1m IS NOT NULL) = 0,
+                            CAST(NULL, 'Nullable(Int64)'), toInt64(sum(volume_delta_1m))) AS volume_delta_1m_total,
+                        if(countIf(turnover_growth_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(turnover_growth_1m > 0))) AS turnover_accel_count,
+                        if(countIf(turnover_growth_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(turnover_growth_1m < 0))) AS turnover_decel_count,
+                        if(countIf(turnover_growth_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(turnover_growth_1m >= 0.5))) AS turnover_accel_50_count,
+                        if(countIf(turnover_growth_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(turnover_growth_1m >= 1))) AS turnover_accel_100_count,
+                        if(countIf(volume_ratio_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(volume_ratio_1m > 1))) AS volume_expand_count,
+                        if(countIf(volume_ratio_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(volume_ratio_1m < 1))) AS volume_contract_count,
+                        if(countIf(volume_ratio_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(volume_ratio_1m > 1.5))) AS volume_ratio_1_5_count,
+                        if(countIf(volume_ratio_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(volume_ratio_1m > 2))) AS volume_ratio_2_count,
+                        if(countIf(volume_ratio_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(volume_ratio_1m > 3))) AS volume_ratio_3_count,
+                        if(countIf(new_high_flag IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(new_high_flag = 1))) AS new_high_count,
+                        if(countIf(new_low_flag IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(new_low_flag = 1))) AS new_low_count,
+                        if(countIf(price_delta_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(price_delta_1m > 0))) AS price_up_1m_count,
+                        if(countIf(price_delta_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(price_delta_1m < 0))) AS price_down_1m_count,
+                        if(countIf(price_delta_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(price_delta_1m = 0))) AS price_flat_1m_count,
+                        if(countIf(volume_ratio_1m IS NOT NULL AND price_delta_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(volume_ratio_1m > 1 AND price_delta_1m > 0))) AS volume_price_up_count,
+                        if(countIf(volume_ratio_1m IS NOT NULL AND price_delta_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(volume_ratio_1m > 1 AND price_delta_1m < 0))) AS volume_price_down_count,
+                        if(countIf(volume_ratio_1m IS NOT NULL AND price_delta_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(volume_ratio_1m < 1 AND price_delta_1m > 0))) AS contract_price_up_count,
+                        if(countIf(volume_ratio_1m IS NOT NULL AND price_delta_1m IS NOT NULL) = 0, CAST(NULL, 'Nullable(UInt32)'), toUInt32(countIf(volume_ratio_1m < 1 AND price_delta_1m < 0))) AS contract_price_down_count,
+                        groupArrayIf(toFloat64(turnover_delta_1m), turnover_delta_1m IS NOT NULL) AS minute_turnovers
+                    FROM member_rows
+                    GROUP BY sector_code
+                ),
+                index_current AS
+                (
+                    SELECT sector_code, source_time, last_price, price_change_ratio_pct
+                    FROM {SECTOR_INDEX} FINAL
+                    WHERE collection_id = {{collection_id:String}}
+                      AND sector_type = {{sector_type:String}}
+                ),
+                market AS
+                (
+                    SELECT turnover_total, turnover_delta_1m_total
+                    FROM {MARKET_STATE} FINAL
+                    WHERE collection_id = {{collection_id:String}}
+                )
+            SELECT
+                {{date:Date}},
+                {{collection_id:String}},
+                {{time:DateTime64(3, 'Asia/Shanghai')}},
+                current.stock_source_time,
+                index_current.source_time,
+                {{session:String}},
+                current.sector_code,
+                current.sector_name,
+                current.member_total,
+                current.valid_member_count,
+                if(current.member_total > 0, current.valid_member_count / current.member_total, 0.0),
+                index_current.last_price,
+                index_current.price_change_ratio_pct,
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60
+                    AND previous.index_last_price > 0 AND index_current.last_price IS NOT NULL,
+                    (index_current.last_price / previous.index_last_price - 1) * 100,
+                    CAST(NULL, 'Nullable(Float64)')),
+                current.up_count,
+                current.down_count,
+                current.flat_count,
+                if(current.valid_member_count > 0, current.up_count / current.valid_member_count, 0.0),
+                if(current.valid_member_count > 0, current.down_count / current.valid_member_count, 0.0),
+                current.limit_up_count,
+                current.up_5_to_limit_count,
+                current.up_1_to_5_count,
+                current.up_0_to_1_count,
+                current.down_0_to_1_count,
+                current.down_1_to_5_count,
+                current.down_5_to_limit_count,
+                current.limit_down_count,
+                current.turnover_total,
+                current.turnover_delta_1m_total,
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60,
+                    previous.turnover_delta_1m_total, CAST(NULL, 'Nullable(Float64)')),
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60
+                    AND current.turnover_delta_1m_total IS NOT NULL AND previous.turnover_delta_1m_total > 0,
+                    current.turnover_delta_1m_total / previous.turnover_delta_1m_total - 1,
+                    CAST(NULL, 'Nullable(Float64)')),
+                current.volume_total,
+                current.volume_delta_1m_total,
+                if(market.turnover_total > 0, current.turnover_total / toFloat64(market.turnover_total) * 100, CAST(NULL, 'Nullable(Float64)')),
+                if(market.turnover_delta_1m_total > 0 AND current.turnover_delta_1m_total IS NOT NULL,
+                    current.turnover_delta_1m_total / toFloat64(market.turnover_delta_1m_total) * 100, CAST(NULL, 'Nullable(Float64)')),
+                previous_trade_day.turnover_total,
+                if(previous_trade_day.turnover_total IS NOT NULL, current.turnover_total - previous_trade_day.turnover_total, CAST(NULL, 'Nullable(Float64)')),
+                if(previous_trade_day.turnover_total > 0, (current.turnover_total - previous_trade_day.turnover_total) / previous_trade_day.turnover_total * 100, CAST(NULL, 'Nullable(Float64)')),
+                current.turnover_accel_count,
+                current.turnover_decel_count,
+                current.turnover_accel_50_count,
+                current.turnover_accel_100_count,
+                current.volume_expand_count,
+                current.volume_contract_count,
+                current.volume_ratio_1_5_count,
+                current.volume_ratio_2_count,
+                current.volume_ratio_3_count,
+                current.new_high_count,
+                current.new_low_count,
+                if(current.valid_member_count > 0 AND current.new_high_count IS NOT NULL, current.new_high_count / current.valid_member_count, CAST(NULL, 'Nullable(Float64)')),
+                if(current.valid_member_count > 0 AND current.new_low_count IS NOT NULL, current.new_low_count / current.valid_member_count, CAST(NULL, 'Nullable(Float64)')),
+                current.price_up_1m_count,
+                current.price_down_1m_count,
+                current.price_flat_1m_count,
+                current.volume_price_up_count,
+                current.volume_price_down_count,
+                current.contract_price_up_count,
+                current.contract_price_down_count,
+                if(length(current.minute_turnovers) > 0 AND arraySum(current.minute_turnovers) > 0,
+                    arrayElement(arrayReverseSort(current.minute_turnovers), 1) / arraySum(current.minute_turnovers) * 100, CAST(NULL, 'Nullable(Float64)')),
+                if(length(current.minute_turnovers) > 0 AND arraySum(current.minute_turnovers) > 0,
+                    arraySum(arraySlice(arrayReverseSort(current.minute_turnovers), 1, 3)) / arraySum(current.minute_turnovers) * 100, CAST(NULL, 'Nullable(Float64)')),
+                if(length(current.minute_turnovers) > 0 AND arraySum(current.minute_turnovers) > 0,
+                    arraySum(arraySlice(arrayReverseSort(current.minute_turnovers), 1, 5)) / arraySum(current.minute_turnovers) * 100, CAST(NULL, 'Nullable(Float64)')),
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60,
+                    CAST(toInt64(current.up_count) - toInt64(previous.up_count), 'Nullable(Int32)'), CAST(NULL, 'Nullable(Int32)')),
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60,
+                    CAST(toInt64(current.down_count) - toInt64(previous.down_count), 'Nullable(Int32)'), CAST(NULL, 'Nullable(Int32)')),
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60
+                    AND current.new_high_count IS NOT NULL AND previous.new_high_count IS NOT NULL,
+                    CAST(toInt64(current.new_high_count) - toInt64(previous.new_high_count), 'Nullable(Int32)'), CAST(NULL, 'Nullable(Int32)')),
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60
+                    AND current.new_low_count IS NOT NULL AND previous.new_low_count IS NOT NULL,
+                    CAST(toInt64(current.new_low_count) - toInt64(previous.new_low_count), 'Nullable(Int32)'), CAST(NULL, 'Nullable(Int32)')),
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60
+                    AND current.volume_price_up_count IS NOT NULL AND previous.volume_price_up_count IS NOT NULL,
+                    CAST(toInt64(current.volume_price_up_count) - toInt64(previous.volume_price_up_count), 'Nullable(Int32)'), CAST(NULL, 'Nullable(Int32)')),
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60
+                    AND current.volume_price_down_count IS NOT NULL AND previous.volume_price_down_count IS NOT NULL,
+                    CAST(toInt64(current.volume_price_down_count) - toInt64(previous.volume_price_down_count), 'Nullable(Int32)'), CAST(NULL, 'Nullable(Int32)')),
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60
+                    AND previous.turnover_market_share_pct IS NOT NULL AND market.turnover_total > 0,
+                    current.turnover_total / toFloat64(market.turnover_total) * 100 - previous.turnover_market_share_pct,
+                    CAST(NULL, 'Nullable(Float64)')),
+                if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
+                    AND dateDiff('second', previous.scheduled_time, {{time:DateTime64(3, 'Asia/Shanghai')}}) = 60
+                    AND previous.turnover_1m_market_share_pct IS NOT NULL
+                    AND market.turnover_delta_1m_total > 0 AND current.turnover_delta_1m_total IS NOT NULL,
+                    current.turnover_delta_1m_total / toFloat64(market.turnover_delta_1m_total) * 100 - previous.turnover_1m_market_share_pct,
+                    CAST(NULL, 'Nullable(Float64)'))
+            FROM sector_current AS current
+            LEFT JOIN index_current USING (sector_code)
+            LEFT JOIN previous USING (sector_code)
+            LEFT JOIN previous_trade_day USING (sector_code)
+            CROSS JOIN market
+            """,
+            parameters={
+                "date": node.trade_date,
+                "collection_id": node.collection_id,
+                "time": node.scheduled_time,
+                "session": node.session,
+                "sequence_no": node.sequence_no,
+                "previous_collection_id": (
+                    f"{node.trade_date:%Y%m%d}{node.sequence_no - 1:03d}"
+                    if node.sequence_no > 1
+                    else ""
+                ),
+                "sector_type": sector_type,
+                "pool_available": int(limit_pool_available),
+            },
+        )
+
+    def sector_state_count(self, node: ScheduleNode, sector_type: str) -> int:
+        return self._scalar(
+            f"SELECT count() FROM {SECTOR_STATES[sector_type]} FINAL WHERE collection_id = {{collection_id:String}}",
+            {"collection_id": node.collection_id},
+        )
+
+    def successful_schedule_node(self, trade_date: object, sequence_no: int) -> ScheduleNode | None:
+        result = self.client.query(
+            f"""
+            SELECT scheduled_time, session, sequence_no
+            FROM {SCHEDULE} FINAL
+            WHERE trade_date = {{date:Date}} AND sequence_no = {{sequence_no:UInt16}}
+              AND status = 'SUCCESS'
+            """,
+            parameters={"date": trade_date, "sequence_no": sequence_no},
+        ).result_rows
+        if not result:
+            return None
+        scheduled_time, session, found_sequence = result[0]
+        return ScheduleNode(trade_date, scheduled_time, session, found_sequence)
+
+    def sector_pipeline_succeeded(self, node: ScheduleNode) -> bool:
+        return bool(
+            self._scalar(
+                f"SELECT count() FROM {SCHEDULE} FINAL WHERE collection_id = {{collection_id:String}} AND sector_state_status = 'SUCCESS'",
                 {"collection_id": node.collection_id},
             )
         )

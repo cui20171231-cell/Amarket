@@ -43,6 +43,11 @@ def parser() -> argparse.ArgumentParser:
         "migrate-collection-ids", help="backfill YYYYMMDD001-YYYYMMDD254 identifiers"
     )
     migrate.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
+    baseline = sub.add_parser(
+        "closing-baseline",
+        help="create the current day's one real post-close baseline at collection sequence 254",
+    )
+    baseline.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
     membership = sub.add_parser("sector-membership", help="query sector memberships valid on a date")
     membership.add_argument("thscode")
     membership.add_argument("target_date", type=lambda value: datetime.fromisoformat(value).date())
@@ -109,6 +114,10 @@ def main() -> None:
                 return
             if args.command == "serve":
                 CollectorRunner(api, writer).serve_forever()
+                return
+            if args.command == "closing-baseline":
+                trade_date = args.trade_date or datetime.now(SHANGHAI).date()
+                CollectorRunner(api, writer).run_closing_baseline(trade_date)
                 return
             trade_date = args.trade_date or datetime.now(SHANGHAI).date()
             CollectorRunner(api, writer).run_day(trade_date, args.not_before)

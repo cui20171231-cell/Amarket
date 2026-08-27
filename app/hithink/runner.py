@@ -14,6 +14,7 @@ from app.hithink.schedule import (
     allows_one_minute_derivation,
     build_daily_schedule,
 )
+from app.hithink.sector_pipeline import SectorPipeline
 from app.hithink.writer import ClickHouseWriter
 
 LOG = logging.getLogger(__name__)
@@ -47,6 +48,20 @@ class CollectorRunner:
                 sleep(delay)
             previous = nodes[index - 1] if index else None
             self.run_node(node, previous)
+
+    def run_closing_baseline(self, trade_date: object) -> None:
+        if trade_date != datetime.now(SHANGHAI).date():
+            raise RuntimeError("Closing baseline is only allowed for the current trading day")
+        node = build_daily_schedule(trade_date)[-1]
+        if datetime.now(SHANGHAI) < node.scheduled_time:
+            raise RuntimeError("Closing baseline is only allowed after the 15:00 planned node")
+        if (
+            self.writer.statuses(trade_date).get(node.scheduled_time) == "SUCCESS"
+            and self.writer.sector_pipeline_succeeded(node)
+        ):
+            LOG.info("Closing baseline already exists collection_id=%s", node.collection_id)
+            return
+        self.run_node(node, previous_node=None)
 
     def serve_forever(self) -> None:
         """Stay online; create a schedule only after calendar-gate confirmation."""
@@ -147,6 +162,27 @@ class CollectorRunner:
             self.writer.insert_limit_up_pool(node, batch_id, limit_up)
             self.writer.insert_limit_down_pool(node, batch_id, limit_down)
             self.writer.upsert_market_state(node, limit_pool_available=True)
+            sector_values: dict[str, object]
+            try:
+                sector = SectorPipeline(self.api, self.writer).collect_and_derive(
+                    node, limit_pool_available=True
+                )
+                sector_values = {
+                    "sector_index_status": "SUCCESS",
+                    "sector_index_received_count": sector.index_rows,
+                    "sector_index_api_duration_ms": sector.index_duration_ms,
+                    "sector_state_status": "SUCCESS",
+                    "sector_state_row_count": sector.state_rows,
+                    "sector_state_duration_ms": sector.state_duration_ms,
+                }
+            except Exception as exc:
+                LOG.exception("SECTOR_FAILED sequence=%s", node.sequence_no)
+                sector_values = {
+                    "sector_index_status": "FAILED",
+                    "sector_state_status": "FAILED",
+                    "sector_error_code": "SECTOR_PIPELINE_ERROR",
+                    "sector_error_message": str(exc)[:1000],
+                }
             self.writer.set_schedule_status(
                 node,
                 "SUCCESS",
@@ -172,6 +208,7 @@ class CollectorRunner:
                 limit_down_received_count=limit_down.total,
                 limit_up_api_duration_ms=limit_up.duration_ms,
                 limit_down_api_duration_ms=limit_down.duration_ms,
+                **sector_values,
             )
             LOG.info(
                 "SUCCESS sequence=%s count=%s total_ms=%s",

@@ -12,6 +12,7 @@ from app.hithink.schedule import SHANGHAI
 URL = "https://fuyao.aicubes.cn/api/a-share/prices/snapshot?limit=10000&offset=0"
 TRADING_DAYS_URL = "https://fuyao.aicubes.cn/api/a-share/calendar/trading-days"
 LIMIT_POOL_URL = "https://fuyao.aicubes.cn/api/a-share/special-data/{pool_name}"
+SECTOR_INDEX_SNAPSHOT_URL = "https://fuyao.aicubes.cn/api/a-share-index/prices/snapshot"
 DUMP_URLS = {
     "daily_k": "https://fuyao.aicubes.cn/api/dump/market-dumps/daily-k/download-url",
     "daily_k_10d": "https://fuyao.aicubes.cn/api/dump/market-dumps/daily-k-10d/download-url",
@@ -64,6 +65,21 @@ class LimitPoolSnapshot:
     source_time: datetime
     total: int
     items: list[LimitPoolItem]
+    duration_ms: int
+    retry_count: int
+
+
+@dataclass(frozen=True)
+class SectorIndexItem:
+    item: dict[str, Any]
+    source_timestamp: int
+    source_time: datetime
+
+
+@dataclass(frozen=True)
+class SectorIndexSnapshot:
+    total: int
+    items: list[SectorIndexItem]
     duration_ms: int
     retry_count: int
 
@@ -207,6 +223,79 @@ class HithinkClient:
                     source_time=latest_source_time,
                     total=expected_total,
                     items=collected,
+                    duration_ms=round((perf_counter() - started) * 1000),
+                    retry_count=attempt,
+                )
+            except (httpx.HTTPError, ValueError, KeyError, HithinkApiError) as exc:
+                error = exc if isinstance(exc, HithinkApiError) else HithinkApiError(None, str(exc))
+                last_error = error
+                if error.code not in RETRYABLE_CODES and error.code is not None:
+                    break
+        assert last_error is not None
+        raise last_error
+
+    def fetch_sector_index_snapshot(
+        self, sector_codes: list[str], batch_size: int = 600
+    ) -> SectorIndexSnapshot:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        requested = list(dict.fromkeys(sector_codes))
+        if not requested:
+            return SectorIndexSnapshot(total=0, items=[], duration_ms=0, retry_count=0)
+
+        started = perf_counter()
+        collected: list[SectorIndexItem] = []
+        retries = 0
+        for offset in range(0, len(requested), batch_size):
+            batch = requested[offset : offset + batch_size]
+            result = self._fetch_sector_index_batch(batch)
+            collected.extend(result.items)
+            retries += result.retry_count
+
+        returned_codes = [str(record.item["thscode"]) for record in collected]
+        if len(returned_codes) != len(requested) or set(returned_codes) != set(requested):
+            missing = sorted(set(requested) - set(returned_codes))
+            unexpected = sorted(set(returned_codes) - set(requested))
+            raise HithinkApiError(
+                None,
+                f"Sector index response mismatch missing={missing[:5]} unexpected={unexpected[:5]}",
+            )
+        if len(returned_codes) != len(set(returned_codes)):
+            raise HithinkApiError(None, "Sector index response contains duplicate codes")
+        return SectorIndexSnapshot(
+            total=len(collected),
+            items=collected,
+            duration_ms=round((perf_counter() - started) * 1000),
+            retry_count=retries,
+        )
+
+    def _fetch_sector_index_batch(self, sector_codes: list[str]) -> SectorIndexSnapshot:
+        last_error: HithinkApiError | None = None
+        for attempt, pause_seconds in enumerate((0, 1, 2, 4)):
+            if pause_seconds:
+                sleep(pause_seconds)
+            started = perf_counter()
+            try:
+                response = self.client.get(
+                    SECTOR_INDEX_SNAPSHOT_URL, params={"thscodes": ",".join(sector_codes)}
+                )
+                payload = response.json()
+                code = int(payload.get("code", response.status_code))
+                if response.status_code >= 400 or code != 0:
+                    raise HithinkApiError(code, str(payload.get("message", response.text[:300])))
+                data = payload.get("data") or {}
+                items = data.get("item") or []
+                total = int(data.get("total", -1))
+                if total != len(items) or total != len(sector_codes):
+                    raise HithinkApiError(
+                        code,
+                        f"Sector index API total={total}, items={len(items)}, requested={len(sector_codes)}",
+                    )
+                timestamp = int(data["timestamp"])
+                source_time = datetime.fromtimestamp(timestamp / 1000, tz=SHANGHAI)
+                return SectorIndexSnapshot(
+                    total=total,
+                    items=[SectorIndexItem(item, timestamp, source_time) for item in items],
                     duration_ms=round((perf_counter() - started) * 1000),
                     retry_count=attempt,
                 )
