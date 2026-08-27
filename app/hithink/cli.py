@@ -39,6 +39,10 @@ def parser() -> argparse.ArgumentParser:
         "market-state-backfill", help="recalculate state rows for real snapshots already collected"
     )
     state.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
+    migrate = sub.add_parser(
+        "migrate-collection-ids", help="backfill YYYYMMDD001-YYYYMMDD254 identifiers"
+    )
+    migrate.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
     membership = sub.add_parser("sector-membership", help="query sector memberships valid on a date")
     membership.add_argument("thscode")
     membership.add_argument("target_date", type=lambda value: datetime.fromisoformat(value).date())
@@ -80,8 +84,13 @@ def main() -> None:
             trade_date = args.trade_date or datetime.now(SHANGHAI).date()
             nodes = writer.market_state_nodes(trade_date)
             for node in nodes:
-                writer.upsert_market_state(node)
+                writer.upsert_market_state(node, writer.limit_pool_collected(node))
             LOG.info("market state backfill completed date=%s nodes=%s", trade_date, len(nodes))
+            return
+        if args.command == "migrate-collection-ids":
+            trade_date = args.trade_date or datetime.now(SHANGHAI).date()
+            writer.migrate_collection_ids(trade_date)
+            LOG.info("collection IDs migrated date=%s", trade_date)
             return
         api = HithinkClient(settings.api_key)
         try:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta
 from time import perf_counter, sleep
 
@@ -101,16 +102,29 @@ class CollectorRunner:
     def run_node(self, node: ScheduleNode, previous_node: ScheduleNode | None) -> None:
         started_at = datetime.now(SHANGHAI)
         started = perf_counter()
-        batch_id = f"{node.trade_date:%Y%m%d}-{node.sequence_no:03d}"
+        batch_id = node.collection_id
         self.writer.set_schedule_status(
             node, "RUNNING", batch_id=batch_id, request_start_time=started_at
         )
         try:
-            response = self.api.fetch()
+            # All three facts belong to this exact planned collection_id.  Fetching
+            # them together minimizes timestamp skew without changing slot identity.
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                snapshot_future = executor.submit(self.api.fetch)
+                limit_up_future = executor.submit(
+                    self.api.fetch_limit_pool, "limit-up-pool", node.trade_date
+                )
+                limit_down_future = executor.submit(
+                    self.api.fetch_limit_pool, "limit-down-pool", node.trade_date
+                )
+                response = snapshot_future.result()
+                limit_up = limit_up_future.result()
+                limit_down = limit_down_future.result()
             raw_rows = [
                 RawSnapshot.from_api(
                     item,
                     trade_date=node.trade_date,
+                    collection_id=node.collection_id,
                     scheduled_time=node.scheduled_time,
                     source_timestamp=response.source_timestamp,
                     source_time=response.source_time,
@@ -130,7 +144,9 @@ class CollectorRunner:
             ]
             derive_ms = round((perf_counter() - derive_started) * 1000)
             derived_count, derived_ms = self.writer.insert_derived_once(derived_rows)
-            self.writer.upsert_market_state(node)
+            self.writer.insert_limit_up_pool(node, batch_id, limit_up)
+            self.writer.insert_limit_down_pool(node, batch_id, limit_down)
+            self.writer.upsert_market_state(node, limit_pool_available=True)
             self.writer.set_schedule_status(
                 node,
                 "SUCCESS",
@@ -149,6 +165,13 @@ class CollectorRunner:
                 derive_ms=derive_ms + derived_ms,
                 total_duration_ms=round((perf_counter() - started) * 1000),
                 retry_count=response.retry_count,
+                limit_pool_collected=1,
+                limit_up_source_time=limit_up.source_time,
+                limit_down_source_time=limit_down.source_time,
+                limit_up_received_count=limit_up.total,
+                limit_down_received_count=limit_down.total,
+                limit_up_api_duration_ms=limit_up.duration_ms,
+                limit_down_api_duration_ms=limit_down.duration_ms,
             )
             LOG.info(
                 "SUCCESS sequence=%s count=%s total_ms=%s",

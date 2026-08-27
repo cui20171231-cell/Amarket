@@ -8,6 +8,7 @@ from typing import Any
 @dataclass(frozen=True)
 class RawSnapshot:
     trade_date: date
+    collection_id: str
     scheduled_time: datetime
     source_timestamp: int
     source_time: datetime

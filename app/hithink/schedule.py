@@ -14,6 +14,10 @@ class ScheduleNode:
     session: str
     sequence_no: int
 
+    @property
+    def collection_id(self) -> str:
+        return f"{self.trade_date:%Y%m%d}{self.sequence_no:03d}"
+
 
 def _at(trade_date: date, value: time) -> datetime:
     return datetime.combine(trade_date, value, SHANGHAI)
