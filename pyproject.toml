@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hithink-snapshot-collector"
+version = "0.1.0"
+description = "Independent all-A-share snapshot collector for the Hithink Financial API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "clickhouse-connect>=0.8,<1",
+  "httpx>=0.28,<1",
+  "pyarrow>=25,<26",
+  "tzdata>=2025.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9", "ruff>=0.8,<1"]
+
+[project.scripts]
+hithink-snapshot = "app.hithink.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

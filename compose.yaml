@@ -1,0 +1,22 @@
+name: hithink-snapshot
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3
+    env_file:
+      - C:\\Users\\DmarketosOS\\.config\\hithink\\collector.env
+    environment:
+      CLICKHOUSE_USER: hithink_snapshot
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  clickhouse_data:
