@@ -35,23 +35,23 @@ def raw(**changes):
     return RawSnapshot(**values)
 
 
-def test_schedule_has_fixed_314_nodes_and_sessions():
+def test_schedule_has_fixed_254_nodes_and_sessions():
     nodes = build_daily_schedule(date(2026, 8, 27))
-    assert len(nodes) == 314
+    assert len(nodes) == 254
     assert sum(node.session == "auction_open" for node in nodes) == 11
     assert sum(node.session == "continuous_am" for node in nodes) == 121
-    assert sum(node.session == "continuous_pm" for node in nodes) == 177
+    assert sum(node.session == "continuous_pm" for node in nodes) == 117
     assert sum(node.session == "auction_close" for node in nodes) == 5
-    assert nodes[-3].scheduled_time.timetz().replace(tzinfo=None) == time(15, 58)
+    assert nodes[-3].scheduled_time.timetz().replace(tzinfo=None) == time(14, 58)
 
 
 def test_only_exact_session_continuity_allows_derivation():
     nodes = build_daily_schedule(date(2026, 8, 27))
     by_time = {node.scheduled_time.timetz().replace(tzinfo=None): node for node in nodes}
     assert not allows_one_minute_derivation(by_time[time(9, 30, 15)], by_time[time(9, 25)])
-    assert not allows_one_minute_derivation(by_time[time(15, 56, 55)], by_time[time(15, 56, 15)])
-    assert not allows_one_minute_derivation(by_time[time(15, 57)], by_time[time(15, 56, 55)])
-    assert allows_one_minute_derivation(by_time[time(15, 58)], by_time[time(15, 57)])
+    assert not allows_one_minute_derivation(by_time[time(14, 56, 55)], by_time[time(14, 56, 15)])
+    assert not allows_one_minute_derivation(by_time[time(14, 57)], by_time[time(14, 56, 55)])
+    assert allows_one_minute_derivation(by_time[time(14, 58)], by_time[time(14, 57)])
 
 
 def test_derivation_obeys_zero_and_counter_rollback_rules():

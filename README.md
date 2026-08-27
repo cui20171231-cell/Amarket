@@ -7,7 +7,7 @@
 执行 `hithink-snapshot init-db` 后，ClickHouse 中只会创建：
 
 - `market` 数据库
-- `market.hithink_snapshot_schedule`：每天 314 个计划节点及状态
+- `market.hithink_snapshot_schedule`：每天 254 个计划节点及状态
 - `market.hithink_snapshot_raw`：同花顺 API 的 11 个原始字段
 - `market.hithink_snapshot_derived`：原始字段和固定 8 个派生字段
 
@@ -37,9 +37,9 @@ hithink-snapshot init-db
 hithink-snapshot run --not-before 13:00
 ```
 
-`run --not-before 13:00` 会生成完整 314 节点计划，13:00 前节点标记 `MISSED`，从下午起按绝对计划时间执行。每节点是一次 API 请求、一次 raw 批量写入、一次上一合法批读取、内存批量派生、一次 derived 批量写入。
+`run --not-before 13:00` 会生成完整 254 节点计划，13:00 前节点标记 `MISSED`，从下午起按绝对计划时间执行。每节点是一次 API 请求、一次 raw 批量写入、一次上一合法批读取、内存批量派生、一次 derived 批量写入。
 
-只有“同交易日、同 session、计划时间精确相差 60 秒”时，8 个派生字段才计算。首次、跨午休、09:30:15、15:56:55、15:57:00 等边界节点均为 `NULL`；15:58:00 恢复计算。
+只有“同交易日、同 session、计划时间精确相差 60 秒”时，8 个派生字段才计算。首次、跨午休、09:30:15、14:56:55、14:57:00 等边界节点均为 `NULL`；14:58:00 恢复计算。
 
 ## 开机与每日自动运行
 

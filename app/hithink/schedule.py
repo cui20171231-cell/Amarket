@@ -35,17 +35,17 @@ def build_daily_schedule(trade_date: date) -> list[ScheduleNode]:
     slots: list[tuple[datetime, str]] = []
     slots.extend(_every_minute(trade_date, time(9, 15), time(9, 25), "auction_open"))
     slots.extend(_every_minute(trade_date, time(9, 30, 15), time(11, 30, 15), "continuous_am"))
-    slots.extend(_every_minute(trade_date, time(13, 0, 15), time(15, 56, 15), "continuous_pm"))
+    slots.extend(_every_minute(trade_date, time(13, 0, 15), time(14, 56, 15), "continuous_pm"))
     slots.extend(
         (_at(trade_date, value), "auction_close")
-        for value in (time(15, 56, 55), time(15, 57), time(15, 58), time(15, 59), time(16))
+        for value in (time(14, 56, 55), time(14, 57), time(14, 58), time(14, 59), time(15))
     )
     nodes = [
         ScheduleNode(trade_date, scheduled, session, index)
         for index, (scheduled, session) in enumerate(slots, 1)
     ]
-    if len(nodes) != 314:
-        raise RuntimeError(f"schedule invariant failed: expected 314 nodes, got {len(nodes)}")
+    if len(nodes) != 254:
+        raise RuntimeError(f"schedule invariant failed: expected 254 nodes, got {len(nodes)}")
     return nodes
 
 

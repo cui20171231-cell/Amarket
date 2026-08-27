@@ -24,7 +24,7 @@ def parser() -> argparse.ArgumentParser:
         "init-db", help="explicitly create the market database and the three collector tables"
     )
     run = sub.add_parser(
-        "run", help="generate today's 314-node plan and collect until market close"
+        "run", help="generate today's 254-node plan and collect until market close"
     )
     run.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
     run.add_argument(
