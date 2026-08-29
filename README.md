@@ -1,6 +1,12 @@
-# Hithink 全 A 股市场采集基础设施
+# A-market 全 A 股市场数据基础设施
 
-这是 N100 上独立运行的新项目，使用独立 ClickHouse 数据库 `market`，不依赖旧采集项目。
+当前版本：`1.0.0`。
+
+这是在 Intel N100 设备上独立运行的项目，使用独立 ClickHouse 数据库 `market`，不依赖旧采集项目。
+
+项目范围和交接基线见 [总体架构](ARCHITECTURE.md)、[产品基线](docs/PRODUCT_BASELINE.md)、
+[1.0 版本范围](docs/V1.0_SCOPE.md)、[数据库草案](docs/DATABASE_DRAFT.md)和
+[接口草案](docs/API_DRAFT.md)。
 
 ## 快照主链
 
@@ -48,7 +54,7 @@ N100 开机后服务自动启动并持续在线。每天 08:50 刷新同花顺�
 程序从 N100 本机外部配置读取密钥：
 
 ```text
-C:\Users\DmarketosOS\.config\hithink\collector.env
+D:\Amarket\secrets\collector.env
 ```
 
 密钥不写入仓库和日志。

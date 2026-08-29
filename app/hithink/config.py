@@ -4,7 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-KEY_FILE = Path(r"C:\Users\DmarketosOS\.config\hithink\collector.env")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+KEY_FILE = PROJECT_ROOT / "secrets" / "collector.env"
 
 
 def _read_key_file() -> dict[str, str]:

@@ -7,7 +7,6 @@ from app.hithink.derive import calculate
 from app.hithink.models import DerivedSnapshot, RawSnapshot
 from app.hithink.schedule import (
     SHANGHAI,
-    allows_one_minute_derivation,
     build_daily_schedule,
 )
 
@@ -52,8 +51,8 @@ def test_schedule_has_fixed_254_nodes_and_sessions():
 def test_collection_id_has_a_permanent_time_mapping():
     nodes = build_daily_schedule(date(2026, 8, 27))
     expected = {
-        1: time(9, 15),
-        11: time(9, 25),
+        1: time(9, 15, 15),
+        11: time(9, 25, 15),
         12: time(9, 30, 15),
         132: time(11, 30, 15),
         133: time(13, 0, 15),
@@ -67,13 +66,16 @@ def test_collection_id_has_a_permanent_time_mapping():
         assert node.scheduled_time.timetz().replace(tzinfo=None) == planned_time
 
 
-def test_only_exact_session_continuity_allows_derivation():
+def test_limit_pools_run_only_at_meaningful_nodes():
     nodes = build_daily_schedule(date(2026, 8, 27))
-    by_time = {node.scheduled_time.timetz().replace(tzinfo=None): node for node in nodes}
-    assert not allows_one_minute_derivation(by_time[time(9, 30, 15)], by_time[time(9, 25)])
-    assert not allows_one_minute_derivation(by_time[time(14, 56, 55)], by_time[time(14, 56, 15)])
-    assert not allows_one_minute_derivation(by_time[time(14, 57)], by_time[time(14, 56, 55)])
-    assert allows_one_minute_derivation(by_time[time(14, 58)], by_time[time(14, 57)])
+    applicable = [node.sequence_no for node in nodes if node.limit_pools_applicable]
+    assert len(applicable) == 241
+    assert applicable[0] == 11
+    assert 250 in applicable
+    assert 251 not in applicable
+    assert 252 not in applicable
+    assert 253 not in applicable
+    assert applicable[-1] == 254
 
 
 def test_derivation_obeys_zero_and_counter_rollback_rules():
@@ -99,6 +101,50 @@ def test_derivation_obeys_zero_and_counter_rollback_rules():
     rollback = calculate(raw(volume=99, turnover=999), previous, True)
     assert rollback.turnover_delta_1m is None and rollback.turnover_growth_1m is None
     assert rollback.volume_delta_1m is None and rollback.volume_ratio_1m is None
+
+
+def test_previous_trade_day_turnover_uses_the_last_available_stock_record():
+    derived = calculate(
+        raw(turnover=1300),
+        previous=None,
+        allowed=False,
+        previous_trade_day_turnover=1000,
+    )
+    assert derived.prev_trade_day_same_time_turnover == 1000
+    assert derived.turnover_prev_trade_day_delta == 300
+    assert derived.turnover_prev_trade_day_pct == pytest.approx(0.3)
+
+
+def test_derivation_uses_the_last_successful_snapshot_after_a_failed_node():
+    last_success = DerivedSnapshot(
+        raw(last_price=10, high_price=10, low_price=9, volume=100, turnover=1000),
+        50,
+        10,
+        None,
+        None,
+        0,
+        0,
+        0.2,
+        2,
+    )
+    derived = calculate(
+        raw(last_price=11, high_price=11, low_price=9, volume=160, turnover=1300),
+        last_success,
+        allowed=True,
+    )
+    assert derived.turnover_delta_1m == 300
+    assert derived.volume_delta_1m == 60
+    assert derived.price_delta_1m == 1
+
+
+def test_auction_nodes_are_facts_only_and_have_no_minute_derivation():
+    auction = calculate(
+        raw(session="auction_open", turnover=1300),
+        previous=None,
+        allowed=False,
+    )
+    assert auction.turnover_delta_1m is None
+    assert auction.volume_delta_1m is None
 
 
 def test_empty_limit_pool_is_a_valid_same_node_fact():

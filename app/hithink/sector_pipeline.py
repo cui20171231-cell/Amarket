@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from time import perf_counter
 
-from app.hithink.api import HithinkClient
 from app.hithink.schedule import ScheduleNode
 from app.hithink.writer import ClickHouseWriter
 
@@ -17,26 +16,39 @@ class SectorPipelineResult:
 
 
 class SectorPipeline:
-    """Collect one sector-index fact set and derive all three sector state sets."""
+    """Derive the three board-state tables from facts already stored locally."""
 
-    def __init__(self, api: HithinkClient, writer: ClickHouseWriter):
-        self.api = api
+    def __init__(self, writer: ClickHouseWriter):
         self.writer = writer
 
-    def collect_and_derive(
-        self, node: ScheduleNode, limit_pool_available: bool
+    def derive_states(
+        self,
+        node: ScheduleNode,
+        sectors: list[tuple[str, str, str, str]],
+        limit_pool_available: bool,
+        comparison_enabled: bool,
+        previous_collection_id: str | None,
+        previous_limit_break_collection_id: str | None,
+        allow_gap_comparison: bool,
+        previous_trade_day_enabled: bool,
     ) -> SectorPipelineResult:
-        sectors = self.writer.active_sector_catalog()
         if not sectors:
             raise RuntimeError("No active concept, industry, or style sectors exist")
-        snapshot = self.api.fetch_sector_index_snapshot([sector[0] for sector in sectors])
-        self.writer.insert_sector_index_once(node, sectors, snapshot)
 
         started = perf_counter()
         state_rows = 0
         for sector_type in ("concept", "industry", "style"):
             expected = sum(sector[2] == sector_type for sector in sectors)
-            self.writer.upsert_sector_state(node, sector_type, limit_pool_available)
+            self.writer.upsert_sector_state(
+                node,
+                sector_type,
+                limit_pool_available,
+                comparison_enabled,
+                previous_collection_id,
+                previous_limit_break_collection_id,
+                allow_gap_comparison,
+                previous_trade_day_enabled,
+            )
             actual = self.writer.sector_state_count(node, sector_type)
             if actual != expected:
                 raise RuntimeError(
@@ -44,8 +56,8 @@ class SectorPipeline:
                 )
             state_rows += actual
         return SectorPipelineResult(
-            index_rows=snapshot.total,
-            index_duration_ms=snapshot.duration_ms,
+            index_rows=0,
+            index_duration_ms=0,
             state_rows=state_rows,
             state_duration_ms=round((perf_counter() - started) * 1000),
         )

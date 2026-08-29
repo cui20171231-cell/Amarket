@@ -61,6 +61,29 @@ ENGINE = ReplacingMergeTree(version_time)
 PARTITION BY toYYYYMM(trade_date)
 ORDER BY (trade_date, assumeNotNull(collection_id), thscode, source_time);
 
+CREATE TABLE IF NOT EXISTS market.hithink_limit_break_pool
+(
+    trade_date Date,
+    collection_id FixedString(11),
+    scheduled_time DateTime64(3, 'Asia/Shanghai'),
+    batch_id String,
+    source_timestamp UInt64,
+    source_time DateTime64(3, 'Asia/Shanghai'),
+    thscode String,
+    ticker String,
+    name String,
+    last_price Nullable(Float64),
+    price_change_ratio_pct Nullable(Float64),
+    open_times Nullable(UInt16),
+    turnover_ratio_pct Nullable(Float64),
+    turnover Nullable(Float64),
+    ingest_time DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3),
+    version_time DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree(version_time)
+PARTITION BY toYYYYMM(trade_date)
+ORDER BY (trade_date, scheduled_time, thscode);
+
 CREATE TABLE IF NOT EXISTS market.sector_catalog
 (
     sector_code String,
@@ -122,6 +145,7 @@ ORDER BY (sync_date, sync_run_id, sector_type);
 CREATE TABLE IF NOT EXISTS market.hithink_daily_k_raw
 (
     trade_date Date,
+    collection_id String DEFAULT concat(formatDateTime(trade_date, '%Y%m%d'), '254'),
     date_ms UInt64,
     thscode LowCardinality(String),
     ticker FixedString(6),
@@ -147,6 +171,7 @@ CREATE TABLE IF NOT EXISTS market.hithink_adjustment_events
     thscode LowCardinality(String),
     ticker FixedString(6),
     ex_date Date,
+    collection_id String DEFAULT concat(formatDateTime(ex_date, '%Y%m%d'), '254'),
     ex_date_ms UInt64,
     dividend_per_share Float64,
     per_share_bonus Float64,
@@ -172,6 +197,7 @@ ORDER BY (
 CREATE TABLE IF NOT EXISTS market.hithink_daily_k_forward
 (
     trade_date Date,
+    collection_id String DEFAULT concat(formatDateTime(trade_date, '%Y%m%d'), '254'),
     thscode LowCardinality(String),
     ticker FixedString(6),
     open_price Float64,
@@ -190,7 +216,7 @@ CREATE TABLE IF NOT EXISTS market.hithink_daily_k_forward
 )
 ENGINE = ReplacingMergeTree(version_time)
 PARTITION BY toYYYYMM(trade_date)
-ORDER BY (thscode, trade_date);
+ORDER BY (collection_id, thscode);
 
 CREATE TABLE IF NOT EXISTS market.hithink_daily_sync_status
 (
@@ -225,6 +251,19 @@ CREATE TABLE IF NOT EXISTS market.hithink_snapshot_schedule
     session LowCardinality(String),
     sequence_no UInt16,
     status LowCardinality(String),
+    raw_status LowCardinality(String) DEFAULT 'PENDING',
+    derivation_status LowCardinality(String) DEFAULT 'PENDING',
+    all_a_snapshot_status LowCardinality(String) DEFAULT 'PENDING',
+    limit_up_pool_status LowCardinality(String) DEFAULT 'PENDING',
+    limit_down_pool_status LowCardinality(String) DEFAULT 'PENDING',
+    raw_completed_at Nullable(DateTime64(3, 'Asia/Shanghai')),
+    derivation_started_at Nullable(DateTime64(3, 'Asia/Shanghai')),
+    derivation_completed_at Nullable(DateTime64(3, 'Asia/Shanghai')),
+    derivation_duration_ms Nullable(UInt32),
+    raw_error_code Nullable(String),
+    raw_error_message Nullable(String),
+    derivation_error_code Nullable(String),
+    derivation_error_message Nullable(String),
     batch_id Nullable(String),
     request_start_time Nullable(DateTime64(3, 'Asia/Shanghai')),
     request_end_time Nullable(DateTime64(3, 'Asia/Shanghai')),
@@ -309,6 +348,9 @@ CREATE TABLE IF NOT EXISTS market.hithink_snapshot_derived
     new_low_flag Nullable(UInt8),
     price_delta_1m Nullable(Float64),
     price_change_1m_pct Nullable(Float64),
+    prev_trade_day_same_time_turnover Nullable(UInt64),
+    turnover_prev_trade_day_delta Nullable(Int64),
+    turnover_prev_trade_day_pct Nullable(Float64),
     ingest_time DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3)
 )
 ENGINE = MergeTree
@@ -334,6 +376,9 @@ ALTER TABLE market.hithink_snapshot_derived MODIFY COLUMN low_price Nullable(Flo
 ALTER TABLE market.hithink_snapshot_derived MODIFY COLUMN prev_price Nullable(Float64);
 ALTER TABLE market.hithink_snapshot_derived MODIFY COLUMN volume Nullable(UInt64);
 ALTER TABLE market.hithink_snapshot_derived MODIFY COLUMN turnover Nullable(UInt64);
+ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS prev_trade_day_same_time_turnover Nullable(UInt64) AFTER turnover;
+ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS turnover_prev_trade_day_delta Nullable(Int64) AFTER prev_trade_day_same_time_turnover;
+ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS turnover_prev_trade_day_pct Nullable(Float64) AFTER turnover_prev_trade_day_delta;
 
 CREATE TABLE IF NOT EXISTS market.hithink_market_state
 (
@@ -515,6 +560,32 @@ ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_sta
 ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_state_duration_ms Nullable(UInt32) AFTER sector_state_row_count;
 ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_error_code Nullable(String) AFTER sector_state_duration_ms;
 ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS sector_error_message Nullable(String) AFTER sector_error_code;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS raw_status LowCardinality(String) DEFAULT 'PENDING' AFTER status;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS derivation_status LowCardinality(String) DEFAULT 'PENDING' AFTER raw_status;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS all_a_snapshot_status LowCardinality(String) DEFAULT 'PENDING' AFTER derivation_status;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS limit_up_pool_status LowCardinality(String) DEFAULT 'PENDING' AFTER all_a_snapshot_status;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS limit_down_pool_status LowCardinality(String) DEFAULT 'PENDING' AFTER limit_up_pool_status;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS limit_break_pool_status LowCardinality(String) DEFAULT 'PENDING' AFTER limit_down_pool_status;
+ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS is_limit_break Nullable(UInt8) AFTER turnover_prev_trade_day_pct;
+ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS limit_break_open_times Nullable(UInt16) AFTER is_limit_break;
+ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS is_limit_up Nullable(UInt8) AFTER turnover_prev_trade_day_pct;
+ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS is_limit_down Nullable(UInt8) AFTER is_limit_up;
+ALTER TABLE market.hithink_market_state ADD COLUMN IF NOT EXISTS limit_break_count Nullable(UInt32) AFTER limit_down_count;
+ALTER TABLE market.hithink_market_state ADD COLUMN IF NOT EXISTS limit_break_count_delta_prev_available Nullable(Int32) AFTER limit_break_count;
+ALTER TABLE market.hithink_concept_state ADD COLUMN IF NOT EXISTS limit_break_count Nullable(UInt32) AFTER limit_down_count;
+ALTER TABLE market.hithink_concept_state ADD COLUMN IF NOT EXISTS limit_break_count_delta_prev_available Nullable(Int32) AFTER limit_break_count;
+ALTER TABLE market.hithink_industry_state ADD COLUMN IF NOT EXISTS limit_break_count Nullable(UInt32) AFTER limit_down_count;
+ALTER TABLE market.hithink_industry_state ADD COLUMN IF NOT EXISTS limit_break_count_delta_prev_available Nullable(Int32) AFTER limit_break_count;
+ALTER TABLE market.hithink_style_state ADD COLUMN IF NOT EXISTS limit_break_count Nullable(UInt32) AFTER limit_down_count;
+ALTER TABLE market.hithink_style_state ADD COLUMN IF NOT EXISTS limit_break_count_delta_prev_available Nullable(Int32) AFTER limit_break_count;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS raw_completed_at Nullable(DateTime64(3, 'Asia/Shanghai')) AFTER derivation_status;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS derivation_started_at Nullable(DateTime64(3, 'Asia/Shanghai')) AFTER raw_completed_at;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS derivation_completed_at Nullable(DateTime64(3, 'Asia/Shanghai')) AFTER derivation_started_at;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS derivation_duration_ms Nullable(UInt32) AFTER derivation_completed_at;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS raw_error_code Nullable(String) AFTER derivation_completed_at;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS raw_error_message Nullable(String) AFTER raw_error_code;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS derivation_error_code Nullable(String) AFTER raw_error_message;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS derivation_error_message Nullable(String) AFTER derivation_error_code;
 
 ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN last_price Nullable(Float64);
 ALTER TABLE market.hithink_sector_index_snapshot MODIFY COLUMN price_change Nullable(Float64);
@@ -542,6 +613,9 @@ ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS limit_up_r
 ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS limit_down_received_count Nullable(UInt32) AFTER limit_up_received_count;
 ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS limit_up_api_duration_ms Nullable(UInt32) AFTER limit_down_received_count;
 ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS limit_down_api_duration_ms Nullable(UInt32) AFTER limit_up_api_duration_ms;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS limit_break_source_time Nullable(DateTime64(3, 'Asia/Shanghai')) AFTER limit_down_source_time;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS limit_break_received_count Nullable(UInt32) AFTER limit_down_received_count;
+ALTER TABLE market.hithink_snapshot_schedule ADD COLUMN IF NOT EXISTS limit_break_api_duration_ms Nullable(UInt32) AFTER limit_down_api_duration_ms;
 
 ALTER TABLE market.hithink_snapshot_raw ADD COLUMN IF NOT EXISTS collection_id FixedString(11) AFTER trade_date;
 ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS collection_id FixedString(11) AFTER trade_date;
@@ -552,3 +626,18 @@ ALTER TABLE market.hithink_market_state MODIFY COLUMN down_5_to_limit_count Null
 ALTER TABLE market.hithink_market_state MODIFY COLUMN limit_down_count Nullable(UInt32);
 ALTER TABLE market.hithink_market_state RENAME COLUMN IF EXISTS turnover_yoy_delta TO turnover_prev_day_delta;
 ALTER TABLE market.hithink_market_state RENAME COLUMN IF EXISTS turnover_yoy_pct TO turnover_prev_day_pct;
+
+ALTER TABLE market.hithink_daily_k_raw
+    ADD COLUMN IF NOT EXISTS collection_id String
+    DEFAULT concat(formatDateTime(trade_date, '%Y%m%d'), '254')
+    AFTER trade_date;
+
+ALTER TABLE market.hithink_adjustment_events
+    ADD COLUMN IF NOT EXISTS collection_id String
+    DEFAULT concat(formatDateTime(ex_date, '%Y%m%d'), '254')
+    AFTER ex_date;
+
+ALTER TABLE market.hithink_daily_k_forward
+    ADD COLUMN IF NOT EXISTS collection_id String
+    DEFAULT concat(formatDateTime(trade_date, '%Y%m%d'), '254')
+    AFTER trade_date;

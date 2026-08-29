@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
-from time import perf_counter, sleep
+from datetime import date, datetime, time
+from email.utils import parsedate_to_datetime
+from threading import Lock
+from time import monotonic, perf_counter, sleep
 from typing import Any
 
 import httpx
@@ -19,12 +24,67 @@ DUMP_URLS = {
     "adjustment_factors": "https://fuyao.aicubes.cn/api/dump/market-dumps/adjustment-factors/download-url",
 }
 RETRYABLE_CODES = {4001, 5001, 5002, 5003}
+LOG = logging.getLogger(__name__)
 
 
 class HithinkApiError(RuntimeError):
-    def __init__(self, code: int | None, message: str):
+    def __init__(
+        self,
+        code: int | None,
+        message: str,
+        *,
+        error_code: str | None = None,
+        endpoint: str | None = None,
+        url: str | None = None,
+        http_status: int | None = None,
+        response_summary: str | None = None,
+        retry_after: str | None = None,
+        request_started_at: datetime | None = None,
+        request_ended_at: datetime | None = None,
+        retry_index: int = 0,
+        limiter_source: str | None = None,
+        duration_ms: int | None = None,
+    ):
         super().__init__(message)
         self.code = code
+        self.error_code = error_code or (str(code) if code is not None else "API_ERROR")
+        self.endpoint = endpoint
+        self.url = url
+        self.http_status = http_status
+        self.response_summary = response_summary
+        self.retry_after = retry_after
+        self.request_started_at = request_started_at
+        self.request_ended_at = request_ended_at
+        self.retry_index = retry_index
+        self.limiter_source = limiter_source
+        self.duration_ms = duration_ms
+
+
+class _EndpointRateLimiter:
+    """Serialize one endpoint and keep at least one second between request starts."""
+
+    def __init__(self, minimum_interval_seconds: float = 1.0):
+        self.minimum_interval_seconds = minimum_interval_seconds
+        self._lock = Lock()
+        self._last_started = 0.0
+
+    @contextmanager
+    def slot(self, endpoint: str):
+        with self._lock:
+            wait_seconds = max(
+                0.0,
+                self.minimum_interval_seconds - (monotonic() - self._last_started),
+            )
+            if wait_seconds:
+                LOG.info(
+                    "API_LOCAL_RATE_LIMIT endpoint=%s code=LOCAL_RATE_LIMIT "
+                    "wait_ms=%s limiter_source=LOCAL",
+                    endpoint,
+                    round(wait_seconds * 1000),
+                )
+                sleep(wait_seconds)
+            self._last_started = monotonic()
+            yield
 
 
 @dataclass(frozen=True)
@@ -89,9 +149,127 @@ class HithinkClient:
         self.client = httpx.Client(
             timeout=httpx.Timeout(15.0, connect=5.0), headers={"X-api-key": api_key}
         )
+        self._active_request_lock = Lock()
+        self._active_request_count = 0
+        self._endpoint_limiters = {
+            "all_a_snapshot": _EndpointRateLimiter(1.0),
+            "sector_index": _EndpointRateLimiter(1.0),
+        }
 
     def close(self) -> None:
         self.client.close()
+
+    def _get(self, endpoint: str, url: str, **kwargs: Any) -> httpx.Response:
+        """Issue one HTTP request and log the real in-flight request count."""
+        if not hasattr(self, "_active_request_lock"):
+            self._active_request_lock = Lock()
+            self._active_request_count = 0
+        if not hasattr(self, "_endpoint_limiters"):
+            self._endpoint_limiters = {
+                "all_a_snapshot": _EndpointRateLimiter(1.0),
+                "sector_index": _EndpointRateLimiter(1.0),
+            }
+
+        def send() -> httpx.Response:
+            with self._active_request_lock:
+                self._active_request_count += 1
+                active = self._active_request_count
+            started = perf_counter()
+            LOG.info("API_REQUEST_START endpoint=%s active=%s", endpoint, active)
+            try:
+                return self.client.get(url, **kwargs)
+            finally:
+                duration_ms = round((perf_counter() - started) * 1000)
+                with self._active_request_lock:
+                    self._active_request_count -= 1
+                    active = self._active_request_count
+                LOG.info(
+                    "API_REQUEST_END endpoint=%s active=%s duration_ms=%s",
+                    endpoint,
+                    active,
+                    duration_ms,
+                )
+
+        limiter = self._endpoint_limiters.get(endpoint)
+        if limiter is None:
+            return send()
+        with limiter.slot(endpoint):
+            return send()
+
+    @staticmethod
+    def _retry_after_seconds(raw: str | None, ended_at: datetime) -> float | None:
+        if not raw:
+            return None
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=SHANGHAI)
+                return max(0.0, (parsed - ended_at).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+    def _request_json(
+        self, endpoint: str, url: str, **kwargs: Any
+    ) -> tuple[httpx.Response, dict[str, Any], int]:
+        """Retry only upstream 429 responses with the dedicated 1s/2s policy."""
+        rate_limit_started = perf_counter()
+        for retry_index in range(3):
+            request_started_at = datetime.now(SHANGHAI)
+            response = self._get(endpoint, url, **kwargs)
+            request_ended_at = datetime.now(SHANGHAI)
+            payload = response.json()
+            code = int(payload.get("code", response.status_code))
+            message = str(payload.get("message", ""))
+            is_rate_limit = response.status_code == 429 or code == 429
+            if not is_rate_limit:
+                return response, payload, retry_index
+
+            retry_after_raw = response.headers.get("Retry-After")
+            retry_after_seconds = self._retry_after_seconds(
+                retry_after_raw, request_ended_at
+            )
+            response_summary = " ".join(response.text.split())[:300]
+            if not response_summary:
+                response_summary = json.dumps(payload, ensure_ascii=False)[:300]
+            LOG.warning(
+                "API_429_EVIDENCE endpoint=%s url=%s http_status=%s "
+                "response_summary=%r retry_after=%r request_started_at=%s "
+                "request_ended_at=%s retry_index=%s limiter_source=UPSTREAM",
+                endpoint,
+                url,
+                response.status_code,
+                response_summary,
+                retry_after_raw,
+                request_started_at.isoformat(),
+                request_ended_at.isoformat(),
+                retry_index,
+            )
+            if retry_index == 2:
+                raise HithinkApiError(
+                    429,
+                    message or response_summary or "upstream rate limit",
+                    error_code="UPSTREAM_HTTP_429",
+                    endpoint=endpoint,
+                    url=url,
+                    http_status=response.status_code,
+                    response_summary=response_summary,
+                    retry_after=retry_after_raw,
+                    request_started_at=request_started_at,
+                    request_ended_at=request_ended_at,
+                    retry_index=retry_index,
+                    limiter_source="UPSTREAM",
+                    duration_ms=round((perf_counter() - rate_limit_started) * 1000),
+                )
+            wait_seconds = (
+                retry_after_seconds
+                if retry_after_seconds is not None
+                else (1.0 if retry_index == 0 else 2.0)
+            )
+            sleep(wait_seconds)
+        raise AssertionError("unreachable")
 
     def fetch(self) -> ApiSnapshot:
         last_error: HithinkApiError | None = None
@@ -100,8 +278,9 @@ class HithinkClient:
                 sleep(pause_seconds)
             started = perf_counter()
             try:
-                response = self.client.get(URL)
-                payload = response.json()
+                response, payload, rate_retries = self._request_json(
+                    "all_a_snapshot", URL
+                )
                 code = int(payload.get("code", response.status_code))
                 if response.status_code >= 400 or code != 0:
                     raise HithinkApiError(code, str(payload.get("message", response.text[:300])))
@@ -118,7 +297,7 @@ class HithinkClient:
                     total=total,
                     items=items,
                     duration_ms=round((perf_counter() - started) * 1000),
-                    retry_count=attempt,
+                    retry_count=attempt + rate_retries,
                 )
             except (httpx.HTTPError, ValueError, KeyError, HithinkApiError) as exc:
                 error = exc if isinstance(exc, HithinkApiError) else HithinkApiError(None, str(exc))
@@ -135,7 +314,7 @@ class HithinkClient:
                 sleep(pause_seconds)
             started = perf_counter()
             try:
-                response = self.client.get(TRADING_DAYS_URL)
+                response = self._get("trading_calendar", TRADING_DAYS_URL)
                 payload = response.json()
                 code = int(payload.get("code", response.status_code))
                 if response.status_code >= 400 or code != 0:
@@ -158,7 +337,7 @@ class HithinkClient:
         raise last_error
 
     def fetch_limit_pool(self, pool_name: str, trade_date: date) -> LimitPoolSnapshot:
-        if pool_name not in {"limit-up-pool", "limit-down-pool"}:
+        if pool_name not in {"limit-up-pool", "limit-down-pool", "limit-break-pool"}:
             raise ValueError(f"Unsupported limit pool: {pool_name}")
         last_error: HithinkApiError | None = None
         for attempt, pause_seconds in enumerate((0, 1, 2, 4)):
@@ -173,12 +352,18 @@ class HithinkClient:
                 last_code = 0
                 latest_timestamp = 0
                 latest_source_time: datetime | None = None
+                rate_retries = 0
                 while page <= page_count:
-                    response = self.client.get(
+                    response, payload, page_rate_retries = self._request_json(
+                        pool_name,
                         LIMIT_POOL_URL.format(pool_name=pool_name),
-                        params={"date": trade_date.isoformat(), "page": page, "size": 50},
+                        params={
+                            "date_ms": int(datetime.combine(trade_date, time.min, tzinfo=SHANGHAI).timestamp() * 1000),
+                            "page": page,
+                            "size": 200,
+                        },
                     )
-                    payload = response.json()
+                    rate_retries += page_rate_retries
                     last_code = int(payload.get("code", response.status_code))
                     if response.status_code >= 400 or last_code != 0:
                         raise HithinkApiError(
@@ -224,7 +409,7 @@ class HithinkClient:
                     total=expected_total,
                     items=collected,
                     duration_ms=round((perf_counter() - started) * 1000),
-                    retry_count=attempt,
+                    retry_count=attempt + rate_retries,
                 )
             except (httpx.HTTPError, ValueError, KeyError, HithinkApiError) as exc:
                 error = exc if isinstance(exc, HithinkApiError) else HithinkApiError(None, str(exc))
@@ -276,10 +461,10 @@ class HithinkClient:
                 sleep(pause_seconds)
             started = perf_counter()
             try:
-                response = self.client.get(
+                response, payload, rate_retries = self._request_json(
+                    "sector_index",
                     SECTOR_INDEX_SNAPSHOT_URL, params={"thscodes": ",".join(sector_codes)}
                 )
-                payload = response.json()
                 code = int(payload.get("code", response.status_code))
                 if response.status_code >= 400 or code != 0:
                     raise HithinkApiError(code, str(payload.get("message", response.text[:300])))
@@ -297,7 +482,7 @@ class HithinkClient:
                     total=total,
                     items=[SectorIndexItem(item, timestamp, source_time) for item in items],
                     duration_ms=round((perf_counter() - started) * 1000),
-                    retry_count=attempt,
+                    retry_count=attempt + rate_retries,
                 )
             except (httpx.HTTPError, ValueError, KeyError, HithinkApiError) as exc:
                 error = exc if isinstance(exc, HithinkApiError) else HithinkApiError(None, str(exc))
@@ -314,7 +499,7 @@ class HithinkClient:
             raise ValueError(f"Unsupported dump name: {dump_name}") from exc
         started = perf_counter()
         try:
-            response = self.client.get(endpoint)
+            response = self._get(f"dump:{dump_name}", endpoint)
             payload = response.json()
             code = int(payload.get("code", response.status_code))
             if response.status_code >= 400 or code != 0:

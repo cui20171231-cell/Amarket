@@ -19,8 +19,17 @@ DERIVED = "market.hithink_snapshot_derived"
 MARKET_STATE = "market.hithink_market_state"
 LIMIT_UP_POOL = "market.hithink_limit_up_pool"
 LIMIT_DOWN_POOL = "market.hithink_limit_down_pool"
+LIMIT_BREAK_POOL = "market.hithink_limit_break_pool"
 CALENDAR = "market.trading_calendar"
 DAILY_STATUS = "market.hithink_daily_sync_status"
+DAILY_TASKS = (
+    "calendar_gate",
+    "sector_catalog_sync",
+    "sector_membership_sync",
+    "hithink_daily_k_raw_sync",
+    "hithink_adjustment_events_sync",
+    "daily_derivation",
+)
 SECTOR_INDEX = "market.hithink_sector_index_snapshot"
 SECTOR_STATES = {
     "concept": "market.hithink_concept_state",
@@ -32,7 +41,7 @@ SECTOR_STATES = {
 class ClickHouseWriter:
     def __init__(self, host: str, port: int, database: str, username: str, password: str):
         self.client = clickhouse_connect.get_client(
-            host=host, port=port, username=username, password=password, database="default"
+            host=host, port=port, username=username, password=password, database=database
         )
 
     def close(self) -> None:
@@ -64,6 +73,22 @@ class ClickHouseWriter:
                 "status",
             ],
         )
+
+    def initialize_daily_task_plan(self, trade_date: object) -> None:
+        existing = {
+            str(row[0])
+            for row in self.client.query(
+                f"SELECT task_name FROM {DAILY_STATUS} FINAL WHERE trade_date = {{date:Date}}",
+                parameters={"date": trade_date},
+            ).result_rows
+        }
+        missing = [task for task in DAILY_TASKS if task not in existing]
+        if missing:
+            self.client.insert(
+                DAILY_STATUS,
+                [(trade_date, task, "PENDING") for task in missing],
+                column_names=["trade_date", "task_name", "status"],
+            )
 
     def cache_trading_calendar(self, trade_dates: set[object], today: object) -> None:
         rows = [(trade_date, 1, "hithink") for trade_date in trade_dates]
@@ -100,10 +125,11 @@ class ClickHouseWriter:
         raw = self.client.query(
             f"SELECT count() FROM {DAILY_STATUS} FINAL WHERE task_name = 'hithink_daily_k_raw_sync' AND status = 'SUCCESS'"
         ).first_item
-        events = self.client.query(
-            f"SELECT count() FROM {DAILY_STATUS} FINAL WHERE task_name = 'hithink_adjustment_events_sync' AND status = 'SUCCESS'"
-        ).first_item
-        return bool(raw and events)
+        # Daily-K initialization is complete once the raw daily-K seed exists.
+        # Adjustment events are deliberately refreshed only on Mondays, so they
+        # must not force a full daily-K initialization on every weekday before
+        # the next Monday arrives.
+        return bool(raw)
 
     def statuses(self, trade_date: object) -> dict[datetime, str]:
         result = self.client.query(
@@ -113,27 +139,168 @@ class ClickHouseWriter:
         return {row[0]: row[1] for row in result.result_rows}
 
     def set_schedule_status(self, node: ScheduleNode, status: str, **values: Any) -> None:
-        columns = [
-            "trade_date",
+        """Write the next immutable schedule version without discarding prior fields.
+
+        ``ReplacingMergeTree`` keeps the newest row for a collection node.  A
+        partial insert therefore must first carry forward the existing values;
+        otherwise a derivation status update would silently reset raw collection
+        fields to their column defaults.
+        """
+        existing = self.client.query(
+            f"SELECT * FROM {SCHEDULE} FINAL WHERE collection_id = {{collection_id:String}}",
+            parameters={"collection_id": node.collection_id},
+        )
+        if existing.result_rows:
+            row_data = dict(zip(existing.column_names, existing.result_rows[0]))
+            row_data.pop("updated_at", None)
+        else:
+            row_data = {
+                "trade_date": node.trade_date,
+                "collection_id": node.collection_id,
+                "scheduled_time": node.scheduled_time,
+                "session": node.session,
+                "sequence_no": node.sequence_no,
+            }
+        row_data["status"] = status
+        row_data.update(values)
+        self.client.insert(SCHEDULE, [list(row_data.values())], column_names=list(row_data))
+
+    def repair_stale_running(
+        self,
+        trade_date: object,
+        cutoff: datetime,
+        active_collection_id: str | None,
+    ) -> int:
+        """Close overdue RUNNING rows when no live collector node owns them."""
+        columns = (
             "collection_id",
             "scheduled_time",
             "session",
             "sequence_no",
             "status",
-            *values.keys(),
-        ]
-        row = [
-            node.trade_date,
-            node.collection_id,
-            node.scheduled_time,
-            node.session,
-            node.sequence_no,
-            status,
-            *values.values(),
-        ]
-        self.client.insert(SCHEDULE, [row], column_names=columns)
+            "raw_status",
+            "derivation_status",
+            "all_a_snapshot_status",
+            "limit_up_pool_status",
+            "limit_down_pool_status",
+            "limit_break_pool_status",
+            "sector_index_status",
+        )
+        result = self.client.query(
+            f"""
+            SELECT {', '.join(columns)}
+            FROM {SCHEDULE} FINAL
+            WHERE trade_date = {{trade_date:Date}}
+              AND scheduled_time < {{cutoff:DateTime64(3, 'Asia/Shanghai')}}
+              AND (
+                    status = 'RUNNING'
+                 OR raw_status = 'RUNNING'
+                 OR derivation_status = 'RUNNING'
+                 OR all_a_snapshot_status = 'RUNNING'
+                 OR limit_up_pool_status = 'RUNNING'
+                 OR limit_down_pool_status = 'RUNNING'
+                 OR limit_break_pool_status = 'RUNNING'
+                 OR sector_index_status = 'RUNNING'
+              )
+            """,
+            parameters={"trade_date": trade_date, "cutoff": cutoff},
+        )
+        repaired = 0
+        state_columns = columns[5:]
+        for values in result.result_rows:
+            row = dict(zip(columns, values))
+            collection_id = str(row["collection_id"]).rstrip("\x00")
+            if collection_id == active_collection_id:
+                continue
+            node = ScheduleNode(
+                trade_date=trade_date,
+                scheduled_time=row["scheduled_time"],
+                session=str(row["session"]),
+                sequence_no=int(row["sequence_no"]),
+            )
+            updates = {
+                column: "FAILED_TIMEOUT" if row[column] == "RUNNING" else row[column]
+                for column in state_columns
+            }
+            self.set_schedule_status(
+                node,
+                "FAILED_TIMEOUT",
+                **updates,
+                request_end_time=datetime.now(cutoff.tzinfo),
+                error_code="FAILED_TIMEOUT",
+                error_message=(
+                    "scheduled_time passed by more than 3 minutes without an active collector node"
+                ),
+            )
+            repaired += 1
+        return repaired
 
     def previous_derived(self, node: ScheduleNode) -> dict[str, DerivedSnapshot]:
+        return self._derived_rows_for_collection(node.collection_id)
+
+    def raw_rows_for_collection(self, collection_id: str) -> list[RawSnapshot]:
+        """Read the persisted raw fact rows for one immutable collection ID."""
+        columns = list(RawSnapshot.__dataclass_fields__)
+        result = self.client.query(
+            f"SELECT {', '.join(columns)} FROM {RAW} WHERE collection_id = {{collection_id:String}}",
+            parameters={"collection_id": collection_id},
+        )
+        rows: list[RawSnapshot] = []
+        for values in result.result_rows:
+            row = dict(zip(columns, values))
+            for field in ("collection_id", "session", "batch_id", "thscode", "ticker"):
+                if isinstance(row[field], bytes):
+                    row[field] = row[field].decode("ascii").rstrip("\x00")
+            rows.append(RawSnapshot(**row))
+        return rows
+
+    def latest_derived_before(self, node: ScheduleNode) -> dict[str, DerivedSnapshot]:
+        """Return the last successful snapshot before this node on the same day."""
+        result = self.client.query(
+            f"""
+            SELECT collection_id
+            FROM {SCHEDULE} FINAL
+            WHERE trade_date = {{trade_date:Date}}
+              AND sequence_no < {{sequence_no:UInt16}}
+              AND derivation_status = 'SUCCESS'
+            ORDER BY sequence_no DESC
+            LIMIT 1
+            """,
+            parameters={
+                "trade_date": node.trade_date,
+                "sequence_no": node.sequence_no,
+            },
+        ).result_rows
+        if not result:
+            return {}
+        collection_id = result[0][0]
+        if isinstance(collection_id, bytes):
+            collection_id = collection_id.decode("ascii")
+        return self._derived_rows_for_collection(str(collection_id))
+
+    def derived_for_successful_sequence(
+        self, node: ScheduleNode, sequence_no: int
+    ) -> dict[str, DerivedSnapshot]:
+        """Return one exact earlier successful node, or no rows if it failed."""
+        result = self.client.query(
+            f"""
+            SELECT collection_id
+            FROM {SCHEDULE} FINAL
+            WHERE trade_date = {{trade_date:Date}}
+              AND sequence_no = {{sequence_no:UInt16}}
+              AND derivation_status = 'SUCCESS'
+            LIMIT 1
+            """,
+            parameters={"trade_date": node.trade_date, "sequence_no": sequence_no},
+        ).result_rows
+        if not result:
+            return {}
+        collection_id = result[0][0]
+        if isinstance(collection_id, bytes):
+            collection_id = collection_id.decode("ascii")
+        return self._derived_rows_for_collection(str(collection_id))
+
+    def _derived_rows_for_collection(self, collection_id: str) -> dict[str, DerivedSnapshot]:
         columns = [
             "trade_date",
             "collection_id",
@@ -161,15 +328,25 @@ class ClickHouseWriter:
             "new_low_flag",
             "price_delta_1m",
             "price_change_1m_pct",
+            "prev_trade_day_same_time_turnover",
+            "turnover_prev_trade_day_delta",
+            "turnover_prev_trade_day_pct",
+            "is_limit_up",
+            "is_limit_down",
+            "is_limit_break",
+            "limit_break_open_times",
         ]
         result = self.client.query(
             f"SELECT {', '.join(columns)} FROM {DERIVED} WHERE collection_id = {{collection_id:String}}",
-            parameters={"collection_id": node.collection_id},
+            parameters={"collection_id": collection_id},
         )
         found: dict[str, DerivedSnapshot] = {}
         raw_columns = list(RawSnapshot.__dataclass_fields__)
         for values in result.result_rows:
             row = dict(zip(columns, values))
+            for field in ("collection_id", "session", "batch_id", "thscode", "ticker"):
+                if isinstance(row[field], bytes):
+                    row[field] = row[field].decode("ascii").rstrip("\x00")
             raw = RawSnapshot(**{key: row[key] for key in raw_columns})
             found[raw.thscode] = DerivedSnapshot(
                 raw,
@@ -180,6 +357,37 @@ class ClickHouseWriter:
                 ],
             )
         return found
+
+    def previous_trade_day_turnovers(self, node: ScheduleNode) -> dict[str, int]:
+        """Latest earlier trading-day turnover for this stock and planned sequence.
+
+        A suspended stock simply has no row on that date.  When it later returns,
+        argMax selects its last earlier trading day that did have this same sequence.
+        """
+        result = self.client.query(
+            f"""
+            SELECT raw.thscode, argMax(raw.turnover, schedule.trade_date) AS turnover
+            FROM {RAW} AS raw
+            INNER JOIN
+            (
+                SELECT collection_id, trade_date
+                FROM {SCHEDULE} FINAL
+                WHERE sequence_no = {{sequence_no:UInt16}}
+                  AND trade_date < {{trade_date:Date}}
+                  AND derivation_status = 'SUCCESS'
+            ) AS schedule ON raw.collection_id = schedule.collection_id
+            INNER JOIN
+            (
+                SELECT trade_date AS calendar_trade_date
+                FROM {CALENDAR} FINAL
+                WHERE is_trading_day = 1
+            ) AS calendar ON schedule.trade_date = calendar.calendar_trade_date
+            WHERE raw.turnover IS NOT NULL
+            GROUP BY raw.thscode
+            """,
+            parameters={"sequence_no": node.sequence_no, "trade_date": node.trade_date},
+        )
+        return {str(thscode): int(turnover) for thscode, turnover in result.result_rows}
 
     def insert_raw_once(self, rows: list[RawSnapshot]) -> tuple[int, int]:
         return self._insert_once(RAW, rows, [field for field in RawSnapshot.__dataclass_fields__])
@@ -196,6 +404,13 @@ class ClickHouseWriter:
                 row.new_low_flag,
                 row.price_delta_1m,
                 row.price_change_1m_pct,
+                row.prev_trade_day_same_time_turnover,
+                row.turnover_prev_trade_day_delta,
+                row.turnover_prev_trade_day_pct,
+                row.is_limit_up,
+                row.is_limit_down,
+                row.is_limit_break,
+                row.limit_break_open_times,
             )
             for row in rows
         ]
@@ -279,6 +494,31 @@ class ClickHouseWriter:
         ]
         return self._insert_once(LIMIT_DOWN_POOL, rows, columns, batch_id=pool_batch)
 
+    def insert_limit_break_pool(
+        self, node: ScheduleNode, batch_id: str, snapshot: LimitPoolSnapshot
+    ) -> tuple[int, int]:
+        pool_batch = f"{batch_id}-limit-break"
+        rows = [
+            (
+                node.trade_date, node.collection_id, node.scheduled_time, pool_batch,
+                record.source_timestamp, record.source_time, str(record.item["thscode"]),
+                str(record.item["ticker"]), str(record.item.get("name") or ""),
+                _optional_float(record.item.get("last_price")),
+                _optional_float(record.item.get("price_change_ratio_pct")),
+                _optional_int(record.item.get("open_times")),
+                _optional_float(record.item.get("turnover_ratio_pct")),
+                _optional_float(record.item.get("turnover")),
+            )
+            for record in snapshot.items
+        ]
+        columns = [
+            "trade_date", "collection_id", "scheduled_time", "batch_id",
+            "source_timestamp", "source_time", "thscode", "ticker", "name",
+            "last_price", "price_change_ratio_pct", "open_times",
+            "turnover_ratio_pct", "turnover",
+        ]
+        return self._insert_once(LIMIT_BREAK_POOL, rows, columns, batch_id=pool_batch)
+
     def active_sector_catalog(self) -> list[tuple[str, str, str, str]]:
         result = self.client.query(
             """
@@ -289,6 +529,15 @@ class ClickHouseWriter:
             """
         )
         return [(str(code), str(name), str(kind), str(tag)) for code, name, kind, tag in result.result_rows]
+
+    def sector_index_fact_count(self, node: ScheduleNode) -> int:
+        return int(
+            self._scalar(
+                f"SELECT count() FROM {SECTOR_INDEX} WHERE collection_id = {{collection_id:String}}",
+                {"collection_id": node.collection_id},
+            )
+            or 0
+        )
 
     def insert_sector_index_once(
         self,
@@ -345,8 +594,71 @@ class ClickHouseWriter:
             )
         )
 
+    def limit_break_details(self, node: ScheduleNode) -> dict[str, int | None] | None:
+        """None means the break-pool source was not captured for this collection."""
+        status = self.client.query(
+            f"SELECT limit_break_pool_status FROM {SCHEDULE} FINAL WHERE collection_id = {{collection_id:String}}",
+            parameters={"collection_id": node.collection_id},
+        ).result_rows
+        if not status or status[0][0] != "SUCCESS":
+            return None
+        result = self.client.query(
+            f"SELECT thscode, open_times FROM {LIMIT_BREAK_POOL} FINAL WHERE collection_id = {{collection_id:String}}",
+            parameters={"collection_id": node.collection_id},
+        )
+        return {str(code): value for code, value in result.result_rows}
+
+    def limit_pool_codes(self, node: ScheduleNode, pool_name: str) -> set[str] | None:
+        """Stock codes for one successfully captured limit pool at this collection ID."""
+        pools = {
+            "up": ("limit_up_pool_status", LIMIT_UP_POOL),
+            "down": ("limit_down_pool_status", LIMIT_DOWN_POOL),
+        }
+        try:
+            status_column, table = pools[pool_name]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported limit pool: {pool_name}") from exc
+        status = self.client.query(
+            f"SELECT {status_column} FROM {SCHEDULE} FINAL WHERE collection_id = {{collection_id:String}}",
+            parameters={"collection_id": node.collection_id},
+        ).result_rows
+        if not status or status[0][0] != "SUCCESS":
+            return None
+        result = self.client.query(
+            f"SELECT DISTINCT thscode FROM {table} FINAL WHERE collection_id = {{collection_id:String}}",
+            parameters={"collection_id": node.collection_id},
+        )
+        return {str(row[0]) for row in result.result_rows}
+
+    def latest_limit_break_collection_before(self, node: ScheduleNode) -> str | None:
+        """The immediately preceding successfully captured break-pool snapshot."""
+        result = self.client.query(
+            f"""
+            SELECT collection_id
+            FROM {SCHEDULE} FINAL
+            WHERE trade_date = {{trade_date:Date}}
+              AND sequence_no < {{sequence_no:UInt16}}
+              AND limit_break_pool_status = 'SUCCESS'
+            ORDER BY sequence_no DESC
+            LIMIT 1
+            """,
+            parameters={"trade_date": node.trade_date, "sequence_no": node.sequence_no},
+        )
+        if not result.result_rows:
+            return None
+        value = result.result_rows[0][0]
+        return value.decode("ascii") if isinstance(value, bytes) else str(value)
+
     def upsert_sector_state(
-        self, node: ScheduleNode, sector_type: str, limit_pool_available: bool
+        self,
+        node: ScheduleNode,
+        sector_type: str,
+        limit_pool_available: bool,
+        derive_enabled: bool = True,
+        previous_collection_id: str | None = None,
+        previous_limit_break_collection_id: str | None = None,
+        allow_gap_comparison: bool = False,
+        previous_trade_day_enabled: bool | None = None,
     ) -> None:
         try:
             state_table = SECTOR_STATES[sector_type]
@@ -362,6 +674,7 @@ class ClickHouseWriter:
                 up_count, down_count, flat_count, up_ratio, down_ratio,
                 limit_up_count, up_5_to_limit_count, up_1_to_5_count, up_0_to_1_count,
                 down_0_to_1_count, down_1_to_5_count, down_5_to_limit_count, limit_down_count,
+                limit_break_count, limit_break_count_delta_prev_available,
                 turnover_total, turnover_delta_1m_total, prev_turnover_delta_1m_total,
                 turnover_growth_1m, volume_total, volume_delta_1m_total,
                 turnover_market_share_pct, turnover_1m_market_share_pct,
@@ -382,12 +695,21 @@ class ClickHouseWriter:
             WITH
                 previous AS
                 (
-                    SELECT * FROM {state_table} FINAL
+                    SELECT * REPLACE
+                    (
+                        if({{allow_gap_comparison:UInt8}} = 1,
+                            {{time:DateTime64(3, 'Asia/Shanghai')}} - INTERVAL 60 SECOND,
+                            scheduled_time
+                        ) AS scheduled_time,
+                        {{session:String}} AS session
+                    ) FROM {state_table} FINAL
                     WHERE collection_id = {{previous_collection_id:String}}
                 ),
                 previous_trade_day AS
                 (
-                    SELECT sector_code, turnover_total
+                    SELECT
+                        sector_code,
+                        CAST(turnover_total, 'Nullable(Float64)') AS turnover_total
                     FROM {state_table} FINAL
                     WHERE collection_id = concat(
                         formatDateTime(
@@ -398,8 +720,14 @@ class ClickHouseWriter:
                             ),
                             '%Y%m%d'
                         ),
-                        leftPad(toString({{sequence_no:UInt16}}), 3, '0')
+                        leftPad(toString({{previous_day_sequence_no:UInt16}}), 3, '0')
                     )
+                ),
+                previous_limit_break AS
+                (
+                    SELECT sector_code, limit_break_count
+                    FROM {state_table} FINAL
+                    WHERE collection_id = {{previous_limit_break_collection_id:String}}
                 ),
                 member_rows AS
                 (
@@ -446,8 +774,11 @@ class ClickHouseWriter:
                     SELECT
                         sector_code,
                         any(sector_name) AS sector_name,
-                        max(source_time) AS stock_source_time,
-                        toUInt32(countIf(member_thscode IS NOT NULL)) AS member_total,
+                        nullIf(
+                            max(source_time),
+                            toDateTime64(0, 3, 'Asia/Shanghai')
+                        ) AS stock_source_time,
+                        toUInt32(countIf(member_thscode != '')) AS member_total,
                         toUInt32(countIf(price_change_ratio_pct IS NOT NULL)) AS valid_member_count,
                         toUInt32(countIf(price_change_ratio_pct > 0)) AS up_count,
                         toUInt32(countIf(price_change_ratio_pct < 0)) AS down_count,
@@ -468,6 +799,9 @@ class ClickHouseWriter:
                         if({{pool_available:UInt8}} = 1,
                             toUInt32(countIf(snapshot_thscode IN (SELECT DISTINCT thscode FROM {LIMIT_DOWN_POOL} FINAL WHERE collection_id = {{collection_id:String}}))),
                             CAST(NULL, 'Nullable(UInt32)')) AS limit_down_count,
+                        if({{pool_available:UInt8}} = 1,
+                            toUInt32(countIf(snapshot_thscode IN (SELECT DISTINCT thscode FROM {LIMIT_BREAK_POOL} FINAL WHERE collection_id = {{collection_id:String}}))),
+                            CAST(NULL, 'Nullable(UInt32)')) AS limit_break_count,
                         toFloat64(sum(turnover)) AS turnover_total,
                         if(countIf(turnover_delta_1m IS NOT NULL) = 0,
                             CAST(NULL, 'Nullable(Float64)'), toFloat64(sum(turnover_delta_1m))) AS turnover_delta_1m_total,
@@ -503,6 +837,12 @@ class ClickHouseWriter:
                     WHERE collection_id = {{collection_id:String}}
                       AND sector_type = {{sector_type:String}}
                 ),
+                stock_snapshot AS
+                (
+                    SELECT max(source_time) AS source_time
+                    FROM {DERIVED} FINAL
+                    WHERE collection_id = {{collection_id:String}}
+                ),
                 market AS
                 (
                     SELECT turnover_total, turnover_delta_1m_total
@@ -513,7 +853,7 @@ class ClickHouseWriter:
                 {{date:Date}},
                 {{collection_id:String}},
                 {{time:DateTime64(3, 'Asia/Shanghai')}},
-                current.stock_source_time,
+                coalesce(current.stock_source_time, stock_snapshot.source_time),
                 index_current.source_time,
                 {{session:String}},
                 current.sector_code,
@@ -541,6 +881,10 @@ class ClickHouseWriter:
                 current.down_1_to_5_count,
                 current.down_5_to_limit_count,
                 current.limit_down_count,
+                current.limit_break_count,
+                if(previous_limit_break.limit_break_count IS NOT NULL AND current.limit_break_count IS NOT NULL,
+                    CAST(toInt64(current.limit_break_count) - toInt64(previous_limit_break.limit_break_count), 'Nullable(Int32)'),
+                    CAST(NULL, 'Nullable(Int32)')),
                 current.turnover_total,
                 current.turnover_delta_1m_total,
                 if(previous.scheduled_time IS NOT NULL AND previous.session = {{session:String}}
@@ -621,7 +965,9 @@ class ClickHouseWriter:
             FROM sector_current AS current
             LEFT JOIN index_current USING (sector_code)
             LEFT JOIN previous USING (sector_code)
+            LEFT JOIN previous_limit_break USING (sector_code)
             LEFT JOIN previous_trade_day USING (sector_code)
+            CROSS JOIN stock_snapshot
             CROSS JOIN market
             """,
             parameters={
@@ -631,10 +977,16 @@ class ClickHouseWriter:
                 "session": node.session,
                 "sequence_no": node.sequence_no,
                 "previous_collection_id": (
-                    f"{node.trade_date:%Y%m%d}{node.sequence_no - 1:03d}"
-                    if node.sequence_no > 1
+                    previous_collection_id
+                    or f"{node.trade_date:%Y%m%d}{node.sequence_no - 1:03d}"
+                    if derive_enabled and node.sequence_no > 1
                     else ""
                 ),
+                "previous_limit_break_collection_id": previous_limit_break_collection_id or "",
+                "previous_day_sequence_no": node.sequence_no
+                if (node.sequence_no >= 12 if previous_trade_day_enabled is None else previous_trade_day_enabled)
+                else 0,
+                "allow_gap_comparison": int(allow_gap_comparison and derive_enabled),
                 "sector_type": sector_type,
                 "pool_available": int(limit_pool_available),
             },
@@ -652,7 +1004,7 @@ class ClickHouseWriter:
             SELECT scheduled_time, session, sequence_no
             FROM {SCHEDULE} FINAL
             WHERE trade_date = {{date:Date}} AND sequence_no = {{sequence_no:UInt16}}
-              AND status = 'SUCCESS'
+              AND derivation_status = 'SUCCESS'
             """,
             parameters={"date": trade_date, "sequence_no": sequence_no},
         ).result_rows
@@ -669,7 +1021,16 @@ class ClickHouseWriter:
             )
         )
 
-    def upsert_market_state(self, node: ScheduleNode, limit_pool_available: bool) -> None:
+    def upsert_market_state(
+        self,
+        node: ScheduleNode,
+        limit_pool_available: bool,
+        derive_enabled: bool = True,
+        previous_collection_id: str | None = None,
+        previous_limit_break_collection_id: str | None = None,
+        allow_gap_comparison: bool = False,
+        previous_trade_day_enabled: bool | None = None,
+    ) -> None:
         """Aggregate one real snapshot node; absent snapshot nodes are never synthesized."""
         self.client.command(
             f"""
@@ -679,6 +1040,7 @@ class ClickHouseWriter:
                 stock_total, valid_stock_count, up_count, down_count, flat_count, up_ratio, down_ratio,
                 limit_up_count, up_5_to_limit_count, up_1_to_5_count, up_0_to_1_count,
                 down_0_to_1_count, down_1_to_5_count, down_5_to_limit_count, limit_down_count,
+                limit_break_count, limit_break_count_delta_prev_available,
                 turnover_total, turnover_delta_1m_total, prev_turnover_delta_1m_total,
                 turnover_growth_1m_market, volume_total, volume_delta_1m_total,
                 yesterday_same_time_turnover, turnover_prev_day_delta, turnover_prev_day_pct,
@@ -694,7 +1056,14 @@ class ClickHouseWriter:
             WITH
                 previous AS
                 (
-                    SELECT * FROM {MARKET_STATE} FINAL
+                    SELECT * REPLACE
+                    (
+                        if({{allow_gap_comparison:UInt8}} = 1,
+                            {{time:DateTime64(3, 'Asia/Shanghai')}} - INTERVAL 60 SECOND,
+                            scheduled_time
+                        ) AS scheduled_time,
+                        {{session:String}} AS session
+                    ) FROM {MARKET_STATE} FINAL
                     WHERE collection_id = {{previous_collection_id:String}}
                     LIMIT 1
                 ),
@@ -712,6 +1081,13 @@ class ClickHouseWriter:
                         ),
                         leftPad(toString({{sequence_no:UInt16}}), 3, '0')
                     )
+                    LIMIT 1
+                ),
+                previous_limit_break AS
+                (
+                    SELECT limit_break_count
+                    FROM {MARKET_STATE} FINAL
+                    WHERE collection_id = {{previous_limit_break_collection_id:String}}
                     LIMIT 1
                 )
             SELECT
@@ -735,6 +1111,17 @@ class ClickHouseWriter:
                 current.down_1_to_5_count,
                 current.down_5_to_limit_count,
                 current.limit_down_count,
+                current.limit_break_count,
+                if(
+                    previous_limit_break.limit_break_count IS NOT NULL
+                    AND current.limit_break_count IS NOT NULL,
+                    CAST(
+                        toInt64(current.limit_break_count)
+                        - toInt64(previous_limit_break.limit_break_count),
+                        'Nullable(Int32)'
+                    ),
+                    CAST(NULL, 'Nullable(Int32)')
+                ),
                 current.turnover_total,
                 if(
                     previous.scheduled_time IS NOT NULL
@@ -866,6 +1253,9 @@ class ClickHouseWriter:
                     if({{pool_available:UInt8}} = 1,
                         toUInt32(countIf(thscode IN (SELECT DISTINCT thscode FROM {LIMIT_DOWN_POOL} FINAL WHERE collection_id = {{collection_id:String}}))),
                         CAST(NULL, 'Nullable(UInt32)')) AS limit_down_count,
+                    if({{pool_available:UInt8}} = 1,
+                        toUInt32(countIf(thscode IN (SELECT DISTINCT thscode FROM {LIMIT_BREAK_POOL} FINAL WHERE collection_id = {{collection_id:String}}))),
+                        CAST(NULL, 'Nullable(UInt32)')) AS limit_break_count,
                     toDecimal64(sum(turnover), 2) AS turnover_total,
                     if(countIf(turnover_delta_1m IS NOT NULL) = 0,
                         CAST(NULL, 'Nullable(Decimal64(2))'),
@@ -897,17 +1287,24 @@ class ClickHouseWriter:
             ) AS current
             LEFT JOIN previous ON 1 = 1
             LEFT JOIN prior_trade_day ON 1 = 1
+            LEFT JOIN previous_limit_break ON 1 = 1
             """,
             parameters={
                 "date": node.trade_date,
                 "time": node.scheduled_time,
                 "collection_id": node.collection_id,
+                "session": node.session,
                 "previous_collection_id": (
-                    f"{node.trade_date:%Y%m%d}{node.sequence_no - 1:03d}"
-                    if node.sequence_no > 1
+                    previous_collection_id
+                    or f"{node.trade_date:%Y%m%d}{node.sequence_no - 1:03d}"
+                    if derive_enabled and node.sequence_no > 1
                     else ""
                 ),
-                "sequence_no": node.sequence_no,
+                "previous_limit_break_collection_id": previous_limit_break_collection_id or "",
+                "sequence_no": node.sequence_no
+                if (node.sequence_no >= 12 if previous_trade_day_enabled is None else previous_trade_day_enabled)
+                else 0,
+                "allow_gap_comparison": int(allow_gap_comparison and derive_enabled),
                 "pool_available": int(limit_pool_available),
             },
         )
@@ -936,6 +1333,38 @@ class ClickHouseWriter:
             ScheduleNode(trade_date, scheduled_time, session, sequence_no)
             for scheduled_time, session, sequence_no in result.result_rows
         ]
+
+    def raw_snapshot_nodes(self, trade_date: object) -> list[ScheduleNode]:
+        result = self.client.query(
+            f"""
+            SELECT s.scheduled_time, s.session, s.sequence_no
+            FROM
+            (
+                SELECT collection_id, scheduled_time, session, sequence_no
+                FROM {SCHEDULE} FINAL
+                WHERE trade_date = {{date:Date}}
+            ) AS s
+            INNER JOIN
+            (
+                SELECT DISTINCT collection_id
+                FROM {RAW}
+                WHERE trade_date = {{date:Date}}
+            ) AS r USING (collection_id)
+            ORDER BY s.sequence_no
+            """,
+            parameters={"date": trade_date},
+        )
+        return [
+            ScheduleNode(trade_date, scheduled_time, session, sequence_no)
+            for scheduled_time, session, sequence_no in result.result_rows
+        ]
+
+    def clear_rebuildable_derived_outputs(self, trade_date: object) -> None:
+        for table in (DERIVED, MARKET_STATE, *SECTOR_STATES.values()):
+            self.client.command(
+                f"ALTER TABLE {table} DELETE WHERE trade_date = {{date:Date}} SETTINGS mutations_sync = 2",
+                parameters={"date": trade_date},
+            )
 
     def migrate_collection_ids(self, trade_date: object) -> None:
         """Backfill the immutable YYYYMMDD + 3-digit planned sequence key."""

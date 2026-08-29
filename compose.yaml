@@ -3,8 +3,9 @@ name: hithink-snapshot
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:26.3
+    restart: unless-stopped
     env_file:
-      - C:\\Users\\DmarketosOS\\.config\\hithink\\collector.env
+      - ./secrets/collector.env
     environment:
       CLICKHOUSE_USER: hithink_snapshot
     ports:

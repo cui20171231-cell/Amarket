@@ -5,7 +5,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from time import perf_counter, sleep
 from typing import Any
@@ -13,6 +13,7 @@ from typing import Any
 import pyarrow.parquet as pq
 
 from app.hithink.api import HithinkApiError, HithinkClient
+from app.hithink.daily_deriver import DailyForwardDeriver, ForwardFormulaUnverified
 from app.hithink.schedule import SHANGHAI
 from app.hithink.writer import ClickHouseWriter
 
@@ -23,10 +24,6 @@ EVENTS = "market.hithink_adjustment_events"
 
 
 class DataNotReady(RuntimeError):
-    pass
-
-
-class ForwardFormulaUnverified(RuntimeError):
     pass
 
 
@@ -42,8 +39,21 @@ def _trade_date(milliseconds: int) -> date:
     return datetime.fromtimestamp(milliseconds / 1000, tz=SHANGHAI).date()
 
 
+def _daily_collection_id(value: date) -> str:
+    """Daily data has one collection point: the day's final 254th node."""
+    return f"{value:%Y%m%d}254"
+
+
 def _ticker(thscode: str) -> str:
     return thscode.split(".", 1)[0]
+
+
+def _remove_temp_dump(path: Path) -> None:
+    """A cleanup failure must never hide the download/sync result on Windows."""
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        LOG.warning("Could not remove temporary daily dump; it will be left for later cleanup: %s", path)
 
 
 def _event_fingerprint(row: dict[str, Any]) -> str:
@@ -60,7 +70,8 @@ def _event_fingerprint(row: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-class DailyPipeline:
+class DailyRawCollector:
+    """Collection module: writes only raw daily-K and adjustment-event facts."""
     def __init__(self, api: HithinkClient, writer: ClickHouseWriter):
         self.api = api
         self.writer = writer
@@ -126,22 +137,33 @@ class DailyPipeline:
         started = datetime.now(SHANGHAI)
         self.writer.set_daily_status(trade_date, task_name, "RUNNING", request_start_time=started)
         dump_path = self._download("daily_k" if initialize else "daily_k_10d")
+        parquet: pq.ParquetFile | None = None
         try:
             parquet = pq.ParquetFile(dump_path)
+            latest: date | None = None
+            for batch in parquet.iter_batches(columns=["date_ms"], batch_size=100_000):
+                for item in batch.to_pylist():
+                    item_date = _trade_date(int(item["date_ms"]))
+                    latest = max(latest, item_date) if latest else item_date
+            if latest is None:
+                raise RuntimeError("daily-k dump was empty")
+            if latest < trade_date:
+                raise DataNotReady(
+                    f"source_latest_trade_date={latest} < today={trade_date}"
+                )
+
             version_time = datetime.now(SHANGHAI)
             inserted = 0
-            latest: date | None = None
             stocks: set[str] = set()
             for batch in parquet.iter_batches(batch_size=100_000):
                 rows = []
                 for item in batch.to_pylist():
                     thscode = str(item["thscode"])
                     item_date = _trade_date(int(item["date_ms"]))
-                    latest = max(latest, item_date) if latest else item_date
                     stocks.add(thscode)
                     rows.append(
                         (
-                            item_date, int(item["date_ms"]), thscode, _ticker(thscode),
+                            item_date, _daily_collection_id(item_date), int(item["date_ms"]), thscode, _ticker(thscode),
                             str(item["currency"]), str(item["interval"]), str(item["adjusted"]),
                             float(item["open_price"]), float(item["high_price"]), float(item["low_price"]),
                             float(item["close_price"]), float(item["volume"]), float(item["turnover"]),
@@ -152,19 +174,13 @@ class DailyPipeline:
                     RAW,
                     rows,
                     column_names=[
-                        "trade_date", "date_ms", "thscode", "ticker", "currency", "interval", "adjusted",
+                        "trade_date", "collection_id", "date_ms", "thscode", "ticker", "currency", "interval", "adjusted",
                         "open_price", "high_price", "low_price", "close_price", "volume", "turnover",
                         "source", "version_time",
                     ],
                 )
                 inserted += len(rows)
-            if latest is None:
-                raise RuntimeError("daily-k dump was empty")
             result = SyncResult(parquet.metadata.num_rows, inserted, latest, len(stocks))
-            if not initialize and result.source_latest_trade_date < trade_date:
-                raise DataNotReady(
-                    f"source_latest_trade_date={result.source_latest_trade_date} < today={trade_date}"
-                )
             self.writer.set_daily_status(
                 trade_date, task_name, "SUCCESS", request_start_time=started,
                 request_end_time=datetime.now(SHANGHAI), source_file_date=result.source_latest_trade_date,
@@ -187,43 +203,54 @@ class DailyPipeline:
             )
             raise
         finally:
-            dump_path.unlink(missing_ok=True)
+            if parquet is not None:
+                parquet.close()
+            _remove_temp_dump(dump_path)
 
     def sync_events(self, trade_date: date) -> set[str]:
         task_name = "hithink_adjustment_events_sync"
         started = datetime.now(SHANGHAI)
         self.writer.set_daily_status(trade_date, task_name, "RUNNING", request_start_time=started)
         previous = self._event_sets()
+        known_fingerprints = {
+            fingerprint for fingerprints in previous.values() for fingerprint in fingerprints
+        }
         dump_path = self._download("adjustment_factors")
+        parquet: pq.ParquetFile | None = None
         try:
             parquet = pq.ParquetFile(dump_path)
             version_time = datetime.now(SHANGHAI)
             current: dict[str, set[str]] = {}
             inserted = 0
             for batch in parquet.iter_batches(batch_size=100_000):
-                rows = []
+                rows_by_month: dict[str, list[tuple[object, ...]]] = {}
                 for item in batch.to_pylist():
                     thscode = str(item["thscode"])
                     fingerprint = _event_fingerprint(item)
+                    ex_date = _trade_date(int(item["ex_date_ms"]))
                     current.setdefault(thscode, set()).add(fingerprint)
-                    rows.append(
+                    if fingerprint in known_fingerprints:
+                        continue
+                    known_fingerprints.add(fingerprint)
+                    rows_by_month.setdefault(ex_date.strftime("%Y%m"), []).append(
                         (
-                            thscode, str(item["ticker"]), _trade_date(int(item["ex_date_ms"])),
-                            int(item["ex_date_ms"]), float(item["dividend_per_share"]),
+                            thscode, str(item["ticker"]), ex_date,
+                            _daily_collection_id(ex_date), int(item["ex_date_ms"]), float(item["dividend_per_share"]),
                             float(item["per_share_bonus"]), float(item["allotment_ratio"]),
                             float(item["allotment_price"]), str(item["currency"]), fingerprint,
                             "hithink", version_time,
                         )
                     )
-                self.writer.client.insert(
-                    EVENTS, rows,
-                    column_names=[
-                        "thscode", "ticker", "ex_date", "ex_date_ms", "dividend_per_share",
-                        "per_share_bonus", "allotment_ratio", "allotment_price", "currency",
-                        "event_fingerprint", "source", "version_time",
-                    ],
-                )
-                inserted += len(rows)
+                for rows in rows_by_month.values():
+                    self.writer.client.insert(
+                        EVENTS, rows,
+                        column_names=[
+                            "thscode", "ticker", "ex_date", "collection_id", "ex_date_ms", "dividend_per_share",
+                            "per_share_bonus", "allotment_ratio", "allotment_price", "currency",
+                            "event_fingerprint", "source", "version_time",
+                        ],
+                    )
+                    inserted += len(rows)
             affected = {code for code in set(previous) | set(current) if previous.get(code, set()) != current.get(code, set())}
             self.writer.set_daily_status(
                 trade_date, task_name, "SUCCESS", request_start_time=started,
@@ -239,7 +266,9 @@ class DailyPipeline:
             )
             raise
         finally:
-            dump_path.unlink(missing_ok=True)
+            if parquet is not None:
+                parquet.close()
+            _remove_temp_dump(dump_path)
 
     def _event_sets(self) -> dict[str, set[str]]:
         result = self.writer.client.query(f"SELECT thscode, event_fingerprint FROM {EVENTS} FINAL")
@@ -248,80 +277,103 @@ class DailyPipeline:
             sets.setdefault(thscode, set()).add(fingerprint)
         return sets
 
-    def forward_build(self, trade_date: date, affected: set[str]) -> None:
-        message = (
-            "Official adjustment-event documentation does not define a factor formula for "
-            "cash dividends, bonuses and rights issues; forward prices will not be guessed."
-        )
-        self.writer.set_daily_status(
-            trade_date,
-            "hithink_daily_k_forward_build",
-            "FAILED",
-            request_start_time=datetime.now(SHANGHAI),
-            request_end_time=datetime.now(SHANGHAI),
-            affected_stock_count=len(affected),
-            error_code="FORWARD_FORMULA_UNVERIFIED",
-            error_message=message,
-        )
-        raise ForwardFormulaUnverified(message)
+class DailyPipeline:
+    """Orchestrator for daily raw collection; derivation remains manual-only."""
 
-    def run_pipeline(self, trade_date: date, *, initialize: bool) -> None:
+    def __init__(self, api: HithinkClient, writer: ClickHouseWriter):
+        self.writer = writer
+        self.collector = DailyRawCollector(api, writer)
+        # Keep the derivation module available for a separately requested manual run.
+        # The automatic daily task must not invoke it.
+        self.deriver = DailyForwardDeriver(writer)
+
+    def collect(self, trade_date: date, *, initialize: bool) -> set[str] | None:
+        started_at = datetime.now(SHANGHAI)
         started = perf_counter()
-        task_name = "hithink_daily_initialize" if initialize else "daily_pipeline"
-        self.writer.set_daily_status(trade_date, task_name, "RUNNING", request_start_time=datetime.now(SHANGHAI))
-        decision = self.calendar_gate(trade_date)
+        self.writer.set_daily_status(
+            trade_date, "daily_collection", "RUNNING", request_start_time=started_at
+        )
+        decision = self.collector.calendar_gate(trade_date)
         if decision is None:
-            self.writer.set_daily_status(trade_date, task_name, "FAILED", error_code="CALENDAR_UNKNOWN")
-            return
+            self.writer.set_daily_status(
+                trade_date, "daily_collection", "FAILED", request_start_time=started_at,
+                request_end_time=datetime.now(SHANGHAI), error_code="CALENDAR_UNKNOWN",
+                duration_ms=round((perf_counter() - started) * 1000),
+            )
+            return None
         if not decision:
             self.writer.set_daily_status(
-                trade_date, task_name, "SKIPPED", error_code="NON_TRADING_DAY",
-                request_end_time=datetime.now(SHANGHAI), duration_ms=round((perf_counter() - started) * 1000),
+                trade_date, "daily_collection", "SKIPPED", request_start_time=started_at,
+                request_end_time=datetime.now(SHANGHAI), error_code="NON_TRADING_DAY",
+                duration_ms=round((perf_counter() - started) * 1000),
             )
-            return
+            return None
         try:
-            self.sync_raw(trade_date, initialize=initialize)
-            affected = self.sync_events(trade_date)
-            self.forward_build(trade_date, affected)
+            self.collector.sync_raw(trade_date, initialize=initialize)
+            # Corporate-action events are refreshed once a week, on Monday.
+            # On every other trading day only the daily-K raw data is refreshed.
+            affected = (
+                self.collector.sync_events(trade_date)
+                if trade_date.weekday() == 0
+                else set()
+            )
+            if trade_date.weekday() != 0:
+                self.writer.set_daily_status(
+                    trade_date,
+                    "hithink_adjustment_events_sync",
+                    "SKIPPED",
+                    error_code="NOT_SCHEDULED_TODAY",
+                )
         except DataNotReady as exc:
             self.writer.set_daily_status(
-                trade_date, task_name, "FAILED", request_end_time=datetime.now(SHANGHAI),
-                duration_ms=round((perf_counter() - started) * 1000), error_code="DATA_NOT_READY",
-                error_message=str(exc),
+                trade_date, "daily_collection", "WAITING_SOURCE", request_start_time=started_at,
+                request_end_time=datetime.now(SHANGHAI), error_code="DATA_NOT_READY",
+                error_message=str(exc), duration_ms=round((perf_counter() - started) * 1000),
             )
             raise
         except Exception as exc:
             self.writer.set_daily_status(
-                trade_date, task_name, "FAILED", request_end_time=datetime.now(SHANGHAI),
-                duration_ms=round((perf_counter() - started) * 1000), error_code=type(exc).__name__,
-                error_message=str(exc)[:1000],
+                trade_date, "daily_collection", "FAILED", request_start_time=started_at,
+                request_end_time=datetime.now(SHANGHAI), error_code=type(exc).__name__,
+                error_message=str(exc)[:1000], duration_ms=round((perf_counter() - started) * 1000),
             )
             raise
+        self.writer.set_daily_status(
+            trade_date, "daily_collection", "SUCCESS", request_start_time=started_at,
+            request_end_time=datetime.now(SHANGHAI), affected_stock_count=len(affected),
+            duration_ms=round((perf_counter() - started) * 1000),
+        )
+        if initialize:
+            self.writer.set_daily_status(
+                trade_date, "hithink_daily_initialize", "SUCCESS",
+                request_start_time=started_at, request_end_time=datetime.now(SHANGHAI),
+            )
+        return affected
+
+    def run_pipeline(self, trade_date: date, *, initialize: bool) -> None:
+        self.collect(trade_date, initialize=initialize)
 
     def repair_scan(self, trade_date: date) -> None:
-        status = self.daily_status(trade_date, "hithink_daily_initialize")
-        if status != "SUCCESS":
+        if not self.writer.daily_seed_complete():
             self.writer.set_daily_status(
                 trade_date, "repair_scan", "SKIPPED", error_code="INITIALIZATION_PENDING"
             )
             return
         self.writer.set_daily_status(trade_date, "repair_scan", "SUCCESS")
 
-    def daily_status(self, trade_date: date, task_name: str) -> str | None:
-        return self.writer.daily_status(trade_date, task_name)
-
     def run_auto(self) -> None:
         now = datetime.now(SHANGHAI)
         trade_date = now.date()
-        self.calendar_gate(trade_date)
+        self.writer.initialize_daily_task_plan(trade_date)
+        self.collector.calendar_gate(trade_date)
         self.repair_scan(trade_date)
-        if now.time() < time(15, 45):
+        if now.time() < time(16, 0):
             return
         initialize = not self.writer.daily_seed_complete()
         if initialize and now.time() < time(16, 5):
             delay = (datetime.combine(trade_date, time(16, 5), tzinfo=SHANGHAI) - now).total_seconds()
             sleep(max(1, delay))
-        deadline = datetime.combine(trade_date, time(18, 45), tzinfo=SHANGHAI)
+        deadline = datetime.combine(trade_date + timedelta(days=1), time(8, 30), tzinfo=SHANGHAI)
         while datetime.now(SHANGHAI) <= deadline:
             try:
                 self.run_pipeline(trade_date, initialize=initialize)
@@ -331,3 +383,7 @@ class DailyPipeline:
                 initialize = not self.writer.daily_seed_complete()
             except ForwardFormulaUnverified:
                 return
+            except Exception:
+                LOG.exception("Daily collection failed; retrying in ten minutes")
+                sleep(600)
+                initialize = not self.writer.daily_seed_complete()

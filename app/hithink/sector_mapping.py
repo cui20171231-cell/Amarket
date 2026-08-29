@@ -39,10 +39,73 @@ class SectorMappingSync:
         self.workers = workers
 
     def sync_all(self) -> str:
-        run_id = f"sector-{datetime.now(SHANGHAI):%Y%m%dT%H%M%S}-{uuid4().hex[:8]}"
-        for source_tag, sector_type in TYPES.items():
-            self.sync_type(run_id, source_tag, sector_type)
-        return run_id
+        started = datetime.now(SHANGHAI)
+        sync_date = started.date()
+        run_id = f"sector-{started:%Y%m%dT%H%M%S}-{uuid4().hex[:8]}"
+        self.writer.initialize_daily_task_plan(sync_date)
+        for task_name in ("sector_catalog_sync", "sector_membership_sync"):
+            self.writer.set_daily_status(
+                sync_date, task_name, "RUNNING", request_start_time=started
+            )
+        try:
+            for source_tag, sector_type in TYPES.items():
+                self.sync_type(run_id, source_tag, sector_type)
+            self._finish_daily_plan(sync_date, run_id, started)
+            return run_id
+        except Exception as exc:
+            completed = datetime.now(SHANGHAI)
+            for task_name in ("sector_catalog_sync", "sector_membership_sync"):
+                self.writer.set_daily_status(
+                    sync_date,
+                    task_name,
+                    "FAILED",
+                    request_start_time=started,
+                    request_end_time=completed,
+                    duration_ms=round((completed - started).total_seconds() * 1000),
+                    error_code=type(exc).__name__,
+                    error_message=str(exc)[:1000],
+                )
+            raise
+
+    def _finish_daily_plan(self, sync_date: date, run_id: str, started: datetime) -> None:
+        rows = self.writer.client.query(
+            f"""
+            SELECT status, sector_count, sector_failed_count, membership_count,
+                   added_count, removed_count, error_code, error_message
+            FROM {STATUS} FINAL
+            WHERE sync_run_id = {{run_id:String}}
+            """,
+            parameters={"run_id": run_id},
+        ).result_rows
+        completed = datetime.now(SHANGHAI)
+        duration_ms = round((completed - started).total_seconds() * 1000)
+        catalog_failed = any(row[6] == "CATALOG_ERROR" for row in rows)
+        membership_partial = any(row[0] != "SUCCESS" for row in rows)
+        messages = [str(row[7]) for row in rows if row[7]]
+        self.writer.set_daily_status(
+            sync_date,
+            "sector_catalog_sync",
+            "FAILED" if catalog_failed else "SUCCESS",
+            request_start_time=started,
+            request_end_time=completed,
+            download_rows=sum(int(row[1]) for row in rows),
+            duration_ms=duration_ms,
+            error_code="CATALOG_ERROR" if catalog_failed else None,
+            error_message="; ".join(messages)[:1000] if catalog_failed else None,
+        )
+        self.writer.set_daily_status(
+            sync_date,
+            "sector_membership_sync",
+            "PARTIAL" if membership_partial else "SUCCESS",
+            request_start_time=started,
+            request_end_time=completed,
+            download_rows=sum(int(row[3]) for row in rows),
+            insert_rows=sum(int(row[3]) + int(row[5]) for row in rows),
+            updated_rows=sum(int(row[4]) + int(row[5]) for row in rows),
+            duration_ms=duration_ms,
+            error_code="MEMBERSHIP_PARTIAL" if membership_partial else None,
+            error_message="; ".join(messages)[:1000] if membership_partial else None,
+        )
 
     def sync_type(self, run_id: str, source_tag: str, sector_type: str) -> None:
         started = datetime.now(SHANGHAI)

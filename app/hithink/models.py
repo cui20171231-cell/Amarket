@@ -63,3 +63,10 @@ class DerivedSnapshot:
     new_low_flag: int | None
     price_delta_1m: float | None
     price_change_1m_pct: float | None
+    prev_trade_day_same_time_turnover: int | None = None
+    turnover_prev_trade_day_delta: int | None = None
+    turnover_prev_trade_day_pct: float | None = None
+    is_limit_up: int | None = None
+    is_limit_down: int | None = None
+    is_limit_break: int | None = None
+    limit_break_open_times: int | None = None

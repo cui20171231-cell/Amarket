@@ -18,6 +18,16 @@ class ScheduleNode:
     def collection_id(self) -> str:
         return f"{self.trade_date:%Y%m%d}{self.sequence_no:03d}"
 
+    @property
+    def limit_pools_applicable(self) -> bool:
+        """Three limit pools are meaningful only outside live call-auction samples.
+
+        Sequence 011 is captured after the 09:25 opening match, sequence 250
+        is the last pre-close continuous sample, and sequence 254 is the real
+        post-close baseline.  Those three nodes therefore remain applicable.
+        """
+        return not (1 <= self.sequence_no <= 10 or 251 <= self.sequence_no <= 253)
+
 
 def _at(trade_date: date, value: time) -> datetime:
     return datetime.combine(trade_date, value, SHANGHAI)
@@ -37,7 +47,9 @@ def _every_minute(
 
 def build_daily_schedule(trade_date: date) -> list[ScheduleNode]:
     slots: list[tuple[datetime, str]] = []
-    slots.extend(_every_minute(trade_date, time(9, 15), time(9, 25), "auction_open"))
+    slots.extend(
+        _every_minute(trade_date, time(9, 15, 15), time(9, 25, 15), "auction_open")
+    )
     slots.extend(_every_minute(trade_date, time(9, 30, 15), time(11, 30, 15), "continuous_am"))
     slots.extend(_every_minute(trade_date, time(13, 0, 15), time(14, 56, 15), "continuous_pm"))
     slots.extend(
@@ -51,12 +63,3 @@ def build_daily_schedule(trade_date: date) -> list[ScheduleNode]:
     if len(nodes) != 254:
         raise RuntimeError(f"schedule invariant failed: expected 254 nodes, got {len(nodes)}")
     return nodes
-
-
-def allows_one_minute_derivation(current: ScheduleNode, previous: ScheduleNode | None) -> bool:
-    return bool(
-        previous
-        and current.trade_date == previous.trade_date
-        and current.session == previous.session
-        and current.scheduled_time - previous.scheduled_time == timedelta(minutes=1)
-    )

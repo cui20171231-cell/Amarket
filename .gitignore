@@ -1,10 +1,23 @@
 .env
+secrets/
 .venv/
+.ai_gateway_env/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.py[cod]
+*.log
+logs/
 data/
 exports/
 .docker-client/
+.runtime/
+docker-data/
 *.egg-info/
+
+# 从测试阶段保留在本机的一次性数据库工具，不属于 1.0 运行版本。
+/drop_market2_database.py
+/marketB_derived_once.py
+/marketB_market_state_once.py
+/marketB_sector_state_once.py
+/marketB_three_table_query_stress.py

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hithink-snapshot-collector"
-version = "0.1.0"
+version = "1.0.0"
 description = "Independent all-A-share snapshot collector for the Hithink Financial API"
 readme = "README.md"
 requires-python = ">=3.11"
