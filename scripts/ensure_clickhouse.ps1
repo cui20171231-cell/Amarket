@@ -5,10 +5,8 @@ function Start-AmarketClickHouse
         [string]$ProjectRoot
     )
 
-    $docker = 'C:\Program Files\Docker\Docker\resources\bin\docker.exe'
-    $desktop = 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
     $runtimeDirectory = Join-Path $ProjectRoot '.runtime'
-    $lockPath = Join-Path $runtimeDirectory 'docker-startup.lock'
+    $lockPath = Join-Path $runtimeDirectory 'linux-clickhouse-startup.lock'
     $lockStream = $null
 
     New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
@@ -23,53 +21,39 @@ function Start-AmarketClickHouse
             )
             break
         } catch [System.IO.IOException] {
-            if ($attempt -eq 120) { throw 'Timed out waiting for the Docker startup lock.' }
+            if ($attempt -eq 120) { throw 'Timed out waiting for the Linux ClickHouse startup lock.' }
             Start-Sleep -Seconds 5
         }
     }
 
     try {
-        $env:DOCKER_CONFIG = Join-Path $ProjectRoot '.docker-client'
-        $env:DOCKER_HOST = 'npipe:////./pipe/dockerDesktopLinuxEngine'
-        New-Item -ItemType Directory -Force -Path $env:DOCKER_CONFIG | Out-Null
-
-        if (-not (Test-Path $docker)) {
-            throw 'Docker Desktop is not installed.'
+        try {
+            Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 'http://127.0.0.1:8123/ping' | Out-Null
+            return
+        } catch {
+            # Continue into the Linux recovery path.
         }
 
-        $previousErrorAction = $ErrorActionPreference
-        $ErrorActionPreference = 'SilentlyContinue'
-        & $docker version --format '{{.Server.Version}}' 2>$null | Out-Null
-        $dockerReady = $LASTEXITCODE -eq 0
-        $ErrorActionPreference = $previousErrorAction
-
-        if (-not $dockerReady) {
-            $desktopProcess = Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue
-            if (-not $desktopProcess) {
-                Start-Process -FilePath $desktop -WindowStyle Hidden
-            }
-
-            for ($attempt = 1; $attempt -le 120; $attempt++) {
-                $previousErrorAction = $ErrorActionPreference
-                $ErrorActionPreference = 'SilentlyContinue'
-                & $docker version --format '{{.Server.Version}}' 2>$null | Out-Null
-                $dockerReady = $LASTEXITCODE -eq 0
-                $ErrorActionPreference = $previousErrorAction
-                if ($dockerReady) { break }
-                if ($attempt -eq 120) { throw 'Docker engine did not become ready within ten minutes.' }
-                Start-Sleep -Seconds 5
-            }
+        if (-not (Test-Path 'C:\Windows\System32\wsl.exe')) {
+            throw 'Windows Subsystem for Linux is not installed.'
         }
 
-        & $docker compose -f (Join-Path $ProjectRoot 'compose.yaml') up -d
-        if ($LASTEXITCODE -ne 0) { throw 'ClickHouse failed to start.' }
+        $root = [System.IO.Path]::GetPathRoot($ProjectRoot)
+        $drive = $root.Substring(0, 1).ToLowerInvariant()
+        $relativeProject = $ProjectRoot.Substring($root.Length).Replace('\', '/')
+        $linuxProjectRoot = "/mnt/$drive/$relativeProject"
+        $linuxCompose = "$linuxProjectRoot/compose.linux.yaml"
+
+        & 'C:\Windows\System32\wsl.exe' -d Ubuntu --user root -- `
+            docker compose -f $linuxCompose up -d
+        if ($LASTEXITCODE -ne 0) { throw 'Linux ClickHouse failed to start.' }
 
         for ($attempt = 1; $attempt -le 60; $attempt++) {
             try {
                 Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 'http://127.0.0.1:8123/ping' | Out-Null
                 break
             } catch {
-                if ($attempt -eq 60) { throw 'ClickHouse did not become healthy within five minutes.' }
+                if ($attempt -eq 60) { throw 'Linux ClickHouse did not become healthy within five minutes.' }
                 Start-Sleep -Seconds 5
             }
         }

@@ -19,6 +19,13 @@ def _scheduler(*, active_collection_id: str | None = None) -> dict:
         ),
         "tasks": [
             {
+                "name": "AmarketLinuxInfrastructure",
+                "state": "Running",
+                "last_result": 0,
+                "last_run_time": "2026/08/28 00:00:00",
+                "next_run_time": "N/A",
+            },
+            {
                 "name": "HithinkSnapshotCollector",
                 "state": "Running",
                 "last_result": 0,

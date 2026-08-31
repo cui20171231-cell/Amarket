@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import threading
+import urllib.request
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -21,9 +22,11 @@ from app.hithink.schedule import SHANGHAI, build_daily_schedule
 from app.hithink.writer import ClickHouseWriter
 
 TASK_NAMES = (
+    "AmarketLinuxInfrastructure",
     "HithinkSnapshotCollector",
 )
 TASK_LABELS = {
+    "AmarketLinuxInfrastructure": "Linux数据库基础服务",
     "HithinkSnapshotCollector": "盘中快照",
 }
 RAW_ITEMS = {
@@ -48,7 +51,6 @@ POST_DERIVED_ITEMS = {
     "core_stock_candidate_status": "核心个股候选",
     "market_package_status": "市场状态聚合包",
 }
-CLICKHOUSE_CONTAINER = "hithink-snapshot-clickhouse-1"
 ROOT = Path(__file__).resolve().parents[2]
 COLLECTOR_PID_PATH = ROOT / "data" / "hithink_snapshot_collector.pid"
 ACTIVE_NODE_PATH = ROOT / ".runtime" / "hithink_snapshot_active_node.json"
@@ -241,19 +243,18 @@ def _resource_state() -> dict[str, Any]:
 
 
 def _docker_state_uncached() -> dict[str, Any]:
-    completed = subprocess.run(
-        ["docker", "inspect", "--format", "{{json .State}}", CLICKHOUSE_CONTAINER],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=1.5,
-    )
-    state = json.loads(completed.stdout)
+    # The production database can run in Docker Desktop or in the independent
+    # Ubuntu Docker Engine.  The service endpoint is the stable contract the
+    # collector actually depends on, so health must not be tied to one runtime
+    # or container name.
+    with urllib.request.urlopen("http://127.0.0.1:8123/ping", timeout=1.5) as response:
+        content = response.read().decode("ascii", errors="replace").strip()
+        if response.status != 200 or content != "Ok.":
+            raise RuntimeError(f"ClickHouse health endpoint returned {response.status}: {content}")
     return {
-        "running": bool(state.get("Running")),
-        "health": state.get("Health", {}).get("Status"),
-        "started_at": state.get("StartedAt"),
+        "running": True,
+        "health": "healthy",
+        "source": "http://127.0.0.1:8123/ping",
     }
 
 
@@ -1099,7 +1100,7 @@ def render_combined_status(report: dict[str, Any]) -> str:
     clickhouse = report.get("clickhouse") or {}
     lines.append(
         f"| 依赖服务 | ClickHouse | {report['services']['clickhouse']} | "
-        f"容器运行={clickhouse.get('running')}，健康={clickhouse.get('health')} |"
+        f"服务可用={clickhouse.get('running')}，健康={clickhouse.get('health')} |"
     )
     resources = report.get("n100") or {}
     lines.extend(
