@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import ctypes
 import json
 import os
 import time
@@ -32,6 +33,7 @@ PORT = int(os.environ.get("AMARKET_AI_GATEWAY_PORT", "2091"))
 LOG_DIR = ROOT / "logs"
 AUDIT_PATH = LOG_DIR / "ai_gateway_audit.jsonl"
 PID_PATH = LOG_DIR / "ai_gateway.pid"
+_GATEWAY_MUTEX_HANDLE: int | None = None
 
 ArgModelBase.model_config["extra"] = "forbid"
 
@@ -171,7 +173,37 @@ def query_market_data(
 
 
 def _claim_pid() -> None:
+    global _GATEWAY_MUTEX_HANDLE
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_mutex = kernel32.CreateMutexW
+        create_mutex.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        create_mutex.restype = ctypes.c_void_p
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_bool
+
+        ctypes.set_last_error(0)
+        handle = create_mutex(None, False, "Global\\AmarketAiGateway")
+        if not handle:
+            last_error = ctypes.get_last_error()
+            if last_error != 5:  # ERROR_ACCESS_DENIED means SYSTEM owns the mutex.
+                raise ctypes.WinError(last_error)
+        if not handle or ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            if handle:
+                close_handle(handle)
+            try:
+                old_pid = int(PID_PATH.read_text(encoding="ascii").strip())
+            except (OSError, ValueError):
+                old_pid = 0
+            suffix = f"（进程号 {old_pid}）" if old_pid else ""
+            raise RuntimeError(f"Amarket AI 网关已在运行{suffix}。")
+        _GATEWAY_MUTEX_HANDLE = handle
+        PID_PATH.write_text(str(os.getpid()), encoding="ascii")
+        return
+
     if PID_PATH.exists():
         try:
             old_pid = int(PID_PATH.read_text(encoding="ascii").strip())
@@ -184,11 +216,20 @@ def _claim_pid() -> None:
 
 
 def _release_pid() -> None:
+    global _GATEWAY_MUTEX_HANDLE
+
     try:
         if PID_PATH.exists() and PID_PATH.read_text(encoding="ascii").strip() == str(os.getpid()):
             PID_PATH.unlink()
     except OSError:
         pass
+    if os.name == "nt" and _GATEWAY_MUTEX_HANDLE is not None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_bool
+        close_handle(_GATEWAY_MUTEX_HANDLE)
+        _GATEWAY_MUTEX_HANDLE = None
 
 
 def main() -> int:

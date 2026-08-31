@@ -176,6 +176,36 @@ function Get-DynamicProperty {
     return $property.Value
 }
 
+function Invoke-MarketTaskControl {
+    param(
+        [string]$TaskName,
+        [ValidateSet("Start", "Stop")]
+        [string]$Action
+    )
+
+    try {
+        if ($Action -eq "Start") {
+            Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        }
+        else {
+            Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        }
+        return
+    }
+    catch {
+        $switch = if ($Action -eq "Start") { "/Run" } else { "/End" }
+        $process = Start-Process `
+            -FilePath "$env:SystemRoot\System32\schtasks.exe" `
+            -Verb RunAs `
+            -ArgumentList @($switch, "/TN", "`"$TaskName`"") `
+            -Wait `
+            -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "系统任务操作失败（退出码 $($process.ExitCode)）"
+        }
+    }
+}
+
 function Get-MarketTaskStatus {
     param(
         $Indicator,
@@ -187,19 +217,15 @@ function Get-MarketTaskStatus {
             throw "后台状态尚未返回"
         }
 
-        $task = Get-DynamicProperty `
-            -Object $Snapshot.tasks `
-            -Name $Indicator.TaskName
-        if ($null -eq $task) {
-            throw "计划任务状态读取失败"
-        }
-
-        $taskRunning = [bool]$task.running
         $matchingProcess = switch ($Indicator.TaskName) {
             "MarketOS-Gateway" { $Snapshot.processes.gateway }
             "MarketOS-Tunnel" { $Snapshot.processes.tunnel }
             default { $null }
         }
+        $task = Get-DynamicProperty `
+            -Object $Snapshot.tasks `
+            -Name $Indicator.TaskName
+        $taskRunning = ($null -ne $task) -and [bool]$task.running
         $running = if ([string]::IsNullOrWhiteSpace($Indicator.ProcessPattern)) {
             $taskRunning
         }
@@ -213,7 +239,12 @@ function Get-MarketTaskStatus {
                 [string]$matchingProcess.startedAt
             }
             else {
-                [string]$task.lastRunTime
+                if ($null -ne $task) {
+                    [string]$task.lastRunTime
+                }
+                else {
+                    $null
+                }
             }
             $startedAt = if ([string]::IsNullOrWhiteSpace($startedAtText)) {
                 Get-Date
@@ -232,7 +263,7 @@ function Get-MarketTaskStatus {
                 Health = "Normal"
                 Text   = "正常运行 $duration"
                 Running = $true
-                TaskRunning = $taskRunning
+                TaskRunning = $taskRunning -or $running
             }
         }
 
@@ -625,11 +656,13 @@ foreach ($indicator in $indicators) {
         try {
             if ($capturedIndicator.Shape -eq "Circle") {
                 foreach ($taskName in $capturedIndicator.TaskNames) {
-                    Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                    Invoke-MarketTaskControl -TaskName $taskName -Action "Start"
                 }
             }
             else {
-                Start-ScheduledTask -TaskName $capturedIndicator.TaskName -ErrorAction Stop
+                Invoke-MarketTaskControl `
+                    -TaskName $capturedIndicator.TaskName `
+                    -Action "Start"
             }
         }
         catch {
@@ -651,11 +684,13 @@ foreach ($indicator in $indicators) {
         try {
             if ($capturedIndicator.Shape -eq "Circle") {
                 foreach ($taskName in $capturedIndicator.TaskNames) {
-                    Stop-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                    Invoke-MarketTaskControl -TaskName $taskName -Action "Stop"
                 }
             }
             else {
-                Stop-ScheduledTask -TaskName $capturedIndicator.TaskName -ErrorAction Stop
+                Invoke-MarketTaskControl `
+                    -TaskName $capturedIndicator.TaskName `
+                    -Action "Stop"
             }
             $capturedIndicator.DisconnectedAt = Get-Date
             Save-DisconnectedAt `
