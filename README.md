@@ -1,11 +1,12 @@
 # A-market 全 A 股市场数据基础设施
 
-当前版本：`1.0.0`。
+当前版本：`2.0.0`。历史 `v1.0.0` 标签和 [V1.0版本范围](docs/V1.0_SCOPE.md)完整保留；
+当前范围及与1.0的逐项差异见 [V2.0范围与差异](docs/V2.0_SCOPE.md)。
 
 这是在 Intel N100 设备上独立运行的项目，使用独立 ClickHouse 数据库 `market`，不依赖旧采集项目。
 
 项目范围和交接基线见 [总体架构](ARCHITECTURE.md)、[产品基线](docs/PRODUCT_BASELINE.md)、
-[1.0 版本范围](docs/V1.0_SCOPE.md)、[数据库草案](docs/DATABASE_DRAFT.md)和
+[2.0 版本范围](docs/V2.0_SCOPE.md)、[1.0 历史范围](docs/V1.0_SCOPE.md)、[数据库草案](docs/DATABASE_DRAFT.md)和
 [接口草案](docs/API_DRAFT.md)。当前现场状态、重启恢复约定、长期无人值守目标和剩余建设项见
 [当前运行基线与长期目标](docs/CURRENT_STATE_AND_LONG_TERM_GOAL.md)。
 

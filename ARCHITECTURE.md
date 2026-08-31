@@ -95,6 +95,7 @@ YYYYMMDD001 ... YYYYMMDD254
 
 - [全市场状态派生](docs/hithink_market_state_derivation.md)
 - [板块状态派生](docs/hithink_sector_state_derivation.md)
+- [V2.0范围及与V1.0差异](docs/V2.0_SCOPE.md)
 - [当前运行基线与长期目标](docs/CURRENT_STATE_AND_LONG_TERM_GOAL.md)
 
 ## 6. 数据层
@@ -124,4 +125,4 @@ YYYYMMDD001 ... YYYYMMDD254
 - 飞书入口尚未连接到查询和回复链路。
 - 仓库没有面向普通业务调用方的公开写入接口。
 - 本文只确认仓库结构，不确认外部同花顺权限、本机计划任务或服务的实时状态。
-- 产品需求、1.0 版本边界、数据库概览和本地接口分别记录在 `docs` 对应文件中。
+- 产品需求、2.0当前边界、1.0历史边界、数据库概览和本地接口分别记录在 `docs` 对应文件中。
