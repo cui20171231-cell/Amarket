@@ -4,12 +4,14 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from threading import Lock
+from time import monotonic
 from time import sleep as real_sleep
 
 import pytest
 
 import app.hithink.api as api_module
 import app.hithink.raw_collector as raw_module
+from app.hithink.aggregation import MarketAggregationPipeline
 from app.hithink.api import (
     HithinkApiError,
     HithinkClient,
@@ -18,6 +20,7 @@ from app.hithink.api import (
     SectorIndexSnapshot,
     _EndpointRateLimiter,
 )
+from app.hithink.post_derivation import PostDerivationPipeline
 from app.hithink.raw_collector import RawCollector
 from app.hithink.runner import CollectorRunner
 from app.hithink.schedule import SHANGHAI, build_daily_schedule
@@ -130,6 +133,42 @@ def test_non_429_error_does_not_use_the_429_retry_policy(
     assert api.client.calls == 1
 
 
+def test_retryable_5003_stops_after_two_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pauses: list[float] = []
+    monkeypatch.setattr(api_module, "sleep", pauses.append)
+    api = client_with_responses(
+        [
+            Response(
+                {
+                    "code": 5003,
+                    "message": "hotspot_focus pool response missing required pagination",
+                }
+            )
+            for _ in range(3)
+        ]
+    )
+
+    with pytest.raises(HithinkApiError) as caught:
+        api.fetch()
+
+    assert api.client.calls == 3
+    assert pauses == [1.0, 2.0]
+    assert caught.value.code == 5003
+    assert caught.value.retry_index == 2
+
+
+def test_expired_node_deadline_starts_no_request() -> None:
+    api = client_with_responses([success_snapshot()])
+
+    with pytest.raises(HithinkApiError) as caught:
+        api.fetch(deadline=monotonic() - 1)
+
+    assert caught.value.error_code == "NODE_DEADLINE_EXCEEDED"
+    assert api.client.calls == 0
+
+
 def test_all_a_limiter_serializes_itself_but_is_independent_from_sector() -> None:
     class Client:
         def __init__(self) -> None:
@@ -196,12 +235,18 @@ class Writer:
     def insert_sector_index_once(self, *args):
         return 1, 1
 
+    def upsert_emotion_state(self, node):
+        return None
+
+    def emotion_state_count(self, node):
+        return 1
+
 
 class PartialApi:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def fetch(self):
+    def fetch(self, *, deadline=None):
         self.calls.append("all_a_snapshot")
         raise HithinkApiError(
             429,
@@ -211,7 +256,7 @@ class PartialApi:
             duration_ms=3200,
         )
 
-    def fetch_sector_index_snapshot(self, codes):
+    def fetch_sector_index_snapshot(self, codes, *, deadline=None):
         self.calls.append("sector_index")
         source_time = datetime(2026, 8, 28, 10, 30, tzinfo=SHANGHAI)
         return SectorIndexSnapshot(
@@ -221,7 +266,7 @@ class PartialApi:
             retry_count=0,
         )
 
-    def fetch_limit_pool(self, name, trade_date):
+    def fetch_limit_pool(self, name, trade_date, *, deadline=None):
         self.calls.append(name)
         source_time = datetime(2026, 8, 28, 10, 30, tzinfo=SHANGHAI)
         return LimitPoolSnapshot(
@@ -239,7 +284,14 @@ def test_one_failed_interface_keeps_the_other_four_and_marks_partial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pauses: list[float] = []
+    worker_counts: list[int] = []
+
+    def executor(*args, **kwargs):
+        worker_counts.append(int(kwargs["max_workers"]))
+        return ThreadPoolExecutor(*args, **kwargs)
+
     monkeypatch.setattr(raw_module, "sleep", pauses.append)
+    monkeypatch.setattr(raw_module, "ThreadPoolExecutor", executor)
     node = build_daily_schedule(date(2026, 8, 28))[20]
     api = PartialApi()
 
@@ -274,14 +326,16 @@ def test_one_failed_interface_keeps_the_other_four_and_marks_partial(
     assert values["api_duration_ms"] == 3200
     assert values["retry_count"] == 2
     assert "all_a_snapshot:UPSTREAM_HTTP_429" in values["raw_error_code"]
+    assert worker_counts == [5]
+    assert raw_module.NODE_COLLECTION_BUDGET_SECONDS < 60
 
 
 class FailedApi(PartialApi):
-    def fetch_sector_index_snapshot(self, codes):
+    def fetch_sector_index_snapshot(self, codes, *, deadline=None):
         self.calls.append("sector_index")
         raise HithinkApiError(500, "sector failed", duration_ms=100)
 
-    def fetch_limit_pool(self, name, trade_date):
+    def fetch_limit_pool(self, name, trade_date, *, deadline=None):
         self.calls.append(name)
         raise HithinkApiError(500, f"{name} failed", duration_ms=100)
 
@@ -292,6 +346,34 @@ class StaticCollector:
 
     def collect(self, node, batch_id):
         return self.result
+
+
+class RaisingCollector:
+    def collect(self, node, batch_id):
+        raise HithinkApiError(5003, "temporary upstream structure error")
+
+
+def test_unhandled_raw_failure_closes_every_child_status() -> None:
+    node = build_daily_schedule(date(2026, 8, 28))[0]
+    writer = Writer()
+    runner = object.__new__(CollectorRunner)
+    runner.writer = writer
+    runner.raw_collector = RaisingCollector()
+    runner.post_deriver = PostDerivationPipeline(writer)
+    runner.aggregator = MarketAggregationPipeline(writer)
+
+    runner._run_node(node)
+
+    final = writer.statuses[-1]
+    assert final["status"] == "FAILED"
+    assert final["raw_status"] == "FAILED"
+    assert final["all_a_snapshot_status"] == "FAILED"
+    assert final["limit_up_pool_status"] == "SKIPPED"
+    assert final["limit_down_pool_status"] == "SKIPPED"
+    assert final["limit_break_pool_status"] == "SKIPPED"
+    assert final["sector_index_status"] == "FAILED"
+    assert final["sector_state_status"] == "BLOCKED"
+    assert all(value != "RUNNING" for key, value in final.items() if key.endswith("_status"))
 
 
 def test_node_is_failed_only_when_every_applicable_interface_failed(
@@ -306,6 +388,8 @@ def test_node_is_failed_only_when_every_applicable_interface_failed(
     runner = object.__new__(CollectorRunner)
     runner.writer = writer
     runner.raw_collector = StaticCollector(result)
+    runner.post_deriver = PostDerivationPipeline(writer)
+    runner.aggregator = MarketAggregationPipeline(writer)
     runner._run_node(node)
 
     assert writer.statuses[-1]["status"] == "FAILED"
@@ -325,6 +409,8 @@ def test_node_is_partial_when_full_a_failed_but_other_interfaces_succeeded(
     runner = object.__new__(CollectorRunner)
     runner.writer = writer
     runner.raw_collector = StaticCollector(result)
+    runner.post_deriver = PostDerivationPipeline(writer)
+    runner.aggregator = MarketAggregationPipeline(writer)
     runner._run_node(node)
 
     assert writer.statuses[-1]["status"] == "PARTIAL"

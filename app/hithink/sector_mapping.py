@@ -7,7 +7,12 @@ from datetime import date, datetime
 from time import perf_counter, sleep
 from uuid import uuid4
 
-from app.hithink.api import RETRYABLE_CODES, HithinkApiError, HithinkClient
+from app.hithink.api import (
+    REQUEST_TIMEOUT_SECONDS,
+    RETRYABLE_CODES,
+    HithinkApiError,
+    HithinkClient,
+)
 from app.hithink.schedule import SHANGHAI
 from app.hithink.writer import ClickHouseWriter
 
@@ -17,6 +22,10 @@ CATALOG = "market.sector_catalog"
 MEMBERSHIP = "market.sector_membership_history"
 STATUS = "market.sector_mapping_sync_status"
 TYPES = {"cn_concept": "concept", "industry": "industry", "tszs": "style"}
+
+
+class SectorMappingDeadlineExceeded(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -38,7 +47,7 @@ class SectorMappingSync:
         self.writer = writer
         self.workers = workers
 
-    def sync_all(self) -> str:
+    def sync_all(self, *, deadline: datetime | None = None) -> str:
         started = datetime.now(SHANGHAI)
         sync_date = started.date()
         run_id = f"sector-{started:%Y%m%dT%H%M%S}-{uuid4().hex[:8]}"
@@ -49,7 +58,7 @@ class SectorMappingSync:
             )
         try:
             for source_tag, sector_type in TYPES.items():
-                self.sync_type(run_id, source_tag, sector_type)
+                self.sync_type(run_id, source_tag, sector_type, deadline=deadline)
             self._finish_daily_plan(sync_date, run_id, started)
             return run_id
         except Exception as exc:
@@ -107,13 +116,20 @@ class SectorMappingSync:
             error_message="; ".join(messages)[:1000] if membership_partial else None,
         )
 
-    def sync_type(self, run_id: str, source_tag: str, sector_type: str) -> None:
+    def sync_type(
+        self,
+        run_id: str,
+        source_tag: str,
+        sector_type: str,
+        *,
+        deadline: datetime | None = None,
+    ) -> None:
         started = datetime.now(SHANGHAI)
         started_perf = perf_counter()
         sync_date = started.date()
         self._status(run_id, sync_date, sector_type, source_tag, "RUNNING", start_time=started)
         try:
-            sectors, catalog_timestamp = self._catalog(source_tag)
+            sectors, catalog_timestamp = self._catalog(source_tag, deadline=deadline)
         except Exception as exc:  # noqa: BLE001 - records catalog failure as task status
             self._status(
                 run_id, sync_date, sector_type, source_tag, "FAILED", start_time=started,
@@ -125,7 +141,10 @@ class SectorMappingSync:
         successful: list[Constituents] = []
         failures: list[str] = []
         with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="sector-sync") as pool:
-            futures = {pool.submit(self._constituents, sector): sector for sector in sectors}
+            futures = {
+                pool.submit(self._constituents, sector, deadline=deadline): sector
+                for sector in sectors
+            }
             for future in as_completed(futures):
                 sector = futures[future]
                 try:
@@ -150,18 +169,52 @@ class SectorMappingSync:
             error_message="; ".join(failures[:10]) if failures else None,
         )
 
-    def _request(self, path: str, params: dict[str, str]) -> dict:
+    @staticmethod
+    def _remaining_seconds(deadline: datetime | None) -> float | None:
+        if deadline is None:
+            return None
+        remaining = (deadline - datetime.now(SHANGHAI)).total_seconds()
+        if remaining <= 0:
+            raise SectorMappingDeadlineExceeded(
+                f"板块映射超过截止时间 {deadline.isoformat()}"
+            )
+        return remaining
+
+    def _request(
+        self,
+        path: str,
+        params: dict[str, str],
+        *,
+        deadline: datetime | None = None,
+    ) -> dict:
         last_error: HithinkApiError | None = None
         for attempt, pause in enumerate((0, 1, 2, 4, 8)):
             if pause:
+                remaining = self._remaining_seconds(deadline)
+                if remaining is not None and remaining <= pause:
+                    raise SectorMappingDeadlineExceeded(
+                        f"板块映射在重试前到达截止时间 {deadline.isoformat()}"
+                    )
                 sleep(pause)
             try:
-                response = self.api.client.get(f"https://fuyao.aicubes.cn{path}", params=params)
+                remaining = self._remaining_seconds(deadline)
+                timeout = (
+                    REQUEST_TIMEOUT_SECONDS
+                    if remaining is None
+                    else min(REQUEST_TIMEOUT_SECONDS, remaining)
+                )
+                response = self.api.client.get(
+                    f"https://fuyao.aicubes.cn{path}",
+                    params=params,
+                    timeout=timeout,
+                )
                 payload = response.json()
                 code = int(payload.get("code", response.status_code))
                 if response.status_code >= 400 or code != 0:
                     raise HithinkApiError(code, str(payload.get("message", response.text[:300])))
                 return payload
+            except SectorMappingDeadlineExceeded:
+                raise
             except Exception as exc:  # noqa: BLE001 - normalizes transport and API errors
                 error = exc if isinstance(exc, HithinkApiError) else HithinkApiError(None, str(exc))
                 last_error = error
@@ -170,17 +223,27 @@ class SectorMappingSync:
         assert last_error is not None
         raise last_error
 
-    def _catalog(self, source_tag: str) -> tuple[list[Sector], int | None]:
-        payload = self._request("/api/a-share-index/catalog/ths-index-list", {"tag": source_tag})
+    def _catalog(
+        self, source_tag: str, *, deadline: datetime | None = None
+    ) -> tuple[list[Sector], int | None]:
+        payload = self._request(
+            "/api/a-share-index/catalog/ths-index-list",
+            {"tag": source_tag},
+            deadline=deadline,
+        )
         data = payload.get("data") or {}
         return (
             [Sector(str(item["thscode"]), str(item["name"])) for item in data.get("item") or []],
             int(data["timestamp"]) if data.get("timestamp") is not None else None,
         )
 
-    def _constituents(self, sector: Sector) -> Constituents:
+    def _constituents(
+        self, sector: Sector, *, deadline: datetime | None = None
+    ) -> Constituents:
         payload = self._request(
-            "/api/a-share-index/constituents/ths-stock-list", {"thscode": sector.code}
+            "/api/a-share-index/constituents/ths-stock-list",
+            {"thscode": sector.code},
+            deadline=deadline,
         )
         data = payload.get("data") or {}
         return Constituents(

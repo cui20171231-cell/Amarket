@@ -3,29 +3,80 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, time, timedelta
+from collections.abc import Callable
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from threading import Lock, Thread
 from time import perf_counter, sleep
 
+from app.hithink.aggregation import AggregationResult, MarketAggregationPipeline
 from app.hithink.api import HithinkApiError, HithinkClient
+from app.hithink.daily_pipeline import DailyPipeline
+from app.hithink.post_derivation import PostDerivationPipeline, PostDerivationResult
 from app.hithink.raw_collector import RawCollectionResult, RawCollector
 from app.hithink.schedule import SHANGHAI, ScheduleNode, build_daily_schedule
+from app.hithink.sector_mapping import SectorMappingSync
 from app.hithink.state_deriver import DerivationResult, StateDeriver
+from app.hithink.trading_day_gate import SharedTradingDayGate
 from app.hithink.writer import ClickHouseWriter
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
 ACTIVE_NODE_PATH = ROOT / ".runtime" / "hithink_snapshot_active_node.json"
+CLOSING_NODE_RETRY_SECONDS = 60
+COLLECTOR_PREPARE_TIME = time(8, 50)
+DAILY_COLLECTION_TIME = time(16, 0)
+DAILY_RETRY_DEADLINE_TIME = time(8, 30)
+DAILY_RETRY_SECONDS = 600
+SECTOR_MAPPING_DEADLINE_TIME = time(9, 10)
+
+DailyCollectionJob = Callable[[date], bool]
+HealthProbe = Callable[[date], dict[str, object]]
+
+
+def next_daily_collection_at(now: datetime) -> datetime:
+    """Return 16:00, or now when today's daily collection needs catch-up."""
+    scheduled = datetime.combine(now.date(), DAILY_COLLECTION_TIME, tzinfo=SHANGHAI)
+    return max(scheduled, now)
+
+
+def should_run_mapping_after_confirmation(
+    startup_now: datetime, confirmation_date: object
+) -> bool:
+    startup_prepare = datetime.combine(
+        startup_now.date(), COLLECTOR_PREPARE_TIME, tzinfo=SHANGHAI
+    )
+    return not (
+        startup_now.date() == confirmation_date and startup_now > startup_prepare
+    )
 
 
 class CollectorRunner:
-    """One resident service with independently auditable raw and derivation stages."""
+    """One resident service with independently auditable collection, derivation and aggregation."""
 
-    def __init__(self, api: HithinkClient, writer: ClickHouseWriter):
+    def __init__(
+        self,
+        api: HithinkClient,
+        writer: ClickHouseWriter,
+        *,
+        daily_collection_job: DailyCollectionJob | None = None,
+        health_probe: HealthProbe | None = None,
+    ):
         self.api = api
         self.writer = writer
         self.raw_collector = RawCollector(api, writer)
         self.state_deriver = StateDeriver(writer)
+        self.post_deriver = PostDerivationPipeline(writer)
+        self.aggregator = MarketAggregationPipeline(writer)
+        self.trading_day_gate = SharedTradingDayGate(api, writer)
+        self.sector_mapping = SectorMappingSync(api, writer)
+        self.daily_pipeline = DailyPipeline(api, writer)
+        self.daily_collection_job = daily_collection_job
+        self.health_probe = health_probe
+        self._daily_thread_lock = Lock()
+        self._daily_threads: dict[date, Thread] = {}
+        self._monitor_thread_lock = Lock()
+        self._monitor_threads: dict[date, Thread] = {}
 
     def initialize_day(self, trade_date: object) -> list[ScheduleNode]:
         nodes = build_daily_schedule(trade_date)
@@ -38,12 +89,27 @@ class CollectorRunner:
         )
         return nodes
 
-    def run_day(self, trade_date: object, not_before: time | None = None) -> None:
-        nodes = self.initialize_day(trade_date)
+    def run_day(
+        self,
+        trade_date: object,
+        not_before: time | None = None,
+        *,
+        prepared_nodes: list[ScheduleNode] | None = None,
+    ) -> None:
+        nodes = prepared_nodes or self.initialize_day(trade_date)
         status = self.writer.statuses(trade_date)
         now = datetime.now(SHANGHAI)
         for node in nodes:
-            if status.get(node.scheduled_time) != "PENDING":
+            current_status = status.get(node.scheduled_time)
+            if node.sequence_no == 254:
+                if current_status == "SUCCESS":
+                    continue
+                delay = (node.scheduled_time - datetime.now(SHANGHAI)).total_seconds()
+                if delay > 0:
+                    sleep(delay)
+                self._run_closing_node_until_success(node)
+                continue
+            if current_status != "PENDING":
                 continue
             if not_before and node.scheduled_time.timetz().replace(tzinfo=None) < not_before:
                 self._mark_skipped(node, "NOT_BEFORE")
@@ -65,63 +131,352 @@ class CollectorRunner:
         if self.writer.statuses(trade_date).get(node.scheduled_time) == "SUCCESS":
             LOG.info("Closing baseline already exists collection_id=%s", node.collection_id)
             return
-        self.run_node(node)
+        self._run_closing_node_until_success(node)
+
+    def _run_closing_node_until_success(self, node: ScheduleNode) -> None:
+        if node.sequence_no != 254:
+            raise ValueError("Persistent closing execution is only valid for node 254")
+        while True:
+            self.run_node(node)
+            if self.writer.statuses(node.trade_date).get(node.scheduled_time) == "SUCCESS":
+                return
+            LOG.error(
+                "CLOSING_NODE_INCOMPLETE collection_id=%s; retrying in %s seconds",
+                node.collection_id,
+                CLOSING_NODE_RETRY_SECONDS,
+            )
+            sleep(CLOSING_NODE_RETRY_SECONDS)
 
     def serve_forever(self) -> None:
         startup_now = datetime.now(SHANGHAI)
-        startup_date = startup_now.date()
-        decision = self._wait_for_trading_day_decision(startup_date)
-        if decision:
-            nodes = self.initialize_day(startup_date)
-            LOG.info(
-                "STARTUP_PLAN_READY date=%s nodes=%s first=%s last=%s",
-                startup_date,
-                len(nodes),
-                nodes[0].scheduled_time,
-                nodes[-1].scheduled_time,
-            )
-        else:
-            LOG.info("STARTUP_NON_TRADING_DAY date=%s; no schedule generated", startup_date)
-
+        prepared_date = None
+        self._start_previous_daily_catchup(startup_now)
         while True:
             now = datetime.now(SHANGHAI)
-            prepare_at = datetime.combine(now.date(), time(8, 50), tzinfo=SHANGHAI)
-            if now < prepare_at:
-                sleep((prepare_at - now).total_seconds())
-                decision = None
+            if prepared_date == now.date():
+                next_prepare = datetime.combine(
+                    now.date() + timedelta(days=1),
+                    COLLECTOR_PREPARE_TIME,
+                    tzinfo=SHANGHAI,
+                )
+                sleep(max(1.0, (next_prepare - now).total_seconds()))
                 continue
-            if decision is None or now.date() != startup_date:
-                decision = self._wait_for_trading_day_decision(now.date())
-            if decision:
-                self.run_day(now.date())
-            else:
-                LOG.info("NON_TRADING_DAY date=%s; no schedule generated", now.date())
-            next_prepare = datetime.combine(
-                now.date() + timedelta(days=1), time(8, 50), tzinfo=SHANGHAI
+            prepare_at = datetime.combine(
+                now.date(), COLLECTOR_PREPARE_TIME, tzinfo=SHANGHAI
             )
-            sleep(max(1.0, (next_prepare - datetime.now(SHANGHAI)).total_seconds()))
-            decision = None
+            if now < prepare_at:
+                sleep(max(1.0, (prepare_at - now).total_seconds()))
+                continue
+            decision = self._wait_for_trading_day_decision(now.date())
+            prepared_date = now.date()
+            if decision:
+                nodes = self.initialize_day(prepared_date)
+                LOG.info(
+                    "INTRADAY_PLAN_READY date=%s nodes=%s first=%s last=%s",
+                    prepared_date,
+                    len(nodes),
+                    nodes[0].scheduled_time,
+                    nodes[-1].scheduled_time,
+                )
+                self._start_daily_collection_worker(prepared_date)
+                self._start_day_monitor(prepared_date)
+                if not should_run_mapping_after_confirmation(
+                    startup_now, prepared_date
+                ):
+                    LOG.info(
+                        "SECTOR_MAPPING_MISSED_STARTUP date=%s; next run waits for "
+                        "the next trading-day confirmation",
+                        prepared_date,
+                    )
+                else:
+                    self._run_sector_mapping_once(prepared_date)
+                self.run_day(prepared_date, prepared_nodes=nodes)
+            else:
+                self._mark_non_trading_day_skipped(prepared_date)
+                LOG.info(
+                    "NON_TRADING_DAY date=%s; sector mapping, 254-node schedule, "
+                    "and daily-K are all skipped",
+                    now.date(),
+                )
+
+    def _run_sector_mapping_once(self, trade_date: object) -> None:
+        attempted = self.writer.client.query(
+            "SELECT count() FROM market.sector_mapping_sync_status "
+            "WHERE sync_date = {date:Date}",
+            parameters={"date": trade_date},
+        ).result_rows[0][0]
+        if int(attempted) > 0:
+            LOG.info("SECTOR_MAPPING_ALREADY_ATTEMPTED date=%s; skipping", trade_date)
+            return
+        self._run_sector_mapping()
+
+    def _run_sector_mapping(self) -> None:
+        try:
+            now = datetime.now(SHANGHAI)
+            deadline = datetime.combine(
+                now.date(), SECTOR_MAPPING_DEADLINE_TIME, tzinfo=SHANGHAI
+            )
+            run_id = self.sector_mapping.sync_all(deadline=deadline)
+            LOG.info("SECTOR_MAPPING_COMPLETED run_id=%s", run_id)
+        except Exception:
+            # Mapping failure must not terminate or restart the 254-node collector.
+            LOG.exception("SECTOR_MAPPING_FAILED; intraday collector will continue")
+
+    def _run_daily_collection(self, trade_date: object) -> bool:
+        try:
+            self.writer.initialize_daily_task_plan(trade_date)
+            if self.writer.daily_status(trade_date, "daily_collection") == "SUCCESS":
+                LOG.info("DAILY_COLLECTION_ALREADY_SUCCESS date=%s", trade_date)
+                return True
+            initialize = not self.writer.daily_seed_complete()
+            self.daily_pipeline.run_pipeline(trade_date, initialize=initialize)
+            status = self.writer.daily_status(trade_date, "daily_collection")
+            if status in {"SUCCESS", "SKIPPED"}:
+                LOG.info("DAILY_COLLECTION_COMPLETED date=%s status=%s", trade_date, status)
+                return True
+            LOG.error(
+                "DAILY_COLLECTION_INCOMPLETE date=%s status=%s; retrying in %s seconds",
+                trade_date,
+                status,
+                DAILY_RETRY_SECONDS,
+            )
+            return False
+        except Exception:
+            # A failed attempt is retried by the resident scheduler without
+            # terminating or restarting the 254-node collector.
+            LOG.exception(
+                "DAILY_COLLECTION_FAILED date=%s; retrying in %s seconds",
+                trade_date,
+                DAILY_RETRY_SECONDS,
+            )
+            return False
+
+    def _execute_daily_collection(self, trade_date: date) -> bool:
+        if self.daily_collection_job is not None:
+            try:
+                return bool(self.daily_collection_job(trade_date))
+            except Exception:
+                LOG.exception("DAILY_COLLECTION_JOB_FAILED date=%s", trade_date)
+                return False
+        return self._run_daily_collection(trade_date)
+
+    def _start_daily_collection_worker(
+        self, trade_date: date, *, run_immediately: bool = False
+    ) -> None:
+        with self._daily_thread_lock:
+            existing = self._daily_threads.get(trade_date)
+            if existing is not None and existing.is_alive():
+                return
+            worker = Thread(
+                target=self._daily_collection_retry_loop,
+                args=(trade_date, run_immediately),
+                name=f"daily-collection-{trade_date:%Y%m%d}",
+                daemon=True,
+            )
+            self._daily_threads[trade_date] = worker
+            worker.start()
+
+    def _daily_collection_retry_loop(
+        self, trade_date: date, run_immediately: bool = False
+    ) -> None:
+        scheduled_at = datetime.combine(
+            trade_date, DAILY_COLLECTION_TIME, tzinfo=SHANGHAI
+        )
+        retry_deadline = datetime.combine(
+            trade_date + timedelta(days=1),
+            DAILY_RETRY_DEADLINE_TIME,
+            tzinfo=SHANGHAI,
+        )
+        now = datetime.now(SHANGHAI)
+        if not run_immediately and now < scheduled_at:
+            sleep(max(1.0, (scheduled_at - now).total_seconds()))
+
+        while datetime.now(SHANGHAI) <= retry_deadline:
+            if self._execute_daily_collection(trade_date):
+                return
+            now = datetime.now(SHANGHAI)
+            if now >= retry_deadline:
+                break
+            if now >= datetime.combine(
+                trade_date, time(16, 30), tzinfo=SHANGHAI
+            ):
+                LOG.critical(
+                    "CHECKPOINT_ALERT date=%s time=16:30 daily-K has not succeeded",
+                    trade_date,
+                )
+            sleep(min(DAILY_RETRY_SECONDS, (retry_deadline - now).total_seconds()))
+
+        LOG.critical(
+            "DAILY_COLLECTION_DEADLINE_EXCEEDED date=%s deadline=%s",
+            trade_date,
+            retry_deadline,
+        )
+
+    def _start_previous_daily_catchup(self, startup_now: datetime) -> None:
+        if startup_now.time() > DAILY_RETRY_DEADLINE_TIME:
+            return
+        previous_date = startup_now.date() - timedelta(days=1)
+        self._start_daily_collection_worker(previous_date, run_immediately=True)
+
+    def _mark_non_trading_day_skipped(self, trade_date: date) -> None:
+        for task_name in (
+            "sector_catalog_sync",
+            "sector_membership_sync",
+            "hithink_daily_k_raw_sync",
+            "hithink_adjustment_events_sync",
+            "daily_collection",
+        ):
+            if self.writer.daily_status(trade_date, task_name) == "SUCCESS":
+                continue
+            self.writer.set_daily_status(
+                trade_date,
+                task_name,
+                "SKIPPED",
+                error_code="NON_TRADING_DAY",
+            )
 
     def _wait_for_trading_day_decision(self, trade_date: object) -> bool:
         while True:
             decision = self._trading_day_decision(trade_date)
             if decision is not None:
                 return decision
-            LOG.error("CALENDAR_UNKNOWN date=%s; retrying in 5 minutes", trade_date)
+            level = (
+                logging.CRITICAL
+                if datetime.now(SHANGHAI).time() >= time(8, 55)
+                else logging.ERROR
+            )
+            LOG.log(
+                level,
+                "CHECKPOINT_ALERT date=%s calendar is still unknown; retrying in 5 minutes",
+                trade_date,
+            )
             sleep(300)
 
+    def _start_day_monitor(self, trade_date: date) -> None:
+        if self.health_probe is None:
+            return
+        with self._monitor_thread_lock:
+            existing = self._monitor_threads.get(trade_date)
+            if existing is not None and existing.is_alive():
+                return
+            worker = Thread(
+                target=self._monitor_day,
+                args=(trade_date,),
+                name=f"collector-monitor-{trade_date:%Y%m%d}",
+                daemon=True,
+            )
+            self._monitor_threads[trade_date] = worker
+            worker.start()
+
+    def _monitor_day(self, trade_date: date) -> None:
+        checks: list[
+            tuple[time, str, Callable[[dict[str, object]], bool], str]
+        ] = [
+            (
+                time(8, 55),
+                "08:55",
+                lambda state: state.get("calendar_status") == "SUCCESS",
+                "交易日确认尚未成功",
+            ),
+            (
+                time(9, 0),
+                "09:00",
+                lambda state: int(state.get("daily_plan_count") or 0) >= 5,
+                "每日任务状态计划未准备完整",
+            ),
+            (
+                time(9, 10),
+                "09:10",
+                lambda state: int(state.get("schedule_count") or 0) == 254,
+                "盘中计划不是完整254条",
+            ),
+            (
+                time(9, 16),
+                "09:16",
+                lambda state: state.get("first_node_status")
+                not in {None, "PENDING", "RUNNING"},
+                "第一号节点尚未结束",
+            ),
+            (
+                time(15, 5),
+                "15:05",
+                lambda state: state.get("closing_node_status") == "SUCCESS",
+                "第254号节点尚未成功，程序应继续重试",
+            ),
+            (
+                time(16, 5),
+                "16:05",
+                lambda state: state.get("daily_collection_status")
+                in {"RUNNING", "SUCCESS"},
+                "16:00日K尚未开始或已经失败",
+            ),
+            (
+                time(16, 30),
+                "16:30",
+                lambda state: state.get("daily_collection_status") == "SUCCESS",
+                "16:00日K尚未成功",
+            ),
+        ]
+        for check_time, label, predicate, message in checks:
+            check_at = datetime.combine(trade_date, check_time, tzinfo=SHANGHAI)
+            now = datetime.now(SHANGHAI)
+            if now < check_at:
+                sleep(max(1.0, (check_at - now).total_seconds()))
+            try:
+                state = self.health_probe(trade_date) if self.health_probe else {}
+                if predicate(state):
+                    LOG.info("CHECKPOINT_OK date=%s time=%s", trade_date, label)
+                else:
+                    LOG.critical(
+                        "CHECKPOINT_ALERT date=%s time=%s message=%s state=%s",
+                        trade_date,
+                        label,
+                        message,
+                        state,
+                    )
+            except Exception:
+                LOG.exception(
+                    "CHECKPOINT_ALERT date=%s time=%s health check failed",
+                    trade_date,
+                    label,
+                )
+
     def _trading_day_decision(self, trade_date: object) -> bool | None:
-        try:
-            calendar = self.api.fetch_trading_days()
-            self.writer.cache_trading_calendar(calendar.trade_dates, trade_date)
-            return trade_date in calendar.trade_dates
-        except HithinkApiError as exc:
-            cached = self.writer.cached_trading_day(trade_date)
-            if cached is None:
-                LOG.error("calendar refresh failed without cache: %s", exc)
-                return None
-            LOG.warning("calendar refresh failed; using cached decision=%s", cached)
-            return cached
+        started = datetime.now(SHANGHAI)
+        self.writer.initialize_daily_task_plan(trade_date)
+        confirmation = self.trading_day_gate.confirm(trade_date)
+        if confirmation.is_trading_day is None:
+            self.writer.set_daily_status(
+                trade_date,
+                "calendar_gate",
+                "FAILED",
+                request_start_time=started,
+                request_end_time=datetime.now(SHANGHAI),
+                error_code="CALENDAR_UNKNOWN",
+                error_message=confirmation.error_message,
+            )
+            LOG.error("calendar confirmation failed: %s", confirmation.error_message)
+        else:
+            self.writer.set_daily_status(
+                trade_date,
+                "calendar_gate",
+                "SUCCESS",
+                request_start_time=started,
+                request_end_time=datetime.now(SHANGHAI),
+                retry_count=confirmation.retry_count,
+                error_code=(
+                    None if confirmation.source == "API" else confirmation.source
+                ),
+                error_message=confirmation.error_message,
+            )
+            LOG.info(
+                "CALENDAR_DECISION date=%s trading_day=%s source=%s confirmed_at=%s",
+                trade_date,
+                confirmation.is_trading_day,
+                confirmation.source,
+                confirmation.confirmed_at,
+            )
+        return confirmation.is_trading_day
 
     def run_node(self, node: ScheduleNode) -> None:
         self._write_active_node(node)
@@ -147,6 +502,8 @@ class CollectorRunner:
             limit_down_pool_status=pool_initial_status,
             limit_break_pool_status=pool_initial_status,
             sector_index_status="RUNNING",
+            **self.post_deriver.initial_status_values(node),
+            **self.aggregator.initial_status_values(node),
         )
         try:
             facts = self.raw_collector.collect(node, batch_id)
@@ -159,6 +516,23 @@ class CollectorRunner:
             LOG.exception("RAW_FAILED sequence=%s", node.sequence_no)
             return
 
+        if node.sequence_no == 254 and any(
+            payload is None
+            for payload in (
+                facts.prices,
+                facts.limit_up,
+                facts.limit_down,
+                facts.limit_break,
+                facts.sector_index,
+            )
+        ):
+            facts = self.raw_collector.complete_closing_node_until_success(
+                node,
+                batch_id,
+                facts,
+                wait_before_first_retry=True,
+            )
+
         raw_completed_at = datetime.now(SHANGHAI)
         raw_values = self._raw_values(facts, started_at, raw_completed_at)
         self.writer.set_schedule_status(
@@ -169,6 +543,16 @@ class CollectorRunner:
             raw_completed_at=raw_completed_at,
         )
         if facts.prices is None:
+            self.post_deriver.run_emotion_and_block(
+                node,
+                "ALL_A_SNAPSHOT_UNAVAILABLE",
+                "全A快照缺失，原有市场状态及后续派生不能生成",
+            )
+            self.aggregator.block(
+                node,
+                "ALL_A_SNAPSHOT_UNAVAILABLE",
+                "全A快照缺失，聚合数据包不能生成",
+            )
             final_status = "FAILED" if facts.raw_status == "FAILED" else "PARTIAL"
             self.writer.set_schedule_status(
                 node,
@@ -203,6 +587,16 @@ class CollectorRunner:
                 node, include_sector_states=facts.sector_index is not None
             )
         except Exception as exc:
+            self.post_deriver.run_emotion_and_block(
+                node,
+                "ORIGINAL_DERIVATION_FAILED",
+                "原有个股、市场或板块状态派生失败",
+            )
+            self.aggregator.block(
+                node,
+                "ORIGINAL_DERIVATION_FAILED",
+                "基础派生失败，聚合数据包不能生成",
+            )
             self._mark_derivation_failure(
                 node,
                 raw_values,
@@ -215,8 +609,30 @@ class CollectorRunner:
             LOG.exception("DERIVATION_FAILED sequence=%s", node.sequence_no)
             return
 
+        post_result = self.post_deriver.run(
+            node,
+            sector_states_ready=facts.sector_index is not None,
+        )
+        derivation_completed_at = datetime.now(SHANGHAI)
+        if post_result.success:
+            aggregation_result = self.aggregator.run(node)
+        else:
+            self.aggregator.block(
+                node,
+                "DERIVATION_CHAIN_FAILED",
+                "派生链未完整成功，聚合数据包不能生成",
+            )
+            aggregation_result = AggregationResult(success=False)
         self._mark_success(
-            node, raw_values, raw_completed_at, derivation_started_at, started, derived
+            node,
+            raw_values,
+            raw_completed_at,
+            derivation_started_at,
+            derivation_completed_at,
+            started,
+            derived,
+            post_result,
+            aggregation_result,
         )
 
     def _raw_values(
@@ -300,13 +716,19 @@ class CollectorRunner:
         raw_values: dict[str, object],
         raw_completed_at: datetime,
         derivation_started_at: datetime,
+        derivation_completed_at: datetime,
         started: float,
         derived: DerivationResult,
+        post_result: PostDerivationResult,
+        aggregation_result: AggregationResult,
     ) -> None:
-        derivation_completed_at = datetime.now(SHANGHAI)
         self.writer.set_schedule_status(
             node,
-            "SUCCESS" if raw_values["raw_status"] == "SUCCESS" else "PARTIAL",
+            "SUCCESS"
+            if raw_values["raw_status"] == "SUCCESS"
+            and post_result.success
+            and aggregation_result.success
+            else "PARTIAL",
             **raw_values,
             derivation_status="SUCCESS",
             raw_completed_at=raw_completed_at,
@@ -334,14 +756,27 @@ class CollectorRunner:
         error_code: str,
         error_message: str,
     ) -> None:
+        completed_at = datetime.now(SHANGHAI)
+        pool_status = "FAILED" if node.limit_pools_applicable else "SKIPPED"
         self.writer.set_schedule_status(
             node,
             "FAILED",
             batch_id=batch_id,
             request_start_time=started_at,
-            request_end_time=datetime.now(SHANGHAI),
+            request_end_time=completed_at,
+            raw_completed_at=completed_at,
             raw_status="FAILED",
             derivation_status="BLOCKED",
+            all_a_snapshot_status="FAILED",
+            limit_up_pool_status=pool_status,
+            limit_down_pool_status=pool_status,
+            limit_break_pool_status=pool_status,
+            sector_index_status="FAILED",
+            sector_state_status="BLOCKED",
+            **self.post_deriver.blocked_status_values(
+                node, error_code, error_message, block_emotion=True
+            ),
+            **self.aggregator.blocked_status_values(node, error_code, error_message),
             raw_error_code=error_code,
             raw_error_message=error_message[:1000],
             total_duration_ms=round((perf_counter() - started) * 1000),
@@ -379,6 +814,13 @@ class CollectorRunner:
             "SKIPPED",
             raw_status="SKIPPED",
             derivation_status="SKIPPED",
+            **{
+                key: ("SKIPPED" if key.endswith("_status") else value)
+                for key, value in {
+                    **self.post_deriver.initial_status_values(node),
+                    **self.aggregator.initial_status_values(node),
+                }.items()
+            },
             all_a_snapshot_status="SKIPPED",
             limit_up_pool_status="SKIPPED",
             limit_down_pool_status="SKIPPED",

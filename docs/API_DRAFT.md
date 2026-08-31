@@ -28,6 +28,31 @@
 
 影响：只查询，不启动、停止、重启或修改任务。
 
+### 工具：`get_market_state_package`
+
+中文用途：读取市场状态聚合包。
+
+工具从固定目录 `D:\Amarket\data\market_state_packages` 定位已经生成的JSON包，校验目录日期、
+文件名、交易日、节点号、采集编号和计划时间后，原样返回完整包内容。它不查询ClickHouse、
+不重新计算、不写文件，也不生成市场结论。
+
+| 参数 | 类型 | 必填 | 规则 |
+|---|---|---:|---|
+| `target_time` | 文本或空 | 与节点号至少一个 | `HH:MM`或`HH:MM:SS` |
+| `node_seq` | 整数或空 | 与时间至少一个 | 1至254，实际只命中已有19节点包 |
+| `trade_date` | 文本或空 | 否 | `YYYY-MM-DD`或`YYYYMMDD`；不传时读取最近有效目录 |
+| `wait_for_ready` | 布尔值 | 否 | 默认false；true时在一次调用内等待正式JSON就绪 |
+| `retry_interval_seconds` | 整数 | 否 | 默认10，允许5至30秒 |
+| `max_wait_seconds` | 整数 | 否 | 默认120，允许1至300秒；15:00任务使用300 |
+
+`/ai 时间`、`/AI 时间`、指定盘中时间或恢复盘中状态时优先调用本工具，不先绕到自由SQL。
+
+等待模式只轮询目标正式`.json`文件，不读取临时文件，不访问ClickHouse，不生成聚合包，也不重新
+触发定时任务。文件出现后仍须通过完整JSON及身份校验。等待期内文件为空或尚未写完整会继续重试；
+超时仍不存在返回`TIMEOUT`，始终损坏返回`INVALID_PACKAGE`。返回同时包含`wait_elapsed_ms`和
+`retry_count`。等待模式未指定日期时固定等待上海时区当天目录，避免静默读取上一交易日同一时间；
+普通手动读取未指定日期时仍使用最近有效交易日目录。
+
 ### 工具：`query_market_data`
 
 用途：对 `market` 数据库执行受限制的只读查询。
@@ -54,9 +79,10 @@ SELECT, WITH, SHOW, DESCRIBE, DESC, EXPLAIN, EXISTS
 
 入口程序：`app/clickhouse_plugin_server.py`
 
-它通过逐行 JSON 消息提供与上面相同的两个工具：
+它通过逐行 JSON 消息提供与上面相同的三个工具：
 
 - `collection_status_query`
+- `get_market_state_package`
 - `execute_clickhouse_readonly_sql`
 
 该入口供本地工具集成，不是 HTTP 服务。它同样只读，参数范围与本机 AI 查询入口一致。

@@ -17,6 +17,7 @@ SCHEDULE = "market.hithink_snapshot_schedule"
 RAW = "market.hithink_snapshot_raw"
 DERIVED = "market.hithink_snapshot_derived"
 MARKET_STATE = "market.hithink_market_state"
+EMOTION_STATE = "market.hithink_emotion_state"
 LIMIT_UP_POOL = "market.hithink_limit_up_pool"
 LIMIT_DOWN_POOL = "market.hithink_limit_down_pool"
 LIMIT_BREAK_POOL = "market.hithink_limit_break_pool"
@@ -28,7 +29,6 @@ DAILY_TASKS = (
     "sector_membership_sync",
     "hithink_daily_k_raw_sync",
     "hithink_adjustment_events_sync",
-    "daily_derivation",
 )
 SECTOR_INDEX = "market.hithink_sector_index_snapshot"
 SECTOR_STATES = {
@@ -36,6 +36,86 @@ SECTOR_STATES = {
     "industry": "market.hithink_industry_state",
     "style": "market.hithink_style_state",
 }
+
+
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split SQL only at statement terminators outside strings and comments."""
+    statements: list[str] = []
+    buffer: list[str] = []
+    quote: str | None = None
+    in_line_comment = False
+    in_block_comment = False
+    index = 0
+    while index < len(sql):
+        char = sql[index]
+        next_char = sql[index + 1] if index + 1 < len(sql) else ""
+
+        if in_line_comment:
+            buffer.append(char)
+            if char in "\r\n":
+                in_line_comment = False
+            index += 1
+            continue
+
+        if in_block_comment:
+            buffer.append(char)
+            if char == "*" and next_char == "/":
+                buffer.append(next_char)
+                index += 2
+                in_block_comment = False
+            else:
+                index += 1
+            continue
+
+        if quote is not None:
+            buffer.append(char)
+            if char == "\\" and next_char:
+                buffer.append(next_char)
+                index += 2
+                continue
+            if char == quote:
+                if next_char == quote:
+                    buffer.append(next_char)
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+
+        if char in {"'", '"', "`"}:
+            quote = char
+            buffer.append(char)
+            index += 1
+            continue
+        if char == "-" and next_char == "-":
+            buffer.extend((char, next_char))
+            index += 2
+            in_line_comment = True
+            continue
+        if char == "/" and next_char == "*":
+            buffer.extend((char, next_char))
+            index += 2
+            in_block_comment = True
+            continue
+        if char == ";":
+            statement = "".join(buffer).strip()
+            if statement:
+                statements.append(statement)
+            buffer.clear()
+            index += 1
+            continue
+
+        buffer.append(char)
+        index += 1
+
+    if quote is not None:
+        raise ValueError("Unterminated SQL string or quoted identifier")
+    if in_block_comment:
+        raise ValueError("Unterminated SQL block comment")
+    statement = "".join(buffer).strip()
+    if statement:
+        statements.append(statement)
+    return statements
 
 
 class ClickHouseWriter:
@@ -48,31 +128,88 @@ class ClickHouseWriter:
         self.client.close()
 
     def initialize_schema(self, schema_path: Path) -> None:
-        for statement in schema_path.read_text(encoding="utf-8").split(";"):
-            if statement.strip():
-                self.client.command(statement)
+        for statement in _split_sql_statements(schema_path.read_text(encoding="utf-8")):
+            self.client.command(statement)
 
     def initialize_schedule(self, nodes: list[ScheduleNode]) -> None:
-        if self._scalar(
-            f"SELECT count() FROM {SCHEDULE} FINAL WHERE trade_date = {{date:Date}}",
-            {"date": nodes[0].trade_date},
-        ):
-            return
-        self.client.insert(
-            SCHEDULE,
-            [
-                (n.trade_date, n.collection_id, n.scheduled_time, n.session, n.sequence_no, "PENDING")
-                for n in nodes
-            ],
-            column_names=[
-                "trade_date",
-                "collection_id",
-                "scheduled_time",
-                "session",
-                "sequence_no",
-                "status",
-            ],
-        )
+        if not nodes:
+            raise RuntimeError("盘中采集计划不能为空")
+
+        trade_date = nodes[0].trade_date
+        expected = {node.scheduled_time: node for node in nodes}
+        if len(nodes) != 254 or len(expected) != 254:
+            raise RuntimeError(
+                f"{trade_date} 盘中计划生成错误：应为254个唯一节点，实际为{len(nodes)}个"
+            )
+
+        def current_rows() -> dict[datetime, tuple[str, str, int]]:
+            result = self.client.query(
+                f"""
+                SELECT collection_id, scheduled_time, session, sequence_no
+                FROM {SCHEDULE} FINAL
+                WHERE trade_date = {{date:Date}}
+                """,
+                parameters={"date": trade_date},
+            )
+            rows: dict[datetime, tuple[str, str, int]] = {}
+            for collection_id, scheduled_time, session, sequence_no in result.result_rows:
+                normalized_id = (
+                    collection_id.decode("ascii")
+                    if isinstance(collection_id, bytes)
+                    else str(collection_id)
+                ).rstrip("\x00")
+                rows[scheduled_time] = (
+                    normalized_id,
+                    str(session),
+                    int(sequence_no),
+                )
+            return rows
+
+        existing = current_rows()
+        unexpected = sorted(set(existing) - set(expected))
+        mismatched = [
+            scheduled_time
+            for scheduled_time, node in expected.items()
+            if scheduled_time in existing
+            and existing[scheduled_time]
+            != (node.collection_id, node.session, node.sequence_no)
+        ]
+        if unexpected or mismatched:
+            raise RuntimeError(
+                f"{trade_date} 盘中计划存在错误节点："
+                f"多余时间{unexpected[:5]}，编号或时段不匹配{mismatched[:5]}"
+            )
+
+        missing = [node for node in nodes if node.scheduled_time not in existing]
+        if missing:
+            self.client.insert(
+                SCHEDULE,
+                [
+                    (
+                        node.trade_date,
+                        node.collection_id,
+                        node.scheduled_time,
+                        node.session,
+                        node.sequence_no,
+                        "PENDING",
+                    )
+                    for node in missing
+                ],
+                column_names=[
+                    "trade_date",
+                    "collection_id",
+                    "scheduled_time",
+                    "session",
+                    "sequence_no",
+                    "status",
+                ],
+            )
+
+        completed = current_rows()
+        if len(completed) != 254 or set(completed) != set(expected):
+            raise RuntimeError(
+                f"{trade_date} 盘中计划未准备完整：应为254条，实际为{len(completed)}条"
+            )
 
     def initialize_daily_task_plan(self, trade_date: object) -> None:
         existing = {
@@ -107,6 +244,21 @@ class ClickHouseWriter:
         ).result_rows
         return bool(result[0][0]) if result else None
 
+    def cached_trading_day_confirmation(
+        self, trade_date: object
+    ) -> tuple[bool, datetime] | None:
+        result = self.client.query(
+            f"""
+            SELECT is_trading_day, fetched_at
+            FROM {CALENDAR} FINAL
+            WHERE trade_date = {{date:Date}}
+            """,
+            parameters={"date": trade_date},
+        ).result_rows
+        if not result:
+            return None
+        return bool(result[0][0]), result[0][1]
+
     def set_daily_status(
         self, trade_date: object, task_name: str, status: str, **values: Any
     ) -> None:
@@ -122,14 +274,14 @@ class ClickHouseWriter:
         return result[0][0] if result else None
 
     def daily_seed_complete(self) -> bool:
-        raw = self.client.query(
+        result = self.client.query(
             f"SELECT count() FROM {DAILY_STATUS} FINAL WHERE task_name = 'hithink_daily_k_raw_sync' AND status = 'SUCCESS'"
-        ).first_item
+        ).result_rows
         # Daily-K initialization is complete once the raw daily-K seed exists.
         # Adjustment events are deliberately refreshed only on Mondays, so they
         # must not force a full daily-K initialization on every weekday before
         # the next Monday arrives.
-        return bool(raw)
+        return bool(result and result[0][0])
 
     def statuses(self, trade_date: object) -> dict[datetime, str]:
         result = self.client.query(
@@ -152,6 +304,7 @@ class ClickHouseWriter:
         )
         if existing.result_rows:
             row_data = dict(zip(existing.column_names, existing.result_rows[0]))
+            row_data.pop("node_seq", None)
             row_data.pop("updated_at", None)
         else:
             row_data = {
@@ -185,6 +338,12 @@ class ClickHouseWriter:
             "limit_down_pool_status",
             "limit_break_pool_status",
             "sector_index_status",
+            "emotion_state_status",
+            "market_delta_15m_status",
+            "capital_migration_status",
+            "core_sector_candidate_status",
+            "core_stock_candidate_status",
+            "market_package_status",
         )
         result = self.client.query(
             f"""
@@ -201,6 +360,12 @@ class ClickHouseWriter:
                  OR limit_down_pool_status = 'RUNNING'
                  OR limit_break_pool_status = 'RUNNING'
                  OR sector_index_status = 'RUNNING'
+                 OR emotion_state_status = 'RUNNING'
+                 OR market_delta_15m_status = 'RUNNING'
+                 OR capital_migration_status = 'RUNNING'
+                 OR core_sector_candidate_status = 'RUNNING'
+                 OR core_stock_candidate_status = 'RUNNING'
+                 OR market_package_status = 'RUNNING'
               )
             """,
             parameters={"trade_date": trade_date, "cutoff": cutoff},
@@ -1308,6 +1473,426 @@ class ClickHouseWriter:
                 "pool_available": int(limit_pool_available),
             },
         )
+
+    def latest_pool_source(
+        self,
+        node: ScheduleNode,
+        pool_name: str,
+        *,
+        strictly_before: datetime | None = None,
+        trade_date: object | None = None,
+    ) -> tuple[str, object, datetime] | None:
+        """Return the nearest successfully persisted source node for one pool."""
+        status_columns = {
+            "up": "limit_up_pool_status",
+            "down": "limit_down_pool_status",
+            "break": "limit_break_pool_status",
+        }
+        try:
+            status_column = status_columns[pool_name]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported limit pool: {pool_name}") from exc
+
+        conditions = [f"{status_column} = 'SUCCESS'"]
+        parameters: dict[str, object] = {}
+        if trade_date is not None:
+            conditions.append("trade_date = {source_date:Date}")
+            parameters["source_date"] = trade_date
+        elif strictly_before is not None:
+            conditions.append(
+                "scheduled_time < {before:DateTime64(3, 'Asia/Shanghai')}"
+            )
+            parameters["before"] = strictly_before
+        else:
+            conditions.append(
+                "scheduled_time <= {as_of:DateTime64(3, 'Asia/Shanghai')}"
+            )
+            parameters["as_of"] = node.scheduled_time
+        result = self.client.query(
+            f"""
+            SELECT collection_id, trade_date, scheduled_time
+            FROM {SCHEDULE} FINAL
+            WHERE {' AND '.join(conditions)}
+            ORDER BY scheduled_time DESC
+            LIMIT 1
+            """,
+            parameters=parameters,
+        ).result_rows
+        if not result:
+            return None
+        collection_id, source_date, scheduled_time = result[0]
+        if isinstance(collection_id, bytes):
+            collection_id = collection_id.decode("ascii")
+        return str(collection_id), source_date, scheduled_time
+
+    def previous_trading_day(self, trade_date: object) -> object | None:
+        result = self.client.query(
+            f"""
+            SELECT max(trade_date)
+            FROM {CALENDAR} FINAL
+            WHERE trade_date < {{trade_date:Date}} AND is_trading_day = 1
+            """,
+            parameters={"trade_date": trade_date},
+        ).result_rows
+        return result[0][0] if result and result[0][0] is not None else None
+
+    def latest_complete_pool_source(
+        self, node: ScheduleNode
+    ) -> tuple[str, object, datetime] | None:
+        """Nearest node at which all three limit pools persisted successfully."""
+        result = self.client.query(
+            f"""
+            SELECT collection_id, trade_date, scheduled_time
+            FROM {SCHEDULE} FINAL
+            WHERE scheduled_time <= {{as_of:DateTime64(3, 'Asia/Shanghai')}}
+              AND limit_up_pool_status = 'SUCCESS'
+              AND limit_down_pool_status = 'SUCCESS'
+              AND limit_break_pool_status = 'SUCCESS'
+            ORDER BY scheduled_time DESC
+            LIMIT 1
+            """,
+            parameters={"as_of": node.scheduled_time},
+        ).result_rows
+        if not result:
+            return None
+        collection_id, source_date, scheduled_time = result[0]
+        if isinstance(collection_id, bytes):
+            collection_id = collection_id.decode("ascii")
+        return str(collection_id), source_date, scheduled_time
+
+    def emotion_pool_context(
+        self, node: ScheduleNode
+    ) -> tuple[tuple[str, object, datetime] | None, str]:
+        """Resolve the current node's four-state pool semantics."""
+        if not node.limit_pools_applicable:
+            return None, "NOT_APPLICABLE"
+        pool_source = self.latest_complete_pool_source(node)
+        if node.sequence_no == 254:
+            if (
+                pool_source is None
+                or pool_source[0] != node.collection_id
+                or pool_source[1] != node.trade_date
+                or pool_source[2] != node.scheduled_time
+            ):
+                raise RuntimeError(
+                    f"Closing node {node.collection_id} requires its own three successful pools"
+                )
+            return pool_source, "CURRENT"
+        if pool_source is None:
+            return None, "NO_SOURCE"
+        if pool_source[0] == node.collection_id:
+            return pool_source, "CURRENT"
+        return pool_source, "FALLBACK"
+
+    def previous_closing_pool_source(
+        self, source_trade_date: object
+    ) -> tuple[str, object, datetime] | None:
+        """Previous trading day's formal node-254 CURRENT pool baseline only."""
+        previous_date = self.previous_trading_day(source_trade_date)
+        if previous_date is None:
+            return None
+        result = self.client.query(
+            f"""
+            SELECT schedule.collection_id, schedule.trade_date, schedule.scheduled_time
+            FROM
+            (
+                SELECT collection_id, trade_date, scheduled_time
+                FROM {SCHEDULE} FINAL
+                WHERE trade_date = {{previous_date:Date}}
+                  AND sequence_no = 254
+                  AND limit_up_pool_status = 'SUCCESS'
+                  AND limit_down_pool_status = 'SUCCESS'
+                  AND limit_break_pool_status = 'SUCCESS'
+                  AND limit_pool_collected = 1
+            ) AS schedule
+            INNER JOIN
+            (
+                SELECT collection_id
+                FROM {EMOTION_STATE} FINAL
+                WHERE trade_date = {{previous_date:Date}}
+                  AND node_seq = 254
+                  AND pool_data_status = 'CURRENT'
+                  AND pool_source_collection_id = collection_id
+                  AND pool_source_age_seconds = 0
+                  AND pool_is_fallback = 0
+            ) AS emotion USING (collection_id)
+            LIMIT 1
+            """,
+            parameters={"previous_date": previous_date},
+        ).result_rows
+        if not result:
+            return None
+        collection_id, trade_date, scheduled_time = result[0]
+        if isinstance(collection_id, bytes):
+            collection_id = collection_id.decode("ascii")
+        return str(collection_id), trade_date, scheduled_time
+
+    def upsert_emotion_state(self, node: ScheduleNode) -> None:
+        """Build one emotion row from the latest node where all three pools succeeded."""
+        pool_source, pool_data_status = self.emotion_pool_context(node)
+        sources = {name: pool_source for name in ("up", "down", "break")}
+        up_source = pool_source
+        previous_day_up_source = (
+            self.previous_closing_pool_source(up_source[1])
+            if up_source is not None
+            else None
+        )
+
+        def source_id(name: str) -> str:
+            source = sources[name]
+            return source[0] if source is not None else ""
+
+        height_expression = """
+            ifNull(
+                continue_day_cnt,
+                if(
+                    positionUTF8(ifNull(continue_day_text, ''), '首板') > 0,
+                    toUInt16(1),
+                    toUInt16OrNull(extract(ifNull(continue_day_text, ''), '([0-9]+)'))
+                )
+            )
+        """
+        self.client.command(
+            f"""
+            INSERT INTO {EMOTION_STATE}
+            (
+                trade_date, collection_id, scheduled_time, session,
+                pool_data_status,
+                pool_source_collection_id, pool_source_scheduled_time,
+                pool_source_age_seconds, pool_is_fallback,
+                limit_up_source_collection_id, limit_up_source_scheduled_time,
+                limit_up_is_fallback,
+                limit_down_source_collection_id, limit_down_source_scheduled_time,
+                limit_down_is_fallback,
+                limit_break_source_collection_id, limit_break_source_scheduled_time,
+                limit_break_is_fallback,
+                limit_up_count, limit_down_count, limit_break_count, limit_attempt_count,
+                limit_success_rate, limit_break_rate,
+                first_board_count, second_board_count, third_board_count, fourth_board_count,
+                fifth_plus_board_count, max_board_height,
+                promotion_base_count, promotion_success_count, promotion_fail_count,
+                promotion_rate, high_board_count, high_board_break_count,
+                high_board_fail_count
+            )
+            WITH
+                current_up AS
+                (
+                    SELECT thscode, {height_expression} AS board_height
+                    FROM {LIMIT_UP_POOL} FINAL
+                    WHERE {{up_found:UInt8}} = 1
+                      AND collection_id = {{up_source_id:String}}
+                ),
+                current_down AS
+                (
+                    SELECT DISTINCT thscode
+                    FROM {LIMIT_DOWN_POOL} FINAL
+                    WHERE {{down_found:UInt8}} = 1
+                      AND collection_id = {{down_source_id:String}}
+                ),
+                current_break AS
+                (
+                    SELECT DISTINCT thscode
+                    FROM {LIMIT_BREAK_POOL} FINAL
+                    WHERE {{break_found:UInt8}} = 1
+                      AND collection_id = {{break_source_id:String}}
+                ),
+                previous_day_up AS
+                (
+                    SELECT thscode, {height_expression} AS board_height
+                    FROM {LIMIT_UP_POOL} FINAL
+                    WHERE {{previous_up_found:UInt8}} = 1
+                      AND collection_id = {{previous_up_source_id:String}}
+                ),
+                up_summary AS
+                (
+                    SELECT
+                        toUInt32(count()) AS total,
+                        toUInt32(countIf(board_height = 1)) AS first_count,
+                        toUInt32(countIf(board_height = 2)) AS second_count,
+                        toUInt32(countIf(board_height = 3)) AS third_count,
+                        toUInt32(countIf(board_height = 4)) AS fourth_count,
+                        toUInt32(countIf(board_height >= 5)) AS fifth_plus_count,
+                        if(count() = 0, toUInt16(0), max(board_height)) AS max_height,
+                        toUInt32(countIf(board_height >= 3)) AS high_count
+                    FROM current_up
+                ),
+                down_summary AS
+                (
+                    SELECT toUInt32(count()) AS total FROM current_down
+                ),
+                break_summary AS
+                (
+                    SELECT toUInt32(count()) AS total FROM current_break
+                ),
+                promotion_summary AS
+                (
+                    SELECT
+                        toUInt32(count()) AS base_count,
+                        toUInt32(countIf(current.board_height >= previous.board_height + 1))
+                            AS success_count,
+                        toUInt32(countIf(
+                            current.board_height IS NULL
+                            OR current.board_height < previous.board_height + 1
+                        ))
+                            AS fail_count,
+                        toUInt32(countIf(
+                            previous.board_height >= 3
+                            AND (
+                                current.board_height IS NULL
+                                OR current.board_height < previous.board_height + 1
+                            )
+                        )) AS high_fail_count
+                    FROM previous_day_up AS previous
+                    LEFT JOIN current_up AS current USING (thscode)
+                ),
+                high_break_summary AS
+                (
+                    SELECT toUInt32(count()) AS total
+                    FROM current_break AS broken
+                    INNER JOIN previous_day_up AS reference USING (thscode)
+                    WHERE reference.board_height >= 3
+                )
+            SELECT
+                {{trade_date:Date}},
+                {{collection_id:String}},
+                {{scheduled_time:DateTime64(3, 'Asia/Shanghai')}},
+                {{session:String}},
+                {{pool_data_status:String}},
+                if({{pool_source_found:UInt8}} = 1, {{pool_source_id:String}},
+                    CAST(NULL, 'Nullable(FixedString(11))')),
+                if({{pool_source_found:UInt8}} = 1,
+                    {{pool_source_time:DateTime64(3, 'Asia/Shanghai')}},
+                    CAST(NULL AS Nullable(DateTime64(3, 'Asia/Shanghai')))),
+                if({{pool_source_found:UInt8}} = 1,
+                    toUInt32(dateDiff(
+                        'second',
+                        {{pool_source_time:DateTime64(3, 'Asia/Shanghai')}},
+                        {{scheduled_time:DateTime64(3, 'Asia/Shanghai')}}
+                    )),
+                    CAST(NULL, 'Nullable(UInt32)')),
+                {{pool_is_fallback:UInt8}},
+                if({{up_found:UInt8}} = 1, {{up_source_id:String}},
+                    CAST(NULL, 'Nullable(FixedString(11))')),
+                if({{up_found:UInt8}} = 1,
+                    {{up_source_time:DateTime64(3, 'Asia/Shanghai')}},
+                    CAST(NULL AS Nullable(DateTime64(3, 'Asia/Shanghai')))),
+                {{up_is_fallback:UInt8}},
+                if({{down_found:UInt8}} = 1, {{down_source_id:String}},
+                    CAST(NULL, 'Nullable(FixedString(11))')),
+                if({{down_found:UInt8}} = 1,
+                    {{down_source_time:DateTime64(3, 'Asia/Shanghai')}},
+                    CAST(NULL AS Nullable(DateTime64(3, 'Asia/Shanghai')))),
+                {{down_is_fallback:UInt8}},
+                if({{break_found:UInt8}} = 1, {{break_source_id:String}},
+                    CAST(NULL, 'Nullable(FixedString(11))')),
+                if({{break_found:UInt8}} = 1,
+                    {{break_source_time:DateTime64(3, 'Asia/Shanghai')}},
+                    CAST(NULL AS Nullable(DateTime64(3, 'Asia/Shanghai')))),
+                {{break_is_fallback:UInt8}},
+                if({{up_found:UInt8}} = 1, up.total, CAST(NULL, 'Nullable(UInt32)')),
+                if({{down_found:UInt8}} = 1, down.total, CAST(NULL, 'Nullable(UInt32)')),
+                if({{break_found:UInt8}} = 1, broken.total, CAST(NULL, 'Nullable(UInt32)')),
+                if({{up_found:UInt8}} = 1 AND {{break_found:UInt8}} = 1,
+                    toUInt32(up.total + broken.total), CAST(NULL, 'Nullable(UInt32)')),
+                if({{up_found:UInt8}} = 1 AND {{break_found:UInt8}} = 1
+                    AND up.total + broken.total > 0,
+                    up.total / (up.total + broken.total), CAST(NULL, 'Nullable(Float64)')),
+                if({{up_found:UInt8}} = 1 AND {{break_found:UInt8}} = 1
+                    AND up.total + broken.total > 0,
+                    broken.total / (up.total + broken.total), CAST(NULL, 'Nullable(Float64)')),
+                if({{up_found:UInt8}} = 1, up.first_count, CAST(NULL, 'Nullable(UInt32)')),
+                if({{up_found:UInt8}} = 1, up.second_count, CAST(NULL, 'Nullable(UInt32)')),
+                if({{up_found:UInt8}} = 1, up.third_count, CAST(NULL, 'Nullable(UInt32)')),
+                if({{up_found:UInt8}} = 1, up.fourth_count, CAST(NULL, 'Nullable(UInt32)')),
+                if({{up_found:UInt8}} = 1, up.fifth_plus_count, CAST(NULL, 'Nullable(UInt32)')),
+                if({{up_found:UInt8}} = 1, up.max_height, CAST(NULL, 'Nullable(UInt16)')),
+                if({{previous_up_found:UInt8}} = 1, promotion.base_count,
+                    CAST(NULL, 'Nullable(UInt32)')),
+                if({{previous_up_found:UInt8}} = 1, promotion.success_count,
+                    CAST(NULL, 'Nullable(UInt32)')),
+                if({{previous_up_found:UInt8}} = 1, promotion.fail_count,
+                    CAST(NULL, 'Nullable(UInt32)')),
+                if({{previous_up_found:UInt8}} = 1 AND promotion.base_count > 0,
+                    promotion.success_count / promotion.base_count,
+                    CAST(NULL, 'Nullable(Float64)')),
+                if({{up_found:UInt8}} = 1, up.high_count, CAST(NULL, 'Nullable(UInt32)')),
+                if({{break_found:UInt8}} = 1 AND {{previous_up_found:UInt8}} = 1,
+                    high_break.total, CAST(NULL, 'Nullable(UInt32)')),
+                if({{previous_up_found:UInt8}} = 1, promotion.high_fail_count,
+                    CAST(NULL, 'Nullable(UInt32)'))
+            FROM up_summary AS up
+            CROSS JOIN down_summary AS down
+            CROSS JOIN break_summary AS broken
+            CROSS JOIN promotion_summary AS promotion
+            CROSS JOIN high_break_summary AS high_break
+            """,
+            parameters={
+                "trade_date": node.trade_date,
+                "collection_id": node.collection_id,
+                "scheduled_time": node.scheduled_time,
+                "session": node.session,
+                "pool_data_status": pool_data_status,
+                "pool_source_found": int(pool_source is not None),
+                "pool_source_id": pool_source[0] if pool_source else "",
+                "pool_source_time": pool_source[2] if pool_source else node.scheduled_time,
+                "pool_is_fallback": int(pool_data_status == "FALLBACK"),
+                "up_found": int(sources["up"] is not None),
+                "up_source_id": source_id("up"),
+                "up_source_time": sources["up"][2] if sources["up"] else node.scheduled_time,
+                "up_is_fallback": int(
+                    sources["up"] is not None and source_id("up") != node.collection_id
+                ),
+                "down_found": int(sources["down"] is not None),
+                "down_source_id": source_id("down"),
+                "down_source_time": (
+                    sources["down"][2] if sources["down"] else node.scheduled_time
+                ),
+                "down_is_fallback": int(
+                    sources["down"] is not None and source_id("down") != node.collection_id
+                ),
+                "break_found": int(sources["break"] is not None),
+                "break_source_id": source_id("break"),
+                "break_source_time": (
+                    sources["break"][2] if sources["break"] else node.scheduled_time
+                ),
+                "break_is_fallback": int(
+                    sources["break"] is not None and source_id("break") != node.collection_id
+                ),
+                "previous_up_found": int(previous_day_up_source is not None),
+                "previous_up_source_id": (
+                    previous_day_up_source[0] if previous_day_up_source else ""
+                ),
+            },
+        )
+
+    def emotion_state_count(self, node: ScheduleNode) -> int:
+        return self._scalar(
+            f"SELECT count() FROM {EMOTION_STATE} FINAL "
+            "WHERE collection_id = {collection_id:String}",
+            {"collection_id": node.collection_id},
+        )
+
+    def emotion_state_nodes(self, trade_date: object) -> list[ScheduleNode]:
+        result = self.client.query(
+            f"""
+            SELECT scheduled_time, session, sequence_no
+            FROM {SCHEDULE} FINAL
+            WHERE trade_date = {{date:Date}}
+              AND scheduled_time <= now64(3)
+              AND (
+                    derivation_status = 'SUCCESS'
+                 OR limit_up_pool_status NOT IN ('', 'PENDING', 'RUNNING', 'SKIPPED')
+                 OR limit_down_pool_status NOT IN ('', 'PENDING', 'RUNNING', 'SKIPPED')
+                 OR limit_break_pool_status NOT IN ('', 'PENDING', 'RUNNING', 'SKIPPED')
+              )
+            ORDER BY sequence_no
+            """,
+            parameters={"date": trade_date},
+        )
+        return [
+            ScheduleNode(trade_date, scheduled_time, session, sequence_no)
+            for scheduled_time, session, sequence_no in result.result_rows
+        ]
 
     def market_state_nodes(self, trade_date: object) -> list[ScheduleNode]:
         result = self.client.query(

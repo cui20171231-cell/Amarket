@@ -27,7 +27,7 @@ $bootTrigger = New-ScheduledTaskTrigger -AtStartup
 $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 
-Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $bootTrigger -Settings $taskSettings -Principal $taskPrincipal -Description "SYSTEM-owned always-on Hithink collector with direct Python startup and one-minute failure recovery." -Force
+Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $bootTrigger -Settings $taskSettings -Principal $taskPrincipal -Description "SYSTEM-owned collector with an 08:50 trading-day gate, then sector mapping, 254 intraday snapshots, 16:00 daily-K and Monday adjustment events." -Force
 Start-ScheduledTask -TaskName $taskName
 Start-Sleep -Seconds 3
 Get-ScheduledTask -TaskName $taskName | Select-Object TaskName, State

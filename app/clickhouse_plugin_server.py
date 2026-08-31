@@ -1,4 +1,4 @@
-"""MCP server exposing one read-only Amarket collection-status query."""
+"""MCP server exposing Amarket's read-only status, package and SQL tools."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 from app.clickhouse_readonly import execute_clickhouse_readonly_sql
 from app.hithink.status import collection_status_response
+from app.market_state_package_reader import compact_package_for_ai, get_market_state_package
 
 TOOLS = [
     {
@@ -26,6 +27,44 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_market_state_package",
+        "title": "读取市场状态聚合包",
+        "description": (
+            "读取本地已经生成的A股市场状态聚合包。"
+            "当用户输入“/ai 时间”、“/AI 时间”、指定盘中时间、节点号，或要求恢复某个盘中市场状态时，"
+            "优先调用本工具。工具按交易日和目标时间/节点定位JSON聚合包并返回复盘核心数据，"
+            "仅省略体积过大的全概念历史轨迹矩阵，核心板块自身轨迹仍完整保留；"
+            "可在一次调用内等待目标包就绪；不重新查询数据库、不触发聚合任务。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_time": {"type": ["string", "null"]},
+                "node_seq": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 254,
+                },
+                "trade_date": {"type": ["string", "null"]},
+                "wait_for_ready": {"type": "boolean", "default": False},
+                "retry_interval_seconds": {
+                    "type": "integer",
+                    "minimum": 5,
+                    "maximum": 30,
+                    "default": 10,
+                },
+                "max_wait_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 300,
+                    "default": 120,
+                },
+            },
+            "anyOf": [{"required": ["target_time"]}, {"required": ["node_seq"]}],
             "additionalProperties": False,
         },
     },
@@ -78,6 +117,21 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 {"type": "text", "text": json.dumps(result, ensure_ascii=False, default=str)}
             ]
         }
+    if name == "get_market_state_package":
+        result = compact_package_for_ai(get_market_state_package(**arguments))
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        result,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                }
+            ],
+        }
     raise ValueError(f"未知工具：{name}")
 
 
@@ -102,7 +156,7 @@ def main() -> None:
                         "protocolVersion", "2024-11-05"
                     ),
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "采集状态查询", "version": "1.0.0"},
+                    "serverInfo": {"name": "我的行情数据库", "version": "1.1.0"},
                 }
             elif method == "tools/list":
                 result = {"tools": TOOLS}

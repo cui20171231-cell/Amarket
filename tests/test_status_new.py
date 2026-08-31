@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from app.hithink import status as status_module
+from app.hithink.aggregation import TARGET_NODE_SEQUENCES
 from app.hithink.schedule import SHANGHAI, build_daily_schedule
 from app.hithink.status import build_status_payload, render_combined_status
 
@@ -24,25 +25,27 @@ def _scheduler(*, active_collection_id: str | None = None) -> dict:
                 "last_run_time": "2026/08/28 08:50:00",
                 "next_run_time": "N/A",
             },
-            {
-                "name": "HithinkDailyPipeline",
-                "state": "Ready",
-                "last_result": 0,
-                "last_run_time": "2026/08/28 10:00:00",
-                "next_run_time": "2026-08-28T16:00:00",
-            },
-            {
-                "name": "HithinkSectorMappingSync",
-                "state": "Ready",
-                "last_result": 0,
-                "last_run_time": "2026/08/28 08:20:00",
-                "next_run_time": "2026-08-29T08:20:00",
-            },
         ],
     }
 
 
 def _row(node, raw="SUCCESS", derivation="SUCCESS", **values) -> dict:
+    emotion = (
+        "SUCCESS"
+        if derivation == "SUCCESS"
+        else "PENDING"
+        if derivation == "RUNNING"
+        else "BLOCKED"
+    )
+    fixed_status = (
+        "SUCCESS"
+        if derivation == "SUCCESS"
+        else "PENDING"
+        if derivation == "RUNNING"
+        else "BLOCKED"
+    )
+    if node.sequence_no not in TARGET_NODE_SEQUENCES:
+        fixed_status = "SKIPPED"
     base = {
         "collection_id": node.collection_id,
         "scheduled_time": node.scheduled_time,
@@ -56,6 +59,12 @@ def _row(node, raw="SUCCESS", derivation="SUCCESS", **values) -> dict:
         "limit_break_pool_status": "SUCCESS" if raw == "SUCCESS" else raw,
         "sector_index_status": "SUCCESS" if raw == "SUCCESS" else raw,
         "sector_state_status": "SUCCESS" if derivation == "SUCCESS" else derivation,
+        "emotion_state_status": emotion,
+        "market_delta_15m_status": fixed_status,
+        "capital_migration_status": fixed_status,
+        "core_sector_candidate_status": fixed_status,
+        "core_stock_candidate_status": fixed_status,
+        "market_package_status": fixed_status,
         "raw_error_code": None,
         "raw_error_message": None,
     }
@@ -176,6 +185,22 @@ def test_non_trading_day_is_idle() -> None:
     daily_k = next(item for item in report["details"] if item["item"] == "日K数据")
     assert daily_k["expected"] == 0
     assert daily_k["failed"] == 0
+
+
+def test_non_trading_day_skips_mapping_and_1600_daily_collection() -> None:
+    as_of = datetime(2026, 8, 29, 17, 0, tzinfo=SHANGHAI)
+    report = _payload(as_of, [], trading_day=False)
+
+    mapping = [
+        item for item in report["details"] if item["group"] == "板块映射"
+    ]
+    daily = [item for item in report["details"] if item["group"] == "每日数据"]
+
+    assert mapping and all(item["expected"] == 0 for item in mapping)
+    assert next(item for item in daily if item["item"] == "日K数据")["expected"] == 0
+    assert next(
+        item for item in daily if item["item"] == "复权、除权事件"
+    )["expected"] == 0
 
 
 def test_lunch_next_time_points_to_afternoon() -> None:

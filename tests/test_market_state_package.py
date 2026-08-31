@@ -1,0 +1,171 @@
+import json
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+
+from app.hithink.candidate_config import CAPITAL_SECTOR_TYPES, CORE_SECTOR_TYPES
+from app.market_state_package import (
+    MarketStatePackageBuilder,
+    _business_period,
+    _json_safe,
+    _parse_target_time,
+    _subtract,
+)
+
+PACKAGE_SOURCE = Path("app/market_state_package.py").read_text(encoding="utf-8")
+
+
+def test_target_time_accepts_minutes_or_seconds() -> None:
+    assert _parse_target_time("10:30").isoformat() == "10:30:00"
+    assert _parse_target_time("10:30:15").isoformat() == "10:30:15"
+
+
+def test_business_period_never_crosses_lunch() -> None:
+    morning = datetime.fromisoformat("2026-08-28T10:30:15+08:00")
+    afternoon = datetime.fromisoformat("2026-08-28T13:30:15+08:00")
+    assert _business_period(morning)[0] == "AM"
+    assert _business_period(afternoon)[0] == "PM"
+    assert _business_period(afternoon)[1].hour == 13
+
+
+def test_null_propagation_is_preserved_for_temporary_deltas() -> None:
+    assert _subtract(10, 4) == 6
+    assert _subtract(None, 4) is None
+    assert _subtract(10, None) is None
+
+
+def test_json_conversion_preserves_decimal_precision_and_fixed_strings() -> None:
+    value = _json_safe({"amount": Decimal("123.45"), "collection_id": b"20260828072"})
+    assert value == {"amount": "123.45", "collection_id": "20260828072"}
+
+
+def test_capital_top_lists_only_use_signed_share_changes() -> None:
+    builder = MarketStatePackageBuilder(client=None)
+    rows = [
+        {
+            "sector_type": "concept",
+            "sector_code": "A",
+            "turnover_market_share_delta_15m": 2.0,
+        },
+        {
+            "sector_type": "concept",
+            "sector_code": "B",
+            "turnover_market_share_delta_15m": -3.0,
+        },
+        {
+            "sector_type": "concept",
+            "sector_code": "C",
+            "turnover_market_share_delta_15m": 0.0,
+        },
+    ]
+    block = builder._capital_block(rows, 10)
+    assert [row["sector_code"] for row in block["concept"]["share_rising_top"]] == ["A"]
+    assert [row["sector_code"] for row in block["concept"]["share_falling_top"]] == ["B"]
+
+
+def test_style_remains_in_capital_but_not_core_sector_competition() -> None:
+    assert CAPITAL_SECTOR_TYPES == ("concept", "industry", "style")
+    assert CORE_SECTOR_TYPES == ("concept", "industry")
+    assert "for sector_type in CAPITAL_SECTOR_TYPES" in PACKAGE_SOURCE
+    assert "for sector_type in CORE_SECTOR_TYPES" in PACKAGE_SOURCE
+    assert PACKAGE_SOURCE.count("sector_type IN {core_sector_types:Array(String)}") == 4
+
+
+def test_package_reader_is_wired_into_both_mcp_servers() -> None:
+    gateway = Path("app/ai_gateway.py").read_text(encoding="utf-8")
+    plugin = Path("app/clickhouse_plugin_server.py").read_text(encoding="utf-8")
+    assert "def get_market_state_package(" in gateway
+    assert '"name": "get_market_state_package"' in plugin
+
+
+def test_example_package_id_matches_its_resolved_node() -> None:
+    package = json.loads(
+        Path("docs/market_state_package_20260828_1030.json").read_text(encoding="utf-8")
+    )
+    assert package["package_id"] == package["target"]["resolved_collection_id"]
+    assert package["package_id"] == "20260828072"
+
+
+def test_core_sector_trajectories_keep_candidate_and_state_semantics_separate() -> None:
+    package = json.loads(
+        Path("docs/market_state_package_20260828_1030.json").read_text(encoding="utf-8")
+    )
+    assert set(package["core_sectors"]) == {"concept", "industry"}
+    sectors = [
+        sector
+        for sector_type in ("concept", "industry")
+        for sector in package["core_sectors"][sector_type]
+    ]
+    assert sectors
+    for sector in sectors:
+        recent = sector["trajectory_recent_5_nodes"]
+        key_nodes = sector["trajectory_15m_last_5"]
+        assert 1 <= len(recent) <= 5
+        assert 1 <= len(key_nodes) <= 5
+        assert all(node["candidate_rank"] is None for node in recent)
+        assert all(node["candidate_score_v1"] is None for node in recent)
+        assert all(node["state_data_status"] == "CURRENT" for node in recent)
+        assert all(node["state_source_age_seconds"] == 0 for node in recent)
+        assert all(
+            (node["candidate_rank"] is None)
+            == (node["candidate_score_v1"] is None)
+            for node in key_nodes
+        )
+
+
+def test_1030_trajectory_preserves_the_real_fallback_source() -> None:
+    package = json.loads(
+        Path("docs/market_state_package_20260828_1030.json").read_text(encoding="utf-8")
+    )
+    sector = package["core_sectors"]["concept"][0]
+    recent_current = sector["trajectory_recent_5_nodes"][-1]
+    key_current = sector["trajectory_15m_last_5"][-1]
+    assert recent_current["scheduled_time"].startswith("2026-08-28T10:29:15")
+    assert key_current["scheduled_time"].startswith("2026-08-28T10:30:15")
+    assert key_current["state_data_status"] == "FALLBACK"
+    assert key_current["state_source_scheduled_time"].startswith(
+        "2026-08-28T10:29:15"
+    )
+    assert key_current["state_source_age_seconds"] == 60
+
+
+def test_v2_market_intraday_path_uses_the_fixed_axis_without_future_nodes() -> None:
+    package = json.loads(
+        Path("docs/market_state_package_20260828_1030.json").read_text(encoding="utf-8")
+    )
+    assert package["package_version"] == "V2"
+    nodes = package["market"]["intraday_trajectory"]
+    assert [node["node_seq"] for node in nodes] == [11, 12, 27, 42, 57, 72]
+    assert all(
+        node["scheduled_time"] <= package["target"]["resolved_scheduled_time"]
+        for node in nodes
+    )
+    current = nodes[-1]
+    assert current["state_data_status"] == "FALLBACK"
+    assert current["state_source_scheduled_time"].startswith("2026-08-28T10:29:15")
+    assert current["state_source_age_seconds"] == 60
+
+
+def test_v2_concept_intraday_universe_keeps_historical_exits_and_null_ranks() -> None:
+    package = json.loads(
+        Path("docs/market_state_package_20260828_1030.json").read_text(encoding="utf-8")
+    )
+    block = package["core_sector_intraday"]
+    universe = block["concept_universe"]
+    trajectories = block["concept_trajectories"]
+    assert len(universe) == len(trajectories)
+    assert any(
+        row["included_by_history_top10"] == 1
+        and row["included_by_current_candidate"] == 0
+        for row in universe
+    )
+    assert any(row["included_by_strategic_watch"] == 1 for row in universe)
+    assert any(row["included_by_migration_anomaly"] == 1 for row in universe)
+    for sector in trajectories:
+        assert len(sector["nodes"]) == 6
+        assert len(sector["rank_trajectory_intraday"]) == 6
+        assert all(
+            (node["candidate_rank"] is None)
+            == (node["candidate_score_v1"] is None)
+            for node in sector["nodes"]
+        )

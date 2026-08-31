@@ -12,9 +12,10 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from app.hithink.api import HithinkApiError, HithinkClient
+from app.hithink.api import HithinkClient
 from app.hithink.daily_deriver import DailyForwardDeriver, ForwardFormulaUnverified
 from app.hithink.schedule import SHANGHAI
+from app.hithink.trading_day_gate import SharedTradingDayGate
 from app.hithink.writer import ClickHouseWriter
 
 LOG = logging.getLogger(__name__)
@@ -75,46 +76,36 @@ class DailyRawCollector:
     def __init__(self, api: HithinkClient, writer: ClickHouseWriter):
         self.api = api
         self.writer = writer
+        self.trading_day_gate = SharedTradingDayGate(api, writer)
 
     def calendar_gate(self, trade_date: date) -> bool | None:
         started = datetime.now(SHANGHAI)
         self.writer.set_daily_status(trade_date, "calendar_gate", "RUNNING", request_start_time=started)
-        try:
-            calendar = self.api.fetch_trading_days()
-            self.writer.cache_trading_calendar(calendar.trade_dates, trade_date)
-            is_trading_day = trade_date in calendar.trade_dates
+        confirmation = self.trading_day_gate.confirm(trade_date)
+        if confirmation.is_trading_day is not None:
             self.writer.set_daily_status(
                 trade_date,
                 "calendar_gate",
                 "SUCCESS",
                 request_start_time=started,
                 request_end_time=datetime.now(SHANGHAI),
-                retry_count=calendar.retry_count,
+                retry_count=confirmation.retry_count,
+                error_code=(
+                    None if confirmation.source == "API" else confirmation.source
+                ),
+                error_message=confirmation.error_message,
             )
-            return is_trading_day
-        except HithinkApiError as exc:
-            cached = self.writer.cached_trading_day(trade_date)
-            if cached is not None:
-                self.writer.set_daily_status(
-                    trade_date,
-                    "calendar_gate",
-                    "SUCCESS",
-                    request_start_time=started,
-                    request_end_time=datetime.now(SHANGHAI),
-                    error_code="CALENDAR_CACHE",
-                    error_message=str(exc)[:1000],
-                )
-                return cached
-            self.writer.set_daily_status(
-                trade_date,
-                "calendar_gate",
-                "FAILED",
-                request_start_time=started,
-                request_end_time=datetime.now(SHANGHAI),
-                error_code="CALENDAR_UNKNOWN",
-                error_message=str(exc)[:1000],
-            )
-            return None
+            return confirmation.is_trading_day
+        self.writer.set_daily_status(
+            trade_date,
+            "calendar_gate",
+            "FAILED",
+            request_start_time=started,
+            request_end_time=datetime.now(SHANGHAI),
+            error_code="CALENDAR_UNKNOWN",
+            error_message=confirmation.error_message,
+        )
+        return None
 
     def _download(self, dump_name: str) -> Path:
         dump = self.api.fetch_dump_url(dump_name)
@@ -353,22 +344,13 @@ class DailyPipeline:
     def run_pipeline(self, trade_date: date, *, initialize: bool) -> None:
         self.collect(trade_date, initialize=initialize)
 
-    def repair_scan(self, trade_date: date) -> None:
-        if not self.writer.daily_seed_complete():
-            self.writer.set_daily_status(
-                trade_date, "repair_scan", "SKIPPED", error_code="INITIALIZATION_PENDING"
-            )
-            return
-        self.writer.set_daily_status(trade_date, "repair_scan", "SUCCESS")
-
     def run_auto(self) -> None:
         now = datetime.now(SHANGHAI)
+        if now.time() < time(16, 0):
+            LOG.info("Daily-K collection is scheduled only at 16:00 Beijing time")
+            return
         trade_date = now.date()
         self.writer.initialize_daily_task_plan(trade_date)
-        self.collector.calendar_gate(trade_date)
-        self.repair_scan(trade_date)
-        if now.time() < time(16, 0):
-            return
         initialize = not self.writer.daily_seed_complete()
         if initialize and now.time() < time(16, 5):
             delay = (datetime.combine(trade_date, time(16, 5), tzinfo=SHANGHAI) - now).total_seconds()

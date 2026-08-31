@@ -15,19 +15,16 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from app.hithink.aggregation import TARGET_NODE_SEQUENCES
 from app.hithink.config import Settings
 from app.hithink.schedule import SHANGHAI, build_daily_schedule
 from app.hithink.writer import ClickHouseWriter
 
 TASK_NAMES = (
     "HithinkSnapshotCollector",
-    "HithinkDailyPipeline",
-    "HithinkSectorMappingSync",
 )
 TASK_LABELS = {
     "HithinkSnapshotCollector": "盘中快照",
-    "HithinkDailyPipeline": "每日数据",
-    "HithinkSectorMappingSync": "板块映射",
 }
 RAW_ITEMS = {
     "all_a_snapshot_status": "行情快照",
@@ -43,6 +40,14 @@ DERIVED_ITEMS = (
     "行业板块状态",
     "风格板块状态",
 )
+POST_DERIVED_ITEMS = {
+    "emotion_state_status": "情绪梯队状态",
+    "market_delta_15m_status": "15分钟市场变化",
+    "capital_migration_status": "板块成交份额迁移",
+    "core_sector_candidate_status": "核心板块候选",
+    "core_stock_candidate_status": "核心个股候选",
+    "market_package_status": "市场状态聚合包",
+}
 CLICKHOUSE_CONTAINER = "hithink-snapshot-clickhouse-1"
 ROOT = Path(__file__).resolve().parents[2]
 COLLECTOR_PID_PATH = ROOT / "data" / "hithink_snapshot_collector.pid"
@@ -269,6 +274,12 @@ NODE_COLUMNS = (
     "limit_break_pool_status",
     "sector_index_status",
     "sector_state_status",
+    "emotion_state_status",
+    "market_delta_15m_status",
+    "capital_migration_status",
+    "core_sector_candidate_status",
+    "core_stock_candidate_status",
+    "market_package_status",
     "raw_error_code",
     "raw_error_message",
     "derivation_error_code",
@@ -486,6 +497,17 @@ def _next_pool_schedule(as_of: datetime) -> datetime | None:
     )
 
 
+def _next_fixed_package_schedule(as_of: datetime) -> datetime | None:
+    return next(
+        (
+            node.scheduled_time
+            for node in build_daily_schedule(as_of.date())
+            if node.scheduled_time > as_of and node.sequence_no in TARGET_NODE_SEQUENCES
+        ),
+        None,
+    )
+
+
 def _error_category(code: str, message: str) -> str:
     text = f"{code} {message}".lower()
     if "missing required pagination" in text:
@@ -607,7 +629,7 @@ def _parse_task_time(value: str | None) -> datetime | None:
 
 
 def _daily_trigger_counts(as_of: datetime, last_run_time: str | None) -> tuple[int, int]:
-    triggers = (time(8, 40), time(10), time(16))
+    triggers = (time(16),)
     expected = sum(as_of >= datetime.combine(as_of.date(), trigger, SHANGHAI) for trigger in triggers)
     last_run = _parse_task_time(last_run_time)
     success = (
@@ -628,6 +650,42 @@ def _simple_stats(expected: int, success: int, running: int = 0) -> dict[str, An
     return stats
 
 
+def _next_sector_mapping_schedule(as_of: datetime) -> datetime:
+    scheduled = datetime.combine(as_of.date(), time(8, 50), SHANGHAI)
+    if as_of >= scheduled:
+        scheduled += timedelta(days=1)
+    return scheduled
+
+
+def _next_trading_day_confirmation_schedule(as_of: datetime) -> datetime:
+    scheduled = datetime.combine(as_of.date(), time(8, 50), SHANGHAI)
+    if as_of >= scheduled:
+        scheduled += timedelta(days=1)
+    return scheduled
+
+
+def _next_daily_collection_schedule(as_of: datetime) -> datetime:
+    scheduled = datetime.combine(as_of.date(), time(16), SHANGHAI)
+    if as_of >= scheduled:
+        scheduled += timedelta(days=1)
+    return scheduled
+
+
+def _single_result_stats(expected: int, status: Any) -> dict[str, Any]:
+    stats = _empty_stats(expected)
+    if expected:
+        bucket = {
+            "SUCCESS": "success",
+            "PARTIAL": "partial",
+            "FAILED": "failed",
+            "RUNNING": "running",
+        }.get(_canonical_state(status), "failed")
+        stats[bucket] = 1
+    stats["closed"] = True
+    stats["unclassified"] = 0
+    return stats
+
+
 def _detail_rows(
     rows: list[dict[str, Any]],
     as_of: datetime,
@@ -639,6 +697,7 @@ def _detail_rows(
 ) -> list[dict[str, Any]]:
     next_snapshot = _next_schedule(as_of)
     next_pool = _next_pool_schedule(as_of)
+    next_fixed_package = _next_fixed_package_schedule(as_of)
     details: list[dict[str, Any]] = []
     pool_fields = {"limit_up_pool_status", "limit_down_pool_status", "limit_break_pool_status"}
     for field, item in RAW_ITEMS.items():
@@ -663,23 +722,49 @@ def _detail_rows(
             }
         )
 
-    scheduled = {task["name"]: task for task in scheduler.get("tasks", [])}
-    daily_task = scheduled.get("HithinkDailyPipeline", {})
-    daily_expected, daily_success = _daily_trigger_counts(as_of, daily_task.get("last_run_time"))
+    target_rows = [
+        row for row in rows if int(row.get("sequence_no") or 0) in TARGET_NODE_SEQUENCES
+    ]
+    for field, item in POST_DERIVED_ITEMS.items():
+        applicable = rows if field == "emotion_state_status" else target_rows
+        details.append(
+            {
+                "group": "新增派生",
+                "item": item,
+                **_count_states(
+                    applicable,
+                    field,
+                    as_of,
+                    active_collection_id,
+                    derivation=True,
+                ),
+                "next_scheduled_time": (
+                    next_snapshot if field == "emotion_state_status" else next_fixed_package
+                ),
+            }
+        )
+
     daily_steps = {row["task_name"]: row for row in daily}
-    daily_running = int(daily_task.get("state") == "Running")
-    daily_next = _parse_task_time(daily_task.get("next_run_time"))
+    daily_expected = int(as_of.time() >= time(8, 50))
+    daily_success = int(
+        (daily_steps.get("calendar_gate") or {}).get("status") == "SUCCESS"
+    )
+    daily_running = int(
+        any(str(row.get("status") or "").upper() == "RUNNING" for row in daily)
+    )
+    daily_next = _next_daily_collection_schedule(as_of)
+    confirmation_next = _next_trading_day_confirmation_schedule(as_of)
     monday_delta = (7 - as_of.weekday()) % 7
     adjustment_next = datetime.combine(as_of.date() + timedelta(days=monday_delta), time(16), SHANGHAI)
     if adjustment_next <= as_of:
         adjustment_next += timedelta(days=7)
     daily_specs = [
-        ("交易日判断", daily_expected, daily_success, daily_next),
+        ("交易日判断", daily_expected, daily_success, confirmation_next),
         (
             "日K数据",
             int(trading_day and as_of.time() >= time(16)),
             int((daily_steps.get("hithink_daily_k_raw_sync") or {}).get("status") == "SUCCESS"),
-            datetime.combine(as_of.date(), time(16), SHANGHAI),
+            daily_next,
         ),
         (
             "复权、除权事件",
@@ -687,7 +772,6 @@ def _detail_rows(
             int((daily_steps.get("hithink_adjustment_events_sync") or {}).get("status") == "SUCCESS"),
             adjustment_next,
         ),
-        ("补查", daily_expected, daily_success, daily_next),
     ]
     for item, expected, success, next_time in daily_specs:
         details.append(
@@ -699,13 +783,13 @@ def _detail_rows(
             }
         )
 
-    sector_task = scheduled.get("HithinkSectorMappingSync", {})
-    sector_next = _parse_task_time(sector_task.get("next_run_time"))
+    sector_next = _next_sector_mapping_schedule(as_of)
     sector_types = {row["sector_type"]: row for row in sector}
     for sector_type, label in (("concept", "概念"), ("industry", "行业"), ("style", "风格")):
-        expected = int(as_of.time() >= time(8, 20))
-        success = int((sector_types.get(sector_type) or {}).get("status") == "SUCCESS")
-        stats = _simple_stats(expected, success, int(sector_task.get("state") == "Running"))
+        expected = int(trading_day and as_of.time() >= time(8, 50))
+        stats = _single_result_stats(
+            expected, (sector_types.get(sector_type) or {}).get("status")
+        )
         for suffix in ("板块目录", "板块股票成员关系"):
             details.append(
                 {
@@ -782,6 +866,7 @@ def build_status_payload(
                     "derivation_status": "PENDING",
                     **{field: "PENDING" for field in RAW_ITEMS},
                     "sector_state_status": "PENDING",
+                    **{field: "PENDING" for field in POST_DERIVED_ITEMS},
                     "raw_error_code": "MISSING_NODE_STATE",
                     "raw_error_message": "scheduled node has no status record",
                 }

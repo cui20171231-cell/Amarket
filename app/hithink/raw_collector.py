@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from time import sleep
+from dataclasses import dataclass, replace
+from time import perf_counter, sleep
 from typing import Any
 
 from app.hithink.api import (
@@ -16,6 +17,10 @@ from app.hithink.api import (
 from app.hithink.models import RawSnapshot
 from app.hithink.schedule import ScheduleNode
 from app.hithink.writer import ClickHouseWriter
+
+CLOSING_POOL_RETRY_SECONDS = 60
+NODE_COLLECTION_BUDGET_SECONDS = 45
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,7 @@ class RawCollector:
         self.writer = writer
 
     def collect(self, node: ScheduleNode, batch_id: str) -> RawCollectionResult:
+        deadline = perf_counter() + NODE_COLLECTION_BUDGET_SECONDS
         errors: dict[str, tuple[str, str]] = {}
         failures: dict[str, Exception] = {}
         task_columns = {
@@ -140,16 +146,21 @@ class RawCollector:
             capture_error("sector_index", exc)
 
         try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            # Each endpoint owns its retries.  Five workers prevent a failed
+            # endpoint from queueing the other four behind it and consuming the
+            # next minute's collection slot.
+            with ThreadPoolExecutor(max_workers=5) as executor:
                 called.add("all_a_snapshot")
-                prices_future = executor.submit(self.api.fetch)
+                prices_future = executor.submit(self.api.fetch, deadline=deadline)
                 sleep(0.3)
 
                 sector_index_future = None
                 if sectors:
                     called.add("sector_index")
                     sector_index_future = executor.submit(
-                        self.api.fetch_sector_index_snapshot, [sector[0] for sector in sectors]
+                        self.api.fetch_sector_index_snapshot,
+                        [sector[0] for sector in sectors],
+                        deadline=deadline,
                     )
                 sleep(0.3)
 
@@ -159,17 +170,26 @@ class RawCollector:
                 if node.limit_pools_applicable:
                     called.add("limit_up_pool")
                     limit_up_future = executor.submit(
-                        self.api.fetch_limit_pool, "limit-up-pool", node.trade_date
+                        self.api.fetch_limit_pool,
+                        "limit-up-pool",
+                        node.trade_date,
+                        deadline=deadline,
                     )
                     sleep(0.3)
                     called.add("limit_down_pool")
                     limit_down_future = executor.submit(
-                        self.api.fetch_limit_pool, "limit-down-pool", node.trade_date
+                        self.api.fetch_limit_pool,
+                        "limit-down-pool",
+                        node.trade_date,
+                        deadline=deadline,
                     )
                     sleep(0.3)
                     called.add("limit_break_pool")
                     limit_break_future = executor.submit(
-                        self.api.fetch_limit_pool, "limit-break-pool", node.trade_date
+                        self.api.fetch_limit_pool,
+                        "limit-break-pool",
+                        node.trade_date,
+                        deadline=deadline,
                     )
 
                 def write_prices(snapshot: ApiSnapshot) -> None:
@@ -252,4 +272,264 @@ class RawCollector:
             errors=errors,
             failures=failures,
             not_applicable=not_applicable,
+        )
+
+    def collect_closing_pools_until_success(
+        self,
+        node: ScheduleNode,
+        batch_id: str,
+        *,
+        limit_up: LimitPoolSnapshot | None = None,
+        limit_down: LimitPoolSnapshot | None = None,
+        limit_break: LimitPoolSnapshot | None = None,
+        wait_before_first_retry: bool = False,
+    ) -> tuple[LimitPoolSnapshot, LimitPoolSnapshot, LimitPoolSnapshot]:
+        """Persist the 254th node's three pools, retrying missing pools until complete."""
+        if node.sequence_no != 254:
+            raise ValueError("Continuous closing-pool retry is only valid for node 254")
+
+        snapshots: dict[str, LimitPoolSnapshot | None] = {
+            "limit_up": limit_up,
+            "limit_down": limit_down,
+            "limit_break": limit_break,
+        }
+        specs = {
+            "limit_up": (
+                "limit-up-pool",
+                "limit_up_pool_status",
+                self.writer.insert_limit_up_pool,
+            ),
+            "limit_down": (
+                "limit-down-pool",
+                "limit_down_pool_status",
+                self.writer.insert_limit_down_pool,
+            ),
+            "limit_break": (
+                "limit-break-pool",
+                "limit_break_pool_status",
+                self.writer.insert_limit_break_pool,
+            ),
+        }
+        retry_round = 0
+        should_wait = wait_before_first_retry
+        while any(snapshot is None for snapshot in snapshots.values()):
+            retry_round += 1
+            if should_wait:
+                sleep(CLOSING_POOL_RETRY_SECONDS)
+            should_wait = True
+            round_errors: list[str] = []
+            for name, snapshot in list(snapshots.items()):
+                if snapshot is not None:
+                    continue
+                endpoint, status_column, insert = specs[name]
+                self.writer.set_schedule_status(
+                    node,
+                    "RUNNING",
+                    **{status_column: "RUNNING"},
+                    emotion_state_status="BLOCKED",
+                    emotion_error_code="CLOSING_POOLS_INCOMPLETE",
+                    emotion_error_message="254号收盘三池尚未全部成功，正在持续重采",
+                )
+                try:
+                    captured = self.api.fetch_limit_pool(endpoint, node.trade_date)
+                    insert(node, batch_id, captured)
+                except Exception as exc:  # noqa: BLE001 - node 254 must keep retrying
+                    error_code = str(getattr(exc, "error_code", type(exc).__name__))
+                    round_errors.append(f"{name}:{error_code}:{exc}")
+                    self.writer.set_schedule_status(
+                        node,
+                        "RUNNING",
+                        **{status_column: "FAILED"},
+                        emotion_state_status="BLOCKED",
+                        emotion_error_code="CLOSING_POOLS_INCOMPLETE",
+                        emotion_error_message=str(exc)[:1000],
+                    )
+                    continue
+                snapshots[name] = captured
+                self.writer.set_schedule_status(
+                    node,
+                    "RUNNING",
+                    **{
+                        status_column: "SUCCESS",
+                        f"{name}_source_time": captured.source_time,
+                        f"{name}_received_count": captured.total,
+                        f"{name}_api_duration_ms": captured.duration_ms,
+                    },
+                )
+            if round_errors:
+                LOG.warning(
+                    "CLOSING_POOLS_RETRY collection_id=%s round=%s errors=%s",
+                    node.collection_id,
+                    retry_round,
+                    "; ".join(round_errors),
+                )
+
+        self.writer.set_schedule_status(
+            node,
+            "RUNNING",
+            limit_up_pool_status="SUCCESS",
+            limit_down_pool_status="SUCCESS",
+            limit_break_pool_status="SUCCESS",
+            limit_pool_collected=1,
+            emotion_state_status="PENDING",
+            emotion_error_code=None,
+            emotion_error_message=None,
+        )
+        assert snapshots["limit_up"] is not None
+        assert snapshots["limit_down"] is not None
+        assert snapshots["limit_break"] is not None
+        return (
+            snapshots["limit_up"],
+            snapshots["limit_down"],
+            snapshots["limit_break"],
+        )
+
+    def complete_closing_node_until_success(
+        self,
+        node: ScheduleNode,
+        batch_id: str,
+        result: RawCollectionResult,
+        *,
+        wait_before_first_retry: bool = False,
+    ) -> RawCollectionResult:
+        """Keep node 254 open until all five original inputs are persisted."""
+        if node.sequence_no != 254:
+            raise ValueError("Continuous closing retry is only valid for node 254")
+
+        pools_were_missing = any(
+            snapshot is None
+            for snapshot in (result.limit_up, result.limit_down, result.limit_break)
+        )
+        limit_up, limit_down, limit_break = self.collect_closing_pools_until_success(
+            node,
+            batch_id,
+            limit_up=result.limit_up,
+            limit_down=result.limit_down,
+            limit_break=result.limit_break,
+            wait_before_first_retry=wait_before_first_retry,
+        )
+
+        prices = result.prices
+        sector_index = result.sector_index
+        sectors = result.sectors
+        raw_rows = result.raw_rows
+        raw_insert_count = result.raw_insert_count
+        raw_insert_ms = result.raw_insert_ms
+        sector_insert_count = result.sector_index_insert_count
+        sector_insert_ms = result.sector_index_insert_ms
+        should_wait = wait_before_first_retry and not pools_were_missing
+        retry_round = 0
+
+        while prices is None or sector_index is None:
+            retry_round += 1
+            if should_wait:
+                sleep(CLOSING_POOL_RETRY_SECONDS)
+            should_wait = True
+            round_errors: list[str] = []
+
+            if prices is None:
+                self.writer.set_schedule_status(
+                    node,
+                    "RUNNING",
+                    all_a_snapshot_status="RUNNING",
+                )
+                try:
+                    captured_prices = self.api.fetch()
+                    captured_rows = [
+                        RawSnapshot.from_api(
+                            item,
+                            trade_date=node.trade_date,
+                            collection_id=node.collection_id,
+                            scheduled_time=node.scheduled_time,
+                            source_timestamp=captured_prices.source_timestamp,
+                            source_time=captured_prices.source_time,
+                            session=node.session,
+                            batch_id=batch_id,
+                        )
+                        for item in captured_prices.items
+                    ]
+                    captured_count, captured_ms = self.writer.insert_raw_once(captured_rows)
+                except Exception as exc:  # noqa: BLE001 - closing node must remain open.
+                    round_errors.append(f"all_a_snapshot:{type(exc).__name__}:{exc}")
+                    self.writer.set_schedule_status(
+                        node,
+                        "RUNNING",
+                        all_a_snapshot_status="FAILED",
+                    )
+                else:
+                    prices = captured_prices
+                    raw_rows = captured_rows
+                    raw_insert_count = captured_count
+                    raw_insert_ms = captured_ms
+                    self.writer.set_schedule_status(
+                        node,
+                        "RUNNING",
+                        all_a_snapshot_status="SUCCESS",
+                    )
+
+            if sector_index is None:
+                self.writer.set_schedule_status(
+                    node,
+                    "RUNNING",
+                    sector_index_status="RUNNING",
+                )
+                try:
+                    sectors = self.writer.active_sector_catalog()
+                    if not sectors:
+                        raise RuntimeError("No active sector catalog exists")
+                    captured_sector = self.api.fetch_sector_index_snapshot(
+                        [sector[0] for sector in sectors]
+                    )
+                    captured_count, captured_ms = self.writer.insert_sector_index_once(
+                        node, sectors, captured_sector
+                    )
+                except Exception as exc:  # noqa: BLE001 - closing node must remain open.
+                    round_errors.append(f"sector_index:{type(exc).__name__}:{exc}")
+                    self.writer.set_schedule_status(
+                        node,
+                        "RUNNING",
+                        sector_index_status="FAILED",
+                    )
+                else:
+                    sector_index = captured_sector
+                    sector_insert_count = captured_count
+                    sector_insert_ms = captured_ms
+                    self.writer.set_schedule_status(
+                        node,
+                        "RUNNING",
+                        sector_index_status="SUCCESS",
+                    )
+
+            if round_errors:
+                LOG.warning(
+                    "CLOSING_INPUTS_RETRY collection_id=%s round=%s errors=%s",
+                    node.collection_id,
+                    retry_round,
+                    "; ".join(round_errors),
+                )
+
+        recovered_tasks = {
+            "all_a_snapshot",
+            "sector_index",
+            "limit_up_pool",
+            "limit_down_pool",
+            "limit_break_pool",
+        }
+        return replace(
+            result,
+            prices=prices,
+            limit_up=limit_up,
+            limit_down=limit_down,
+            limit_break=limit_break,
+            sector_index=sector_index,
+            sectors=sectors,
+            raw_rows=raw_rows,
+            raw_insert_count=raw_insert_count,
+            raw_insert_ms=raw_insert_ms,
+            sector_index_insert_count=sector_insert_count,
+            sector_index_insert_ms=sector_insert_ms,
+            errors={key: value for key, value in result.errors.items() if key not in recovered_tasks},
+            failures={
+                key: value for key, value in result.failures.items() if key not in recovered_tasks
+            },
         )

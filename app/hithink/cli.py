@@ -13,6 +13,7 @@ from app.hithink.concurrent_api_test import ConcurrentApiTester, print_report
 from app.hithink.config import Settings
 from app.hithink.daily_pipeline import DailyPipeline
 from app.hithink.models import RawSnapshot
+from app.hithink.raw_collector import RawCollector
 from app.hithink.runner import CollectorRunner
 from app.hithink.schedule import SHANGHAI, build_daily_schedule
 from app.hithink.sector_mapping import SectorMappingSync
@@ -57,6 +58,95 @@ def _open_collector_writer(settings: Settings) -> ClickHouseWriter:
             sleep(60)
 
 
+def _run_daily_collection_with_fresh_connection(
+    settings: Settings, trade_date: object
+) -> bool:
+    """Run daily collection independently from a possibly retrying node 254."""
+    writer = ClickHouseWriter(
+        settings.clickhouse_host,
+        settings.clickhouse_port,
+        settings.clickhouse_database,
+        settings.clickhouse_username,
+        settings.clickhouse_password,
+    )
+    api = HithinkClient(settings.api_key)
+    try:
+        writer.initialize_daily_task_plan(trade_date)
+        existing = writer.daily_status(trade_date, "daily_collection")
+        if existing in {"SUCCESS", "SKIPPED"}:
+            LOG.info(
+                "DAILY_COLLECTION_ALREADY_CLOSED date=%s status=%s",
+                trade_date,
+                existing,
+            )
+            return True
+        initialize = not writer.daily_seed_complete()
+        DailyPipeline(api, writer).run_pipeline(trade_date, initialize=initialize)
+        status = writer.daily_status(trade_date, "daily_collection")
+        return status in {"SUCCESS", "SKIPPED"}
+    finally:
+        api.close()
+        writer.close()
+
+
+def _collector_health_probe(
+    settings: Settings, trade_date: object
+) -> dict[str, object]:
+    writer = ClickHouseWriter(
+        settings.clickhouse_host,
+        settings.clickhouse_port,
+        settings.clickhouse_database,
+        settings.clickhouse_username,
+        settings.clickhouse_password,
+    )
+    try:
+        schedule = writer.client.query(
+            """
+            SELECT sequence_no, status
+            FROM market.hithink_snapshot_schedule FINAL
+            WHERE trade_date = {trade_date:Date}
+              AND sequence_no IN (1, 254)
+            """,
+            parameters={"trade_date": trade_date},
+        ).result_rows
+        node_status = {int(sequence_no): str(status) for sequence_no, status in schedule}
+        daily_plan_count = writer.client.query(
+            """
+            SELECT count()
+            FROM market.hithink_daily_sync_status FINAL
+            WHERE trade_date = {trade_date:Date}
+              AND task_name IN (
+                  'calendar_gate',
+                  'sector_catalog_sync',
+                  'sector_membership_sync',
+                  'hithink_daily_k_raw_sync',
+                  'hithink_adjustment_events_sync'
+              )
+            """,
+            parameters={"trade_date": trade_date},
+        ).result_rows[0][0]
+        schedule_count = writer.client.query(
+            """
+            SELECT count()
+            FROM market.hithink_snapshot_schedule FINAL
+            WHERE trade_date = {trade_date:Date}
+            """,
+            parameters={"trade_date": trade_date},
+        ).result_rows[0][0]
+        return {
+            "calendar_status": writer.daily_status(trade_date, "calendar_gate"),
+            "daily_plan_count": int(daily_plan_count),
+            "schedule_count": int(schedule_count),
+            "first_node_status": node_status.get(1),
+            "closing_node_status": node_status.get(254),
+            "daily_collection_status": writer.daily_status(
+                trade_date, "daily_collection"
+            ),
+        }
+    finally:
+        writer.close()
+
+
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(prog="hithink-snapshot")
     sub = command.add_subparsers(dest="command", required=True)
@@ -80,6 +170,11 @@ def parser() -> argparse.ArgumentParser:
         "market-state-backfill", help="recalculate state rows for real snapshots already collected"
     )
     state.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
+    emotion = sub.add_parser(
+        "emotion-state-backfill",
+        help="recalculate emotion rows from persisted limit-pool snapshots",
+    )
+    emotion.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
     rebuild = sub.add_parser(
         "rederive-existing",
         help="rebuild individual and market derived tables from persisted raw snapshots",
@@ -183,6 +278,41 @@ def main() -> None:
                 writer.upsert_market_state(node, writer.limit_pool_collected(node))
             LOG.info("market state backfill completed date=%s nodes=%s", trade_date, len(nodes))
             return
+        if args.command == "emotion-state-backfill":
+            trade_date = args.trade_date or datetime.now(SHANGHAI).date()
+            nodes = writer.emotion_state_nodes(trade_date)
+            node_statuses = writer.statuses(trade_date)
+            for node in nodes:
+                started = perf_counter()
+                try:
+                    writer.upsert_emotion_state(node)
+                    row_count = writer.emotion_state_count(node)
+                    if row_count != 1:
+                        raise RuntimeError(
+                            f"emotion state row mismatch for {node.collection_id}: {row_count}/1"
+                        )
+                    writer.set_schedule_status(
+                        node,
+                        node_statuses.get(node.scheduled_time, "PARTIAL"),
+                        emotion_state_status="SUCCESS",
+                        emotion_state_row_count=1,
+                        emotion_state_duration_ms=round((perf_counter() - started) * 1000),
+                        emotion_error_code=None,
+                        emotion_error_message=None,
+                    )
+                except Exception as exc:
+                    writer.set_schedule_status(
+                        node,
+                        node_statuses.get(node.scheduled_time, "PARTIAL"),
+                        emotion_state_status="FAILED",
+                        emotion_state_row_count=0,
+                        emotion_state_duration_ms=round((perf_counter() - started) * 1000),
+                        emotion_error_code="EMOTION_BACKFILL_ERROR",
+                        emotion_error_message=str(exc)[:1000],
+                    )
+                    raise
+            LOG.info("emotion state backfill completed date=%s nodes=%s", trade_date, len(nodes))
+            return
         if args.command == "rederive-existing":
             trade_date = args.trade_date or datetime.now(SHANGHAI).date()
             nodes = [
@@ -264,7 +394,18 @@ def main() -> None:
                 return
             if args.command == "serve":
                 try:
-                    CollectorRunner(api, writer).serve_forever()
+                    CollectorRunner(
+                        api,
+                        writer,
+                        daily_collection_job=lambda trade_date: (
+                            _run_daily_collection_with_fresh_connection(
+                                settings, trade_date
+                            )
+                        ),
+                        health_probe=lambda trade_date: _collector_health_probe(
+                            settings, trade_date
+                        ),
+                    ).serve_forever()
                 finally:
                     try:
                         if COLLECTOR_PID_PATH.read_text(encoding="ascii").strip() == str(
@@ -382,12 +523,12 @@ def main() -> None:
                 node = build_daily_schedule(trade_date)[-1]
                 batch_id = node.collection_id
                 started = perf_counter()
-                up = api.fetch_limit_pool("limit-up-pool", trade_date)
-                down = api.fetch_limit_pool("limit-down-pool", trade_date)
-                broken = api.fetch_limit_pool("limit-break-pool", trade_date)
-                up_count, _ = writer.insert_limit_up_pool(node, batch_id, up)
-                down_count, _ = writer.insert_limit_down_pool(node, batch_id, down)
-                break_count, _ = writer.insert_limit_break_pool(node, batch_id, broken)
+                up, down, broken = RawCollector(
+                    api, writer
+                ).collect_closing_pools_until_success(node, batch_id)
+                up_count = up.total
+                down_count = down.total
+                break_count = broken.total
                 writer.set_schedule_status(
                     node,
                     "SUCCESS",

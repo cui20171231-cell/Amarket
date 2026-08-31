@@ -76,6 +76,12 @@ def test_limit_pools_run_only_at_meaningful_nodes():
     assert 252 not in applicable
     assert 253 not in applicable
     assert applicable[-1] == 254
+    assert all(not nodes[index - 1].limit_pools_applicable for index in range(1, 11))
+    assert all(not nodes[index - 1].limit_pools_applicable for index in range(251, 254))
+    assert nodes[10].scheduled_time.timetz().replace(tzinfo=None) == time(9, 25, 15)
+    assert nodes[10].limit_pools_applicable
+    assert nodes[253].scheduled_time.timetz().replace(tzinfo=None) == time(15, 0)
+    assert nodes[253].limit_pools_applicable
 
 
 def test_derivation_obeys_zero_and_counter_rollback_rules():

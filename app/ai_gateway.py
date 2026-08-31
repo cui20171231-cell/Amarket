@@ -11,6 +11,10 @@ from typing import Any
 
 from app.clickhouse_readonly import execute_clickhouse_readonly_sql
 from app.hithink.status import collection_status_response
+from app.market_state_package_reader import compact_package_for_ai
+from app.market_state_package_reader import (
+    get_market_state_package as read_market_state_package,
+)
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -43,7 +47,9 @@ mcp = FastMCP(
     instructions=(
         "这是 D:\\Amarket 的 ClickHouse 查询入口。"
         "数据库为 127.0.0.1:8123 / market。"
-        "仅提供采集状态和只读查询，不修改数据、不启动或重启任务。"
+        "仅提供采集状态、聚合包读取和只读查询，不修改数据、不启动或重启任务。"
+        "当用户输入/ai 时间、/AI 时间或要求恢复盘中市场状态时，优先调用"
+        "get_market_state_package，不要先执行自由SQL。"
     ),
     host=HOST,
     port=PORT,
@@ -105,6 +111,40 @@ def audited(function):
 @audited
 def collection_status_query() -> dict[str, Any]:
     return collection_status_response()
+
+
+@mcp.tool(
+    title="读取市场状态聚合包",
+    description=(
+        "读取本地已经生成的A股市场状态聚合包。"
+        "当用户输入“/ai 时间”、“/AI 时间”、指定盘中时间、节点号，或要求恢复某个盘中市场状态时，"
+        "优先调用本工具。工具按交易日和目标时间/节点定位JSON聚合包并返回复盘核心数据，"
+        "仅省略体积过大的全概念历史轨迹矩阵，核心板块自身轨迹仍完整保留；"
+        "可在一次调用内等待目标包就绪；不重新查询数据库、不触发聚合任务。"
+    ),
+    annotations=READ_ONLY,
+    structured_output=False,
+)
+@audited
+def get_market_state_package(
+    target_time: str | None = None,
+    node_seq: int | None = None,
+    trade_date: str | None = None,
+    wait_for_ready: bool = False,
+    retry_interval_seconds: int = 10,
+    max_wait_seconds: int = 120,
+) -> str:
+    result = compact_package_for_ai(
+        read_market_state_package(
+            target_time=target_time,
+            node_seq=node_seq,
+            trade_date=trade_date,
+            wait_for_ready=wait_for_ready,
+            retry_interval_seconds=retry_interval_seconds,
+            max_wait_seconds=max_wait_seconds,
+        )
+    )
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 @mcp.tool(

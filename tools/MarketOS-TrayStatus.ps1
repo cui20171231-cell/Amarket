@@ -195,11 +195,10 @@ function Get-MarketTaskStatus {
         }
 
         $taskRunning = [bool]$task.running
-        $matchingProcess = if ($Indicator.TaskName -eq "MarketOS-Gateway") {
-            $Snapshot.processes.gateway
-        }
-        else {
-            $null
+        $matchingProcess = switch ($Indicator.TaskName) {
+            "MarketOS-Gateway" { $Snapshot.processes.gateway }
+            "MarketOS-Tunnel" { $Snapshot.processes.tunnel }
+            default { $null }
         }
         $running = if ([string]::IsNullOrWhiteSpace($Indicator.ProcessPattern)) {
             $taskRunning
@@ -302,8 +301,6 @@ function Get-AmarketCollectionStatus {
 
             $label = switch ($taskName) {
                 "HithinkSnapshotCollector" { "快照采集" }
-                "HithinkSectorMappingSync" { "板块同步" }
-                "HithinkDailyPipeline" { "日K采集" }
             }
             $normal = $false
             $stateText = "任务不存在"
@@ -351,16 +348,13 @@ function Get-AmarketCollectionStatus {
 
         $clickhouseNormal = $Probe.overall_health -eq "Normal"
         $snapshotNormal = $taskResults.HithinkSnapshotCollector.normal
-        $otherTasksNormal = (
-            $taskResults.HithinkSectorMappingSync.normal -and
-            $taskResults.HithinkDailyPipeline.normal
-        )
+        $otherTasksNormal = $true
         $health = if ((-not $snapshotNormal) -or (-not $clickhouseNormal)) {
             # 快照服务异常或无法读取快照进度：圆圈全空心。
             "Unknown"
         }
         elseif (-not $otherTasksNormal) {
-            # 快照正常，但板块同步或日K任一异常：圆圈半空心。
+            # 保留半空心状态分支，供主采集器后续增加独立健康项。
             "Partial"
         }
         else {
@@ -483,9 +477,7 @@ $indicators = @(
         Label          = "采集"
         TaskName       = "HithinkSnapshotCollector"
         TaskNames      = @(
-            "HithinkSnapshotCollector",
-            "HithinkSectorMappingSync",
-            "HithinkDailyPipeline"
+            "HithinkSnapshotCollector"
         )
         ProcessPattern = "app\.hithink\.cli\s+serve"
         Shape          = "Circle"
@@ -519,7 +511,7 @@ $indicators = @(
     [pscustomobject]@{
         Label          = "隧道"
         TaskName       = "MarketOS-Tunnel"
-        ProcessPattern = $null
+        ProcessPattern = "tunnel-client\.exe"
         Shape          = "Triangle"
         Notify         = [System.Windows.Forms.NotifyIcon]::new()
         Menu           = $null
@@ -573,12 +565,8 @@ function Update-Indicator {
         if ($null -ne $result.Probe.tasks.HithinkSnapshotCollector) {
             $Indicator.CaptureItem.Text = [string]$result.Probe.tasks.HithinkSnapshotCollector.text
         }
-        if ($null -ne $result.Probe.tasks.HithinkSectorMappingSync) {
-            $Indicator.UniverseItem.Text = [string]$result.Probe.tasks.HithinkSectorMappingSync.text
-        }
-        if ($null -ne $result.Probe.tasks.HithinkDailyPipeline) {
-            $Indicator.DailyKItem.Text = [string]$result.Probe.tasks.HithinkDailyPipeline.text
-        }
+        $Indicator.UniverseItem.Text = "板块同步：交易日08:50确认后运行"
+        $Indicator.DailyKItem.Text = "日K及复权事件：随主采集器每日16:00运行"
     }
 
     $Indicator.LastRunning = $result.Running

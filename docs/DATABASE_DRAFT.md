@@ -61,7 +61,18 @@ collection_id = YYYYMMDD + 三位计划序号
 | `market.hithink_concept_state` | 概念板块状态 |
 | `market.hithink_industry_state` | 行业板块状态 |
 | `market.hithink_style_state` | 风格板块状态 |
+| `market.hithink_emotion_state` | 每个盘中节点的情绪梯队状态 |
+| `market.hithink_market_delta_15m` | 19个固定检查点的市场变化 |
+| `market.hithink_sector_capital_migration` | 三类板块的成交份额迁移 |
+| `market.hithink_core_sector_candidate` | V1核心板块注意力候选 |
+| `market.hithink_core_stock_candidate` | V1核心个股注意力候选 |
 | `market.hithink_daily_k_forward` | 前复权日线结果 |
+
+### 配置/知识层
+
+| 表 | 作用 |
+|---|---|
+| `market.strategic_sector_watchlist` | 长期战略观察板块配置，不随盘中强弱自动增删 |
 
 当前建表文件共定义 19 张表。
 
@@ -85,6 +96,21 @@ hithink_snapshot_raw
                 ├─ hithink_concept_state
                 ├─ hithink_industry_state
                 └─ hithink_style_state
+
+hithink_market_state + 三池
+        └─ hithink_emotion_state
+
+hithink_market_state
+        └─ hithink_market_delta_15m
+
+三类板块状态 + hithink_market_delta_15m
+        └─ hithink_sector_capital_migration
+                └─ hithink_core_sector_candidate
+                        └─ hithink_core_stock_candidate
+
+以上状态/候选 + strategic_sector_watchlist
+        └─ 本地聚合数据包（文件，不是数据库表）
+                └─ 本地聚合包
 
 sector_catalog + sector_membership_history
         └─ 三类板块状态

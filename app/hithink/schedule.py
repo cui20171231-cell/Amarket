@@ -6,6 +6,11 @@ from zoneinfo import ZoneInfo
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
+# Shared fixed axis for 15-minute derivatives and the 19 market review packages.
+MARKET_REVIEW_NODE_SEQUENCES = frozenset(
+    {11, 12, 27, 42, 57, 72, 87, 102, 117, 132, 133, 148, 163, 178, 193, 208, 223, 238, 254}
+)
+
 
 @dataclass(frozen=True)
 class ScheduleNode:

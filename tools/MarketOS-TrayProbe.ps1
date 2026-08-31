@@ -97,8 +97,25 @@ function Get-TaskSnapshot {
 function Get-ProcessSnapshot {
     $collector = $null
     $gateway = $null
+    $tunnel = $null
     $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Sort-Object CreationDate
+
+    # After a machine restart these services can run elevated, so their command
+    # lines may be hidden from the non-elevated tray process.  Bind detection to
+    # the real local service ports and verify the owning executable instead.
+    $gatewayListener = Get-NetTCPConnection `
+        -LocalAddress "127.0.0.1" `
+        -LocalPort 2091 `
+        -State Listen `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $tunnelListener = Get-NetTCPConnection `
+        -LocalAddress "127.0.0.1" `
+        -LocalPort 8080 `
+        -State Listen `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
 
     foreach ($process in $processes) {
         $commandLine = [string]$process.CommandLine
@@ -107,10 +124,25 @@ function Get-ProcessSnapshot {
             $collector = $process
         }
         if (($null -eq $gateway) -and
-            ($commandLine -match "D:\\Amarket.*-m\s+app\.ai_gateway")) {
+            ($null -ne $gatewayListener) -and
+            ([int64]$process.ProcessId -eq [int64]$gatewayListener.OwningProcess) -and
+            ($process.Name -in @("python.exe", "pythonw.exe"))) {
             $gateway = $process
         }
+        if (($null -eq $tunnel) -and
+            ($process.Name -eq "tunnel-client.exe") -and
+            ($null -ne $tunnelListener) -and
+            ([int64]$process.ProcessId -eq [int64]$tunnelListener.OwningProcess)) {
+            $tunnel = $process
+        }
     }
+
+    $gatewayRunning = ($null -ne $gateway) -and
+        ($null -ne $gatewayListener) -and
+        ([int64]$gatewayListener.OwningProcess -eq [int64]$gateway.ProcessId)
+    $tunnelRunning = ($null -ne $tunnel) -and
+        ($null -ne $tunnelListener) -and
+        ([int64]$tunnelListener.OwningProcess -eq [int64]$tunnel.ProcessId)
 
     return [pscustomobject]@{
         collector = [pscustomobject]@{
@@ -123,9 +155,18 @@ function Get-ProcessSnapshot {
             }
         }
         gateway = [pscustomobject]@{
-            running = $null -ne $gateway
-            startedAt = if ($null -ne $gateway) {
+            running = $gatewayRunning
+            startedAt = if ($gatewayRunning) {
                 $gateway.CreationDate.ToString("o")
+            }
+            else {
+                $null
+            }
+        }
+        tunnel = [pscustomobject]@{
+            running = $tunnelRunning
+            startedAt = if ($tunnelRunning) {
+                $tunnel.CreationDate.ToString("o")
             }
             else {
                 $null
@@ -136,8 +177,6 @@ function Get-ProcessSnapshot {
 
 $taskNames = @(
     "HithinkSnapshotCollector",
-    "HithinkSectorMappingSync",
-    "HithinkDailyPipeline",
     "MarketOS-Gateway",
     "MarketOS-Tunnel"
 )
