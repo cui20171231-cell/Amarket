@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Amarket log capacity every hour
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+AccuracySec=1min
+Unit=amarket-log-guard.service
+
+[Install]
+WantedBy=timers.target

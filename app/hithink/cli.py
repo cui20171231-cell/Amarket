@@ -21,6 +21,7 @@ from app.hithink.service_guard import SingleInstanceLock
 from app.hithink.state_deriver import StateDeriver
 from app.hithink.status import check_status, render_combined_status
 from app.hithink.writer import ClickHouseWriter
+from app.logging_utils import configure_bounded_root_logging
 
 ROOT = Path(__file__).resolve().parents[2]
 COLLECTOR_PID_PATH = ROOT / "data" / "hithink_snapshot_collector.pid"
@@ -238,8 +239,7 @@ def main() -> None:
             "sector-sync": "sector_mapping.log",
         }[args.command]
         log_path = ROOT / "data" / "logs" / log_name
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+        handlers = configure_bounded_root_logging(log_path)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",

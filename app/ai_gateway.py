@@ -12,6 +12,7 @@ from typing import Any
 
 from app.clickhouse_readonly import execute_clickhouse_readonly_sql
 from app.hithink.status import collection_status_response
+from app.logging_utils import append_jsonl_bounded
 from app.market_state_package_reader import compact_package_for_ai
 from app.market_state_package_reader import (
     get_market_state_package as read_market_state_package,
@@ -83,8 +84,7 @@ def _audit(tool: str, arguments: dict[str, Any], ok: bool, elapsed: float, error
         "error": error[:500],
     }
     try:
-        with AUDIT_PATH.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_jsonl_bounded(AUDIT_PATH, record)
     except OSError:
         pass
 

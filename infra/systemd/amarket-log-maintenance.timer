@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Amarket daily log maintenance at 08:30 with missed-run recovery
+
+[Timer]
+OnCalendar=*-*-* 08:30:00 Asia/Shanghai
+Persistent=true
+AccuracySec=1s
+Unit=amarket-log-maintenance.service
+
+[Install]
+WantedBy=timers.target

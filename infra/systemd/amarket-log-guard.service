@@ -1,0 +1,12 @@
+[Unit]
+Description=Amarket hourly log size guard
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/mnt/d/Amarket
+ExecStart=/usr/bin/python3 /mnt/d/Amarket/scripts/log_maintenance.py --mode guard
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=5min
