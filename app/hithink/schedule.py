@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+SCHEDULE_V2_EFFECTIVE_DATE = date(2026, 9, 2)
 
 # Shared fixed axis for 15-minute derivatives and the 19 market review packages.
 MARKET_REVIEW_NODE_SEQUENCES = frozenset(
@@ -51,15 +52,43 @@ def _every_minute(
 
 
 def build_daily_schedule(trade_date: date) -> list[ScheduleNode]:
+    shifted = trade_date >= SCHEDULE_V2_EFFECTIVE_DATE
+    regular_second = 8 if shifted else 15
+    pre_close_second = 53 if shifted else 55
     slots: list[tuple[datetime, str]] = []
     slots.extend(
-        _every_minute(trade_date, time(9, 15, 15), time(9, 25, 15), "auction_open")
+        _every_minute(
+            trade_date,
+            time(9, 15, regular_second),
+            time(9, 25, regular_second),
+            "auction_open",
+        )
     )
-    slots.extend(_every_minute(trade_date, time(9, 30, 15), time(11, 30, 15), "continuous_am"))
-    slots.extend(_every_minute(trade_date, time(13, 0, 15), time(14, 56, 15), "continuous_pm"))
+    slots.extend(
+        _every_minute(
+            trade_date,
+            time(9, 30, regular_second),
+            time(11, 30, regular_second),
+            "continuous_am",
+        )
+    )
+    slots.extend(
+        _every_minute(
+            trade_date,
+            time(13, 0, regular_second),
+            time(14, 56, regular_second),
+            "continuous_pm",
+        )
+    )
     slots.extend(
         (_at(trade_date, value), "auction_close")
-        for value in (time(14, 56, 55), time(14, 57), time(14, 58), time(14, 59), time(15))
+        for value in (
+            time(14, 56, pre_close_second),
+            time(14, 57),
+            time(14, 58),
+            time(14, 59),
+            time(15),
+        )
     )
     nodes = [
         ScheduleNode(trade_date, scheduled, session, index)

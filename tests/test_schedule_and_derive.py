@@ -1,4 +1,5 @@
 from datetime import date, datetime, time
+from itertools import pairwise
 
 import pytest
 
@@ -64,6 +65,35 @@ def test_collection_id_has_a_permanent_time_mapping():
         node = nodes[sequence_no - 1]
         assert node.collection_id == f"20260827{sequence_no:03d}"
         assert node.scheduled_time.timetz().replace(tzinfo=None) == planned_time
+
+
+def test_schedule_switches_to_earlier_seconds_without_rewriting_history():
+    historical = build_daily_schedule(date(2026, 9, 1))
+    current = build_daily_schedule(date(2026, 9, 2))
+
+    assert historical[0].scheduled_time.timetz().replace(tzinfo=None) == time(9, 15, 15)
+    assert historical[249].scheduled_time.timetz().replace(tzinfo=None) == time(14, 56, 55)
+    expected = {
+        1: time(9, 15, 8),
+        11: time(9, 25, 8),
+        12: time(9, 30, 8),
+        132: time(11, 30, 8),
+        133: time(13, 0, 8),
+        249: time(14, 56, 8),
+        250: time(14, 56, 53),
+        251: time(14, 57),
+        254: time(15),
+    }
+    for sequence_no, planned_time in expected.items():
+        assert (
+            current[sequence_no - 1].scheduled_time.timetz().replace(tzinfo=None)
+            == planned_time
+        )
+    assert all(
+        (right.scheduled_time - left.scheduled_time).total_seconds() == 60
+        for left, right in pairwise(current[11:132])
+    )
+    assert (current[250].scheduled_time - current[249].scheduled_time).total_seconds() == 7
 
 
 def test_limit_pools_run_only_at_meaningful_nodes():

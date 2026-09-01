@@ -4,10 +4,12 @@ import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from random import uniform
 from time import perf_counter, sleep
 from typing import Any
 
 from app.hithink.api import (
+    RATE_LIMIT_BUDGET_SECONDS,
     ApiSnapshot,
     HithinkApiError,
     HithinkClient,
@@ -20,6 +22,8 @@ from app.hithink.writer import ClickHouseWriter
 
 CLOSING_POOL_RETRY_SECONDS = 60
 NODE_COLLECTION_BUDGET_SECONDS = 45
+SUBMISSION_PAUSE_MIN_SECONDS = 0.5
+SUBMISSION_PAUSE_MAX_SECONDS = 1.5
 LOG = logging.getLogger(__name__)
 
 
@@ -79,7 +83,9 @@ class RawCollector:
         self.writer = writer
 
     def collect(self, node: ScheduleNode, batch_id: str) -> RawCollectionResult:
-        deadline = perf_counter() + NODE_COLLECTION_BUDGET_SECONDS
+        collection_started = perf_counter()
+        deadline = collection_started + NODE_COLLECTION_BUDGET_SECONDS
+        rate_limit_deadline = collection_started + RATE_LIMIT_BUDGET_SECONDS
         errors: dict[str, tuple[str, str]] = {}
         failures: dict[str, Exception] = {}
         task_columns = {
@@ -150,9 +156,23 @@ class RawCollector:
             # endpoint from queueing the other four behind it and consuming the
             # next minute's collection slot.
             with ThreadPoolExecutor(max_workers=5) as executor:
+                request_options: dict[str, Any] = {
+                    "deadline": deadline,
+                    "rate_limit_deadline": rate_limit_deadline,
+                }
+                if node.sequence_no == 250 and node.scheduled_time.second == 53:
+                    request_options["allow_retries"] = False
+
+                def pause_between_submissions() -> None:
+                    sleep(uniform(SUBMISSION_PAUSE_MIN_SECONDS, SUBMISSION_PAUSE_MAX_SECONDS))
+
                 called.add("all_a_snapshot")
-                prices_future = executor.submit(self.api.fetch, deadline=deadline)
-                sleep(0.3)
+                prices_future = executor.submit(
+                    self.api.fetch,
+                    **request_options,
+                )
+                if sectors or node.limit_pools_applicable:
+                    pause_between_submissions()
 
                 sector_index_future = None
                 if sectors:
@@ -160,9 +180,10 @@ class RawCollector:
                     sector_index_future = executor.submit(
                         self.api.fetch_sector_index_snapshot,
                         [sector[0] for sector in sectors],
-                        deadline=deadline,
+                        **request_options,
                     )
-                sleep(0.3)
+                    if node.limit_pools_applicable:
+                        pause_between_submissions()
 
                 limit_up_future = None
                 limit_down_future = None
@@ -173,23 +194,23 @@ class RawCollector:
                         self.api.fetch_limit_pool,
                         "limit-up-pool",
                         node.trade_date,
-                        deadline=deadline,
+                        **request_options,
                     )
-                    sleep(0.3)
+                    pause_between_submissions()
                     called.add("limit_down_pool")
                     limit_down_future = executor.submit(
                         self.api.fetch_limit_pool,
                         "limit-down-pool",
                         node.trade_date,
-                        deadline=deadline,
+                        **request_options,
                     )
-                    sleep(0.3)
+                    pause_between_submissions()
                     called.add("limit_break_pool")
                     limit_break_future = executor.submit(
                         self.api.fetch_limit_pool,
                         "limit-break-pool",
                         node.trade_date,
-                        deadline=deadline,
+                        **request_options,
                     )
 
                 def write_prices(snapshot: ApiSnapshot) -> None:

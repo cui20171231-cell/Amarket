@@ -198,6 +198,17 @@ def test_closing_254_current_state_never_falls_back() -> None:
     assert select_source(current, states) is None
 
 
+def test_new_schedule_keeps_the_19_review_nodes_and_closing_base() -> None:
+    nodes = build_daily_schedule(date(2026, 9, 2))
+    targets = [node for node in nodes if node.sequence_no in TARGET_NODE_SEQUENCES]
+
+    assert len(targets) == 19
+    assert targets[0].scheduled_time.timetz().replace(tzinfo=None) == time(9, 25, 8)
+    assert targets[-2].scheduled_time.timetz().replace(tzinfo=None) == time(14, 45, 8)
+    assert targets[-1].scheduled_time.timetz().replace(tzinfo=None) == time(15)
+    assert (targets[-1].scheduled_time - targets[-2].scheduled_time).total_seconds() == 892
+
+
 def test_all_delta_fields_are_nullable_in_the_ddl() -> None:
     ddl = Path("sql/hithink_snapshot.sql").read_text(encoding="utf-8")
     table_ddl = ddl.split(
@@ -223,6 +234,9 @@ def test_current_state_source_and_age_fields_are_fixed_in_the_ddl() -> None:
     assert "state_data_status = 'CURRENT'" in ddl
     assert "state_data_status = 'FALLBACK'" in ddl
     assert "state_source_age_seconds = dateDiff" in ddl
+    assert "trade_date < toDate('2026-09-02')" in ddl
+    assert "(11, 33915)" in ddl
+    assert "(11, 33908)" in ddl
 
 
 def test_delta_type_separates_session_bases_auction_open_and_normal_rows() -> None:

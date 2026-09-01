@@ -66,7 +66,7 @@ def client_with_responses(responses: list[Response]) -> HithinkClient:
     return api
 
 
-def test_429_uses_only_the_dedicated_short_retries_and_retry_after(
+def test_429_uses_dedicated_retries_and_honors_retry_after(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     pauses: list[float] = []
@@ -85,7 +85,7 @@ def test_429_uses_only_the_dedicated_short_retries_and_retry_after(
     with caplog.at_level(logging.WARNING):
         result = api.fetch()
 
-    assert pauses == [1.0, 0.25]
+    assert pauses == [2.0, 0.25]
     assert result.retry_count == 2
     assert api.client.calls == 3
     evidence = [record.message for record in caplog.records if "API_429_EVIDENCE" in record.message]
@@ -95,27 +95,46 @@ def test_429_uses_only_the_dedicated_short_retries_and_retry_after(
     assert all("limiter_source=UPSTREAM" in line for line in evidence)
 
 
-def test_third_429_is_classified_as_upstream_and_keeps_failure_evidence(
+def test_fourth_429_is_classified_as_upstream_and_keeps_failure_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pauses: list[float] = []
     monkeypatch.setattr(api_module, "sleep", pauses.append)
     api = client_with_responses(
-        [Response({"code": 429, "message": "request limit exceeded"}) for _ in range(3)]
+        [Response({"code": 429, "message": "request limit exceeded"}) for _ in range(4)]
     )
 
     with pytest.raises(HithinkApiError) as caught:
         api.fetch()
 
     error = caught.value
-    assert pauses == [1.0, 2.0]
+    assert pauses == [2.0, 4.0, 8.0]
     assert error.code == 429
     assert error.error_code == "UPSTREAM_HTTP_429"
     assert error.endpoint == "all_a_snapshot"
     assert error.http_status == 200
-    assert error.retry_index == 2
+    assert error.retry_index == 3
     assert error.limiter_source == "UPSTREAM"
     assert error.duration_ms is not None
+
+
+def test_429_stops_before_the_30_second_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pauses: list[float] = []
+    monkeypatch.setattr(api_module, "sleep", pauses.append)
+    api = client_with_responses(
+        [Response({"code": 429, "message": "request limit exceeded"})]
+    )
+
+    with pytest.raises(HithinkApiError) as caught:
+        api.fetch(rate_limit_deadline=monotonic() + 0.01)
+
+    assert api.client.calls == 1
+    assert pauses == []
+    assert caught.value.code == 429
+    assert caught.value.error_code == "UPSTREAM_HTTP_429"
+    assert "30-second rate-limit deadline reached" in str(caught.value)
 
 
 def test_non_429_error_does_not_use_the_429_retry_policy(
@@ -246,7 +265,7 @@ class PartialApi:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def fetch(self, *, deadline=None):
+    def fetch(self, *, deadline=None, rate_limit_deadline=None):
         self.calls.append("all_a_snapshot")
         raise HithinkApiError(
             429,
@@ -256,7 +275,9 @@ class PartialApi:
             duration_ms=3200,
         )
 
-    def fetch_sector_index_snapshot(self, codes, *, deadline=None):
+    def fetch_sector_index_snapshot(
+        self, codes, *, deadline=None, rate_limit_deadline=None
+    ):
         self.calls.append("sector_index")
         source_time = datetime(2026, 8, 28, 10, 30, tzinfo=SHANGHAI)
         return SectorIndexSnapshot(
@@ -266,7 +287,9 @@ class PartialApi:
             retry_count=0,
         )
 
-    def fetch_limit_pool(self, name, trade_date, *, deadline=None):
+    def fetch_limit_pool(
+        self, name, trade_date, *, deadline=None, rate_limit_deadline=None
+    ):
         self.calls.append(name)
         source_time = datetime(2026, 8, 28, 10, 30, tzinfo=SHANGHAI)
         return LimitPoolSnapshot(
@@ -291,6 +314,7 @@ def test_one_failed_interface_keeps_the_other_four_and_marks_partial(
         return ThreadPoolExecutor(*args, **kwargs)
 
     monkeypatch.setattr(raw_module, "sleep", pauses.append)
+    monkeypatch.setattr(raw_module, "uniform", lambda low, high: 1.0)
     monkeypatch.setattr(raw_module, "ThreadPoolExecutor", executor)
     node = build_daily_schedule(date(2026, 8, 28))[20]
     api = PartialApi()
@@ -304,7 +328,7 @@ def test_one_failed_interface_keeps_the_other_four_and_marks_partial(
         "limit-down-pool",
         "limit-break-pool",
     ]
-    assert pauses == [0.3, 0.3, 0.3, 0.3]
+    assert pauses == [1.0, 1.0, 1.0, 1.0]
     assert result.prices is None
     assert result.sector_index is not None
     assert result.limit_up is not None
@@ -330,12 +354,79 @@ def test_one_failed_interface_keeps_the_other_four_and_marks_partial(
     assert raw_module.NODE_COLLECTION_BUDGET_SECONDS < 60
 
 
+def test_145653_node_disables_all_api_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingApi(PartialApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.options: list[bool] = []
+
+        def fetch(self, *, deadline=None, rate_limit_deadline=None, allow_retries=True):
+            self.options.append(allow_retries)
+            return super().fetch(deadline=deadline, rate_limit_deadline=rate_limit_deadline)
+
+        def fetch_sector_index_snapshot(
+            self, codes, *, deadline=None, rate_limit_deadline=None, allow_retries=True
+        ):
+            self.options.append(allow_retries)
+            return super().fetch_sector_index_snapshot(
+                codes, deadline=deadline, rate_limit_deadline=rate_limit_deadline
+            )
+
+        def fetch_limit_pool(
+            self,
+            name,
+            trade_date,
+            *,
+            deadline=None,
+            rate_limit_deadline=None,
+            allow_retries=True,
+        ):
+            self.options.append(allow_retries)
+            return super().fetch_limit_pool(
+                name,
+                trade_date,
+                deadline=deadline,
+                rate_limit_deadline=rate_limit_deadline,
+            )
+
+    monkeypatch.setattr(raw_module, "sleep", lambda seconds: None)
+    node = build_daily_schedule(date(2026, 9, 2))[249]
+    api = RecordingApi()
+
+    RawCollector(api, Writer()).collect(node, node.collection_id)
+
+    assert node.scheduled_time.strftime("%H:%M:%S") == "14:56:53"
+    assert api.options == [False, False, False, False, False]
+
+
+def test_api_no_retry_mode_stops_after_first_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pauses: list[float] = []
+    monkeypatch.setattr(api_module, "sleep", pauses.append)
+    api = client_with_responses(
+        [Response({"code": 429, "message": "request limit exceeded"})]
+    )
+
+    with pytest.raises(HithinkApiError):
+        api.fetch(allow_retries=False)
+
+    assert api.client.calls == 1
+    assert pauses == []
+
+
 class FailedApi(PartialApi):
-    def fetch_sector_index_snapshot(self, codes, *, deadline=None):
+    def fetch_sector_index_snapshot(
+        self, codes, *, deadline=None, rate_limit_deadline=None
+    ):
         self.calls.append("sector_index")
         raise HithinkApiError(500, "sector failed", duration_ms=100)
 
-    def fetch_limit_pool(self, name, trade_date, *, deadline=None):
+    def fetch_limit_pool(
+        self, name, trade_date, *, deadline=None, rate_limit_deadline=None
+    ):
         self.calls.append(name)
         raise HithinkApiError(500, f"{name} failed", duration_ms=100)
 

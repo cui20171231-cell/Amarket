@@ -599,14 +599,30 @@ CREATE TABLE IF NOT EXISTS market.hithink_market_delta_15m
             AND base_age_seconds IS NULL
         ),
     CONSTRAINT ck_market_delta_business_period CHECK
-        tuple(
-            node_seq,
-            toHour(scheduled_time) * 3600 + toMinute(scheduled_time) * 60 + toSecond(scheduled_time)
-        ) IN (
-            (11, 33915), (12, 34215), (27, 35115), (42, 36015), (57, 36915),
-            (72, 37815), (87, 38715), (102, 39615), (117, 40515), (132, 41415),
-            (133, 46815), (148, 47715), (163, 48615), (178, 49515),
-            (193, 50415), (208, 51315), (223, 52215), (238, 53115), (254, 54000)
+        (
+            trade_date < toDate('2026-09-02')
+            AND tuple(
+                node_seq,
+                toHour(scheduled_time) * 3600 + toMinute(scheduled_time) * 60 + toSecond(scheduled_time)
+            ) IN (
+                (11, 33915), (12, 34215), (27, 35115), (42, 36015), (57, 36915),
+                (72, 37815), (87, 38715), (102, 39615), (117, 40515), (132, 41415),
+                (133, 46815), (148, 47715), (163, 48615), (178, 49515),
+                (193, 50415), (208, 51315), (223, 52215), (238, 53115), (254, 54000)
+            )
+        )
+        OR
+        (
+            trade_date >= toDate('2026-09-02')
+            AND tuple(
+                node_seq,
+                toHour(scheduled_time) * 3600 + toMinute(scheduled_time) * 60 + toSecond(scheduled_time)
+            ) IN (
+                (11, 33908), (12, 34208), (27, 35108), (42, 36008), (57, 36908),
+                (72, 37808), (87, 38708), (102, 39608), (117, 40508), (132, 41408),
+                (133, 46808), (148, 47708), (163, 48608), (178, 49508),
+                (193, 50408), (208, 51308), (223, 52208), (238, 53108), (254, 54000)
+            )
         ),
     CONSTRAINT ck_market_delta_base_time CHECK delta_status != 'VALID' OR
         (
@@ -707,7 +723,7 @@ ALTER TABLE market.hithink_market_delta_15m ADD CONSTRAINT IF NOT EXISTS ck_mark
 ALTER TABLE market.hithink_market_delta_15m ADD CONSTRAINT IF NOT EXISTS ck_market_delta_status CHECK delta_status IN ('VALID', 'NO_BASE', 'NO_SOURCE');
 ALTER TABLE market.hithink_market_delta_15m ADD CONSTRAINT IF NOT EXISTS ck_market_delta_type CHECK (node_seq IN (11, 133) AND delta_type = 'SESSION_BASE' AND delta_status = 'NO_BASE') OR (node_seq = 12 AND delta_type = 'AUCTION_TO_OPEN') OR (node_seq NOT IN (11, 12, 133) AND delta_type = 'NORMAL_15M');
 ALTER TABLE market.hithink_market_delta_15m ADD CONSTRAINT IF NOT EXISTS ck_market_delta_base_shape CHECK (delta_status = 'VALID' AND base_collection_id IS NOT NULL AND base_scheduled_time IS NOT NULL AND base_age_seconds IS NOT NULL AND base_age_seconds > 0) OR (delta_status IN ('NO_BASE', 'NO_SOURCE') AND base_collection_id IS NULL AND base_scheduled_time IS NULL AND base_age_seconds IS NULL);
-ALTER TABLE market.hithink_market_delta_15m ADD CONSTRAINT IF NOT EXISTS ck_market_delta_business_period CHECK tuple(node_seq, toHour(scheduled_time) * 3600 + toMinute(scheduled_time) * 60 + toSecond(scheduled_time)) IN ((11, 33915), (12, 34215), (27, 35115), (42, 36015), (57, 36915), (72, 37815), (87, 38715), (102, 39615), (117, 40515), (132, 41415), (133, 46815), (148, 47715), (163, 48615), (178, 49515), (193, 50415), (208, 51315), (223, 52215), (238, 53115), (254, 54000));
+ALTER TABLE market.hithink_market_delta_15m ADD CONSTRAINT IF NOT EXISTS ck_market_delta_business_period CHECK (trade_date < toDate('2026-09-02') AND tuple(node_seq, toHour(scheduled_time) * 3600 + toMinute(scheduled_time) * 60 + toSecond(scheduled_time)) IN ((11, 33915), (12, 34215), (27, 35115), (42, 36015), (57, 36915), (72, 37815), (87, 38715), (102, 39615), (117, 40515), (132, 41415), (133, 46815), (148, 47715), (163, 48615), (178, 49515), (193, 50415), (208, 51315), (223, 52215), (238, 53115), (254, 54000))) OR (trade_date >= toDate('2026-09-02') AND tuple(node_seq, toHour(scheduled_time) * 3600 + toMinute(scheduled_time) * 60 + toSecond(scheduled_time)) IN ((11, 33908), (12, 34208), (27, 35108), (42, 36008), (57, 36908), (72, 37808), (87, 38708), (102, 39608), (117, 40508), (132, 41408), (133, 46808), (148, 47708), (163, 48608), (178, 49508), (193, 50408), (208, 51308), (223, 52208), (238, 53108), (254, 54000)));
 ALTER TABLE market.hithink_market_delta_15m ADD CONSTRAINT IF NOT EXISTS ck_market_delta_base_time CHECK delta_status != 'VALID' OR (toDate(base_scheduled_time) = trade_date AND substring(toString(base_collection_id), 1, 8) = formatDateTime(trade_date, '%Y%m%d') AND base_scheduled_time < scheduled_time AND base_age_seconds = dateDiff('second', base_scheduled_time, scheduled_time) AND ((node_seq IN (11, 12, 27, 42, 57, 72, 87, 102, 117, 132) AND base_scheduled_time < toDateTime64(concat(toString(trade_date), ' 12:00:00'), 3, 'Asia/Shanghai')) OR (node_seq IN (133, 148, 163, 178, 193, 208, 223, 238, 254) AND base_scheduled_time >= toDateTime64(concat(toString(trade_date), ' 13:00:00'), 3, 'Asia/Shanghai'))));
 ALTER TABLE market.hithink_market_delta_15m ADD CONSTRAINT IF NOT EXISTS ck_market_delta_closing_254 CHECK node_seq != 254 OR (toDate(scheduled_time) = trade_date AND toHour(scheduled_time) = 15 AND toMinute(scheduled_time) = 0 AND toSecond(scheduled_time) = 0 AND delta_status = 'VALID' AND state_data_status = 'CURRENT' AND state_source_collection_id = collection_id AND state_source_scheduled_time = scheduled_time AND state_source_age_seconds = 0 AND state_is_fallback = 0 AND base_scheduled_time >= toDateTime64(concat(toString(trade_date), ' 13:00:00'), 3, 'Asia/Shanghai') AND base_scheduled_time < scheduled_time AND base_age_seconds > 0 AND calculated_at >= scheduled_time);
 

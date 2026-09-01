@@ -26,6 +26,8 @@ DUMP_URLS = {
 RETRYABLE_CODES = {4001, 5001, 5002, 5003}
 REQUEST_TIMEOUT_SECONDS = 10.0
 RETRY_PAUSES_SECONDS = (0.0, 1.0, 2.0)
+RATE_LIMIT_RETRY_PAUSES_SECONDS = (2.0, 4.0, 8.0)
+RATE_LIMIT_BUDGET_SECONDS = 30.0
 LOG = logging.getLogger(__name__)
 
 
@@ -261,13 +263,47 @@ class HithinkClient:
         url: str,
         *,
         deadline: float | None = None,
+        rate_limit_deadline: float | None = None,
+        allow_retries: bool = True,
         **kwargs: Any,
     ) -> tuple[httpx.Response, dict[str, Any], int]:
-        """Retry only upstream 429 responses with the dedicated 1s/2s policy."""
+        """Retry only upstream 429 responses with the dedicated 2s/4s/8s policy."""
         rate_limit_started = perf_counter()
-        for retry_index in range(3):
+        rate_limit_deadline = rate_limit_deadline or (
+            monotonic() + RATE_LIMIT_BUDGET_SECONDS
+        )
+        last_rate_limit_error: HithinkApiError | None = None
+
+        def effective_retry_deadline() -> float:
+            if deadline is None:
+                return rate_limit_deadline
+            return min(deadline, rate_limit_deadline)
+
+        rate_limit_attempts = len(RATE_LIMIT_RETRY_PAUSES_SECONDS) + 1 if allow_retries else 1
+        for retry_index in range(rate_limit_attempts):
             request_started_at = datetime.now(SHANGHAI)
-            response = self._get(endpoint, url, deadline=deadline, **kwargs)
+            try:
+                response = self._get(
+                    endpoint,
+                    url,
+                    deadline=(
+                        deadline if retry_index == 0 else effective_retry_deadline()
+                    ),
+                    **kwargs,
+                )
+            except (httpx.HTTPError, HithinkApiError) as exc:
+                if last_rate_limit_error is None:
+                    raise
+                last_rate_limit_error.args = (
+                    (
+                        f"{last_rate_limit_error}; retry ended before the 30-second "
+                        f"rate-limit deadline: {exc}"
+                    ),
+                )
+                last_rate_limit_error.duration_ms = round(
+                    (perf_counter() - rate_limit_started) * 1000
+                )
+                raise last_rate_limit_error from exc
             request_ended_at = datetime.now(SHANGHAI)
             payload = response.json()
             code = int(payload.get("code", response.status_code))
@@ -296,40 +332,61 @@ class HithinkClient:
                 request_ended_at.isoformat(),
                 retry_index,
             )
-            if retry_index == 2:
-                raise HithinkApiError(
-                    429,
-                    message or response_summary or "upstream rate limit",
-                    error_code="UPSTREAM_HTTP_429",
-                    endpoint=endpoint,
-                    url=url,
-                    http_status=response.status_code,
-                    response_summary=response_summary,
-                    retry_after=retry_after_raw,
-                    request_started_at=request_started_at,
-                    request_ended_at=request_ended_at,
-                    retry_index=retry_index,
-                    limiter_source="UPSTREAM",
-                    duration_ms=round((perf_counter() - rate_limit_started) * 1000),
-                )
+            last_rate_limit_error = HithinkApiError(
+                429,
+                message or response_summary or "upstream rate limit",
+                error_code="UPSTREAM_HTTP_429",
+                endpoint=endpoint,
+                url=url,
+                http_status=response.status_code,
+                response_summary=response_summary,
+                retry_after=retry_after_raw,
+                request_started_at=request_started_at,
+                request_ended_at=request_ended_at,
+                retry_index=retry_index,
+                limiter_source="UPSTREAM",
+                duration_ms=round((perf_counter() - rate_limit_started) * 1000),
+            )
+            if retry_index == rate_limit_attempts - 1:
+                raise last_rate_limit_error
             wait_seconds = (
                 retry_after_seconds
                 if retry_after_seconds is not None
-                else (1.0 if retry_index == 0 else 2.0)
+                else RATE_LIMIT_RETRY_PAUSES_SECONDS[retry_index]
             )
-            self._sleep_before_retry(wait_seconds, endpoint, deadline)
+            retry_deadline = effective_retry_deadline()
+            if retry_deadline - monotonic() <= wait_seconds:
+                last_rate_limit_error.args = (
+                    f"{last_rate_limit_error}; 30-second rate-limit deadline reached",
+                )
+                last_rate_limit_error.duration_ms = round(
+                    (perf_counter() - rate_limit_started) * 1000
+                )
+                raise last_rate_limit_error
+            self._sleep_before_retry(wait_seconds, endpoint, retry_deadline)
         raise AssertionError("unreachable")
 
-    def fetch(self, *, deadline: float | None = None) -> ApiSnapshot:
+    def fetch(
+        self,
+        *,
+        deadline: float | None = None,
+        rate_limit_deadline: float | None = None,
+        allow_retries: bool = True,
+    ) -> ApiSnapshot:
         last_error: HithinkApiError | None = None
-        for attempt, pause_seconds in enumerate(RETRY_PAUSES_SECONDS):
+        retry_pauses = RETRY_PAUSES_SECONDS if allow_retries else (0.0,)
+        for attempt, pause_seconds in enumerate(retry_pauses):
             self._sleep_before_retry(
                 pause_seconds, "all_a_snapshot", deadline
             )
             started = perf_counter()
             try:
                 response, payload, rate_retries = self._request_json(
-                    "all_a_snapshot", URL, deadline=deadline
+                    "all_a_snapshot",
+                    URL,
+                    deadline=deadline,
+                    rate_limit_deadline=rate_limit_deadline,
+                    allow_retries=allow_retries,
                 )
                 code = int(payload.get("code", response.status_code))
                 if response.status_code >= 400 or code != 0:
@@ -393,12 +450,15 @@ class HithinkClient:
         trade_date: date,
         *,
         deadline: float | None = None,
+        rate_limit_deadline: float | None = None,
+        allow_retries: bool = True,
     ) -> LimitPoolSnapshot:
         if pool_name not in {"limit-up-pool", "limit-down-pool", "limit-break-pool"}:
             raise ValueError(f"Unsupported limit pool: {pool_name}")
         last_error: HithinkApiError | None = None
         endpoint_name = f"limit_pool:{pool_name}"
-        for attempt, pause_seconds in enumerate(RETRY_PAUSES_SECONDS):
+        retry_pauses = RETRY_PAUSES_SECONDS if allow_retries else (0.0,)
+        for attempt, pause_seconds in enumerate(retry_pauses):
             self._sleep_before_retry(pause_seconds, endpoint_name, deadline)
             started = perf_counter()
             try:
@@ -415,6 +475,8 @@ class HithinkClient:
                         endpoint_name,
                         LIMIT_POOL_URL.format(pool_name=pool_name),
                         deadline=deadline,
+                        rate_limit_deadline=rate_limit_deadline,
+                        allow_retries=allow_retries,
                         params={
                             "date_ms": int(datetime.combine(trade_date, time.min, tzinfo=SHANGHAI).timestamp() * 1000),
                             "page": page,
@@ -484,6 +546,8 @@ class HithinkClient:
         batch_size: int = 600,
         *,
         deadline: float | None = None,
+        rate_limit_deadline: float | None = None,
+        allow_retries: bool = True,
     ) -> SectorIndexSnapshot:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -496,7 +560,12 @@ class HithinkClient:
         retries = 0
         for offset in range(0, len(requested), batch_size):
             batch = requested[offset : offset + batch_size]
-            result = self._fetch_sector_index_batch(batch, deadline=deadline)
+            result = self._fetch_sector_index_batch(
+                batch,
+                deadline=deadline,
+                rate_limit_deadline=rate_limit_deadline,
+                allow_retries=allow_retries,
+            )
             collected.extend(result.items)
             retries += result.retry_count
 
@@ -518,10 +587,16 @@ class HithinkClient:
         )
 
     def _fetch_sector_index_batch(
-        self, sector_codes: list[str], *, deadline: float | None = None
+        self,
+        sector_codes: list[str],
+        *,
+        deadline: float | None = None,
+        rate_limit_deadline: float | None = None,
+        allow_retries: bool = True,
     ) -> SectorIndexSnapshot:
         last_error: HithinkApiError | None = None
-        for attempt, pause_seconds in enumerate(RETRY_PAUSES_SECONDS):
+        retry_pauses = RETRY_PAUSES_SECONDS if allow_retries else (0.0,)
+        for attempt, pause_seconds in enumerate(retry_pauses):
             self._sleep_before_retry(pause_seconds, "sector_index", deadline)
             started = perf_counter()
             try:
@@ -529,6 +604,8 @@ class HithinkClient:
                     "sector_index",
                     SECTOR_INDEX_SNAPSHOT_URL,
                     deadline=deadline,
+                    rate_limit_deadline=rate_limit_deadline,
+                    allow_retries=allow_retries,
                     params={"thscodes": ",".join(sector_codes)},
                 )
                 code = int(payload.get("code", response.status_code))
