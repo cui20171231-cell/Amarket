@@ -4,7 +4,9 @@ from decimal import Decimal
 from pathlib import Path
 
 from app.hithink.candidate_config import CAPITAL_SECTOR_TYPES, CORE_SECTOR_TYPES
+from app.hithink.schedule import MARKET_REVIEW_NODE_SEQUENCES
 from app.market_state_package import (
+    EMOTION_BUSINESS_FIELDS,
     MarketStatePackageBuilder,
     _business_period,
     _json_safe,
@@ -146,26 +148,47 @@ def test_v2_market_intraday_path_uses_the_fixed_axis_without_future_nodes() -> N
     assert current["state_source_age_seconds"] == 60
 
 
-def test_v2_concept_intraday_universe_keeps_historical_exits_and_null_ranks() -> None:
-    package = json.loads(
-        Path("docs/market_state_package_20260828_1030.json").read_text(encoding="utf-8")
+def test_emotion_intraday_keeps_only_node_time_and_business_fields() -> None:
+    columns = ["scheduled_time", *EMOTION_BUSINESS_FIELDS]
+    values = [datetime.fromisoformat("2026-09-01T10:30:15+08:00"), *range(19)]
+
+    class Result:
+        def __init__(self) -> None:
+            self.column_names = columns
+            self.result_rows = [values]
+
+    class Client:
+        def __init__(self) -> None:
+            self.sql = ""
+            self.parameters = {}
+
+        def query(self, sql, parameters, settings):
+            self.sql = sql
+            self.parameters = parameters
+            return Result()
+
+    client = Client()
+    target = datetime.fromisoformat("2026-09-01T10:30:15+08:00")
+    rows = MarketStatePackageBuilder(client)._emotion_intraday_trajectory(
+        target.date(), target
     )
-    block = package["core_sector_intraday"]
-    universe = block["concept_universe"]
-    trajectories = block["concept_trajectories"]
-    assert len(universe) == len(trajectories)
-    assert any(
-        row["included_by_history_top10"] == 1
-        and row["included_by_current_candidate"] == 0
-        for row in universe
+
+    assert len(rows) == 1
+    assert set(rows[0]) == {"scheduled_time", *EMOTION_BUSINESS_FIELDS}
+    assert "collection_id" not in rows[0]
+    assert "pool_source_collection_id" not in rows[0]
+    assert "state_data_status" not in rows[0]
+    assert "node_seq IN" in client.sql
+    assert "scheduled_time<=" in client.sql
+    assert client.parameters["node_sequences"] == sorted(
+        MARKET_REVIEW_NODE_SEQUENCES
     )
-    assert any(row["included_by_strategic_watch"] == 1 for row in universe)
-    assert any(row["included_by_migration_anomaly"] == 1 for row in universe)
-    for sector in trajectories:
-        assert len(sector["nodes"]) == 6
-        assert len(sector["rank_trajectory_intraday"]) == 6
-        assert all(
-            (node["candidate_rank"] is None)
-            == (node["candidate_score_v1"] is None)
-            for node in sector["nodes"]
-        )
+
+
+def test_current_package_uses_only_current_core_sector_intraday_trajectories() -> None:
+    assert "core_sector_intraday = {" in PACKAGE_SOURCE
+    assert '"current_core_sector_count": len(selected_core_sector_rows)' in PACKAGE_SOURCE
+    assert '"trajectories": [' in PACKAGE_SOURCE
+    assert "target_scheduled_time,\n            intraday_nodes," in PACKAGE_SOURCE
+    assert "self._concept_intraday_block(" not in PACKAGE_SOURCE
+    assert 'trajectory["key_nodes"][-5:]' in PACKAGE_SOURCE

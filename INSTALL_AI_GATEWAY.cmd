@@ -5,7 +5,7 @@ cd /d "%~dp0"
 
 set "VENV=%~dp0.ai_gateway_env"
 if not exist "%VENV%\Scripts\python.exe" (
-    py -3 -m venv "%VENV%"
+    py -3.11 -m venv "%VENV%"
     if errorlevel 1 exit /b 1
 )
 

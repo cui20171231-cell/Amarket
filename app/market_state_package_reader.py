@@ -28,12 +28,14 @@ class PackageInvalidError(ValueError):
 
 
 def compact_package_for_ai(result: dict[str, Any]) -> dict[str, Any]:
-    """Keep review facts while omitting the very large all-concept trajectory matrix."""
+    """Compact legacy packages that still contain the removed all-concept matrix."""
     data = result.get("data")
     if not isinstance(data, dict):
         return result
     intraday = data.get("core_sector_intraday")
     if not isinstance(intraday, dict):
+        return result
+    if "concept_trajectories" not in intraday:
         return result
 
     compact_result = dict(result)

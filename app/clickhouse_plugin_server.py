@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 from app.clickhouse_readonly import execute_clickhouse_readonly_sql
 from app.hithink.status import collection_status_response
+from app.market_context_state import get_market_context_state
 from app.market_state_package_reader import compact_package_for_ai, get_market_state_package
 
 TOOLS = [
@@ -69,6 +70,36 @@ TOOLS = [
         },
     },
     {
+        "name": "get_market_context_state",
+        "title": "读取个股或板块上下文",
+        "description": (
+            "按需读取指定时间的单只股票、最多5只股票或单个板块上下文。"
+            "stock模式返回个股轨迹、自动筛选的主要方向及板块内地位；"
+            "stocks模式分别返回各股票自己的方向上下文；"
+            "sector模式返回板块状态、压缩轨迹和少量关键成员。"
+            "数据库端完成聚合、排名和筛选，不返回完整成员分钟明细。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_type": {"type": "string", "enum": ["stock", "stocks", "sector"]},
+                "ticker": {"type": ["string", "null"]},
+                "tickers": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "minItems": 2,
+                    "maxItems": 5,
+                },
+                "sector_id": {"type": ["string", "null"]},
+                "sector_name": {"type": ["string", "null"]},
+                "target_time": {"type": "string"},
+                "trade_date": {"type": ["string", "null"]},
+            },
+            "required": ["target_type", "target_time"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "execute_clickhouse_readonly_sql",
         "title": "ClickHouse只读查询",
         "description": (
@@ -119,6 +150,21 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         }
     if name == "get_market_state_package":
         result = compact_package_for_ai(get_market_state_package(**arguments))
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        result,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                }
+            ],
+        }
+    if name == "get_market_context_state":
+        result = get_market_context_state(**arguments)
         return {
             "content": [
                 {

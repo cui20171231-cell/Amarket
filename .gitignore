@@ -13,6 +13,8 @@ exports/
 .docker-client/
 .runtime/
 docker-data/
+temp/
+backups/
 *.egg-info/
 
 # 从测试阶段保留在本机的一次性数据库工具，不属于 1.0 运行版本。

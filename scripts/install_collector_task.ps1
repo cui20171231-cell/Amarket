@@ -22,7 +22,7 @@ foreach ($collectorProcess in $collectorProcesses) {
     Stop-Process -Id $collectorProcess.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-$taskAction = New-ScheduledTaskAction -Execute 'C:\Windows\py.exe' -Argument '-3 -m app.hithink.cli serve' -WorkingDirectory $ProjectRoot
+$taskAction = New-ScheduledTaskAction -Execute 'C:\Windows\py.exe' -Argument '-3.11 -m app.hithink.cli serve' -WorkingDirectory $ProjectRoot
 $bootTrigger = New-ScheduledTaskTrigger -AtStartup
 $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest

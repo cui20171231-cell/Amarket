@@ -40,6 +40,11 @@ def test_stock_score_uses_absolute_turnover_only_as_proxy() -> None:
     assert "candidate_rank<=50" in STOCK_SQL
 
 
+def test_stock_sources_do_not_require_a_hardcoded_market_size() -> None:
+    assert "HAVING uniqExact(thscode)" not in STOCK_SQL
+    assert "5562" not in STOCK_SQL
+
+
 def test_persistence_is_partitioned_by_business_period() -> None:
     assert "trade_date,business_period,sector_type,sector_code" in SECTOR_SQL
     assert "trade_date,business_period,thscode" in STOCK_SQL

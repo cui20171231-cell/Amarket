@@ -13,6 +13,7 @@ from typing import Any
 from app.clickhouse_readonly import execute_clickhouse_readonly_sql
 from app.hithink.status import collection_status_response
 from app.logging_utils import append_jsonl_bounded
+from app.market_context_state import get_market_context_state as read_market_context_state
 from app.market_state_package_reader import compact_package_for_ai
 from app.market_state_package_reader import (
     get_market_state_package as read_market_state_package,
@@ -23,9 +24,7 @@ try:
     from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
     from mcp.types import ToolAnnotations
 except ImportError as exc:
-    raise RuntimeError(
-        "AI 网关依赖尚未安装。请运行 D:\\Amarket\\INSTALL_AI_GATEWAY.cmd。"
-    ) from exc
+    raise RuntimeError("AI 网关依赖尚未安装。请运行 D:\\Amarket\\INSTALL_AI_GATEWAY.cmd。") from exc
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -145,6 +144,40 @@ def get_market_state_package(
             retry_interval_seconds=retry_interval_seconds,
             max_wait_seconds=max_wait_seconds,
         )
+    )
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+@mcp.tool(
+    title="读取个股或板块上下文",
+    description=(
+        "按需读取指定时间的单只股票、最多5只股票或单个板块上下文。"
+        "stock模式返回个股轨迹、自动筛选的主要方向及板块内地位；"
+        "stocks模式分别返回各股票自己的方向上下文；"
+        "sector模式返回板块状态、压缩轨迹和少量关键成员。"
+        "查询在数据库端完成聚合、排名和筛选，不返回完整成员分钟明细。"
+    ),
+    annotations=READ_ONLY,
+    structured_output=False,
+)
+@audited
+def get_market_context_state(
+    target_type: str,
+    target_time: str,
+    ticker: str | None = None,
+    tickers: list[str] | None = None,
+    sector_id: str | None = None,
+    sector_name: str | None = None,
+    trade_date: str | None = None,
+) -> str:
+    result = read_market_context_state(
+        target_type=target_type,
+        target_time=target_time,
+        ticker=ticker,
+        tickers=tickers,
+        sector_id=sector_id,
+        sector_name=sector_name,
+        trade_date=trade_date,
     )
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
 

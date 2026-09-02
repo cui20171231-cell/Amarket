@@ -37,6 +37,22 @@ def test_ai_transport_omits_only_the_all_concept_trajectory_matrix() -> None:
     assert original["data"]["core_sector_intraday"]["concept_trajectories"]
 
 
+def test_ai_transport_keeps_current_core_sector_intraday_trajectories() -> None:
+    original = {
+        "status": "OK",
+        "data": {
+            "core_sector_intraday": {
+                "current_core_sector_count": 1,
+                "trajectories": [
+                    {"sector_type": "concept", "sector_code": "A", "nodes": [1, 2]}
+                ],
+            }
+        },
+    }
+
+    assert compact_package_for_ai(original) is original
+
+
 class FakeClock:
     def __init__(self, on_sleep=None) -> None:
         self.current = 0.0

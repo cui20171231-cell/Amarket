@@ -19,7 +19,6 @@ source_nodes AS
  FROM market.hithink_snapshot_derived
  WHERE trade_date={trade_date:Date}
  GROUP BY trade_date,collection_id,scheduled_time
- HAVING uniqExact(thscode)=5562
  ORDER BY trade_date,business_period,scheduled_time
 ),
 targets AS

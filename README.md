@@ -9,7 +9,8 @@
 [2.0 版本范围](docs/V2.0_SCOPE.md)、[1.0 历史范围](docs/V1.0_SCOPE.md)、[数据库草案](docs/DATABASE_DRAFT.md)和
 [接口草案](docs/API_DRAFT.md)。当前现场状态、重启恢复约定、长期无人值守目标和剩余建设项见
 [当前运行基线与长期目标](docs/CURRENT_STATE_AND_LONG_TERM_GOAL.md)；数据库的 Linux 启动、看护、
-迁移核对和回退方法见 [Linux数据库基础服务](docs/LINUX_INFRASTRUCTURE.md)。
+迁移核对和回退方法见 [Linux数据库基础服务](docs/LINUX_INFRASTRUCTURE.md)。整机损坏后的代码、
+依赖、数据库、凭据和管理员任务恢复顺序见 [灾难恢复手册](docs/DISASTER_RECOVERY.md)。
 
 ## 快照主链
 
@@ -104,7 +105,8 @@ D:\Amarket\secrets\collector.env
 ## 初始化与维护
 
 ```powershell
-py -m pip install -e ".[dev]"
+py -3.11 -m pip install -r .\requirements-recovery.txt
+py -3.11 -m pip install --no-deps -e .
 hithink-snapshot init-db
 powershell -ExecutionPolicy Bypass -File .\scripts\install_collector_task.ps1
 ```

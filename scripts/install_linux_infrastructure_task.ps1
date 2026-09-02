@@ -1,6 +1,6 @@
 param(
     [string]$ProjectRoot = 'D:\Amarket',
-    [string]$WindowsUser = 'DESKTOP-T13G2DE\DmarketosOS'
+    [string]$WindowsUser = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,6 +9,9 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Installing the Linux infrastructure task requires an Administrator PowerShell window.'
+}
+if ([string]::IsNullOrWhiteSpace($WindowsUser)) {
+    $WindowsUser = $identity.Name
 }
 
 $oldTask = Get-ScheduledTask -TaskName 'AmarketInfrastructureBootstrap' -ErrorAction SilentlyContinue

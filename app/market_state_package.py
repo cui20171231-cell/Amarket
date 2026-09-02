@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from app.hithink.candidate_config import CAPITAL_SECTOR_TYPES, CORE_SECTOR_TYPES
 from app.hithink.config import Settings
+from app.hithink.schedule import MARKET_REVIEW_NODE_SEQUENCES
 from app.hithink.writer import ClickHouseWriter
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -83,20 +84,26 @@ MARKET_INTRADAY_FIELDS = (
     "price_down_1m_count",
 )
 
-CONCEPT_INTRADAY_FIELDS = (
-    "index_change_ratio_pct",
-    "up_count",
-    "down_count",
-    "up_ratio",
+EMOTION_BUSINESS_FIELDS = (
     "limit_up_count",
+    "limit_down_count",
     "limit_break_count",
-    "turnover_market_share_pct",
-    "turnover_1m_market_share_pct",
-    "new_high_count",
-    "new_high_ratio",
-    "turnover_1m_top1_share_pct",
-    "turnover_1m_top3_share_pct",
-    "turnover_1m_top5_share_pct",
+    "limit_attempt_count",
+    "limit_success_rate",
+    "limit_break_rate",
+    "first_board_count",
+    "second_board_count",
+    "third_board_count",
+    "fourth_board_count",
+    "fifth_plus_board_count",
+    "max_board_height",
+    "promotion_base_count",
+    "promotion_success_count",
+    "promotion_fail_count",
+    "promotion_rate",
+    "high_board_count",
+    "high_board_break_count",
+    "high_board_fail_count",
 )
 
 CAPITAL_FIELDS = (
@@ -399,271 +406,34 @@ class MarketStatePackageBuilder:
             )
         return result
 
-    def _concept_intraday_block(
+    def _emotion_intraday_trajectory(
         self,
         trade_date_value: date,
-        current_collection_id: str,
-        nodes: list[dict[str, Any]],
-        current_migration_rows: list[dict[str, Any]],
-        watchlist: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        node_ids = [node["collection_id"] for node in nodes]
-        node_map = {node["collection_id"]: node for node in nodes}
-        candidate_rows = self._rows(
-            """
-            SELECT toString(collection_id) collection_id,sector_code,sector_name,
-                candidate_rank,candidate_score_v1
-            FROM market.hithink_core_sector_candidate FINAL
-            WHERE trade_date={trade_date:Date}
-              AND sector_type='concept'
-              AND toString(collection_id) IN {collection_ids:Array(String)}
-            """,
-            {"trade_date": trade_date_value, "collection_ids": node_ids},
-        )
-        candidate_map = {
-            (row["collection_id"], row["sector_code"]): row for row in candidate_rows
-        }
-
-        universe: dict[str, dict[str, Any]] = {}
-
-        def include(
-            sector_code: str,
-            sector_name: str | None,
-            reason: str,
-        ) -> None:
-            item = universe.setdefault(
-                sector_code,
-                {
-                    "sector_type": "concept",
-                    "sector_code": sector_code,
-                    "sector_name": sector_name,
-                    "included_by_current_candidate": 0,
-                    "included_by_history_top10": 0,
-                    "included_by_migration_anomaly": 0,
-                    "included_by_strategic_watch": 0,
-                },
-            )
-            if not item.get("sector_name") and sector_name:
-                item["sector_name"] = sector_name
-            item[reason] = 1
-
-        for row in candidate_rows:
-            if row["collection_id"] == current_collection_id:
-                include(
-                    row["sector_code"],
-                    row.get("sector_name"),
-                    "included_by_current_candidate",
-                )
-            if row.get("candidate_rank") is not None and row["candidate_rank"] <= 10:
-                include(
-                    row["sector_code"],
-                    row.get("sector_name"),
-                    "included_by_history_top10",
-                )
-
-        current_concepts = [
-            row
-            for row in current_migration_rows
-            if _text(row.get("sector_type")) == "concept"
-        ]
-
-        def anomaly_top(field: str, positive: bool) -> list[dict[str, Any]]:
-            eligible = [
-                row
-                for row in current_concepts
-                if row.get(field) is not None
-                and ((_number(row[field]) or 0) > 0 if positive else (_number(row[field]) or 0) < 0)
-            ]
-            eligible.sort(
-                key=lambda row: _number(row[field]) or 0,
-                reverse=positive,
-            )
-            return eligible[:10]
-
-        anomaly_rows: dict[str, dict[str, Any]] = {}
-        for field in (
-            "turnover_market_share_delta_15m",
-            "turnover_share_rank_delta",
-        ):
-            for positive in (True, False):
-                for row in anomaly_top(field, positive):
-                    anomaly_rows[row["sector_code"]] = row
-        for row in anomaly_rows.values():
-            include(
-                row["sector_code"],
-                row.get("sector_name"),
-                "included_by_migration_anomaly",
-            )
-
-        for row in watchlist:
-            if _text(row.get("sector_type")) == "concept":
-                include(
-                    row["sector_code"],
-                    row.get("sector_name"),
-                    "included_by_strategic_watch",
-                )
-
-        if not universe:
-            return {"concept_universe": [], "concept_trajectories": []}
-
-        codes = sorted(universe)
-        migration_rows = self._rows(
-            """
-            SELECT toString(collection_id) collection_id,node_seq,scheduled_time,
-                sector_code,sector_name,state_data_status,
-                toString(state_source_collection_id) state_source_collection_id,
-                state_source_scheduled_time,state_source_age_seconds,state_is_fallback,
-                turnover_share_rank
-            FROM market.hithink_sector_capital_migration FINAL
-            WHERE trade_date={trade_date:Date}
-              AND sector_type='concept'
-              AND sector_code IN {sector_codes:Array(String)}
-              AND toString(collection_id) IN {collection_ids:Array(String)}
+        target: datetime,
+    ) -> list[dict[str, Any]]:
+        """Return fixed review-node emotion facts through the package target."""
+        rows = self._rows(
+            f"""
+            SELECT scheduled_time,{', '.join(EMOTION_BUSINESS_FIELDS)}
+            FROM market.hithink_emotion_state FINAL
+            WHERE trade_date={{trade_date:Date}}
+              AND node_seq IN {{node_sequences:Array(UInt16)}}
+              AND scheduled_time<={{target:DateTime64(3,'Asia/Shanghai')}}
+            ORDER BY scheduled_time
             """,
             {
                 "trade_date": trade_date_value,
-                "sector_codes": codes,
-                "collection_ids": node_ids,
+                "node_sequences": sorted(MARKET_REVIEW_NODE_SEQUENCES),
+                "target": target,
             },
         )
-        migration_map = {
-            (row["collection_id"], row["sector_code"]): row
-            for row in migration_rows
-        }
-        source_ids = sorted(
+        return [
             {
-                row["state_source_collection_id"]
-                for row in migration_rows
-                if row.get("state_source_collection_id")
+                "scheduled_time": row["scheduled_time"],
+                **{field: row.get(field) for field in EMOTION_BUSINESS_FIELDS},
             }
-        )
-        state_rows = (
-            self._rows(
-                f"""
-                SELECT toString(collection_id) collection_id,sector_code,
-                    {', '.join(CONCEPT_INTRADAY_FIELDS)}
-                FROM market.hithink_concept_state FINAL
-                WHERE trade_date={{trade_date:Date}}
-                  AND sector_code IN {{sector_codes:Array(String)}}
-                  AND toString(collection_id) IN {{collection_ids:Array(String)}}
-                """,
-                {
-                    "trade_date": trade_date_value,
-                    "sector_codes": codes,
-                    "collection_ids": source_ids,
-                },
-            )
-            if source_ids
-            else []
-        )
-        state_map = {
-            (row["collection_id"], row["sector_code"]): row for row in state_rows
-        }
-
-        current_candidate_ranks = {
-            row["sector_code"]: row["candidate_rank"]
-            for row in candidate_rows
-            if row["collection_id"] == current_collection_id
-        }
-        best_candidate_ranks: dict[str, int] = {}
-        for row in candidate_rows:
-            rank = row.get("candidate_rank")
-            if rank is not None:
-                best_candidate_ranks[row["sector_code"]] = min(
-                    rank, best_candidate_ranks.get(row["sector_code"], rank)
-                )
-        current_migration_ranks = {
-            row["sector_code"]: row.get("turnover_share_rank")
-            for row in current_concepts
-        }
-        ordered_codes = sorted(
-            codes,
-            key=lambda code: (
-                current_candidate_ranks.get(code, 65535),
-                best_candidate_ranks.get(code, 65535),
-                current_migration_ranks.get(code) or 65535,
-                code,
-            ),
-        )
-
-        universe_rows: list[dict[str, Any]] = []
-        trajectories: list[dict[str, Any]] = []
-        for sector_code in ordered_codes:
-            config = universe[sector_code]
-            config["current_candidate_rank"] = current_candidate_ranks.get(sector_code)
-            config["best_intraday_candidate_rank"] = best_candidate_ranks.get(sector_code)
-            config["current_turnover_share_rank"] = current_migration_ranks.get(
-                sector_code
-            )
-            universe_rows.append(config)
-            trajectory_nodes: list[dict[str, Any]] = []
-            rank_nodes: list[dict[str, Any]] = []
-            for collection_id in node_ids:
-                node = node_map[collection_id]
-                migration = migration_map.get((collection_id, sector_code))
-                candidate = candidate_map.get((collection_id, sector_code))
-                source_id = (
-                    migration.get("state_source_collection_id") if migration else None
-                )
-                state = state_map.get((source_id, sector_code)) if source_id else None
-                candidate_rank = (
-                    candidate.get("candidate_rank") if candidate else None
-                )
-                candidate_score = (
-                    candidate.get("candidate_score_v1") if candidate else None
-                )
-                turnover_rank = (
-                    migration.get("turnover_share_rank") if migration else None
-                )
-                trajectory_nodes.append(
-                    {
-                        "node_seq": node["node_seq"],
-                        "scheduled_time": node["scheduled_time"],
-                        "delta_type": _text(node.get("delta_type")),
-                        "state_data_status": _text(
-                            migration.get("state_data_status") if migration else None
-                        ),
-                        "state_source_scheduled_time": migration.get(
-                            "state_source_scheduled_time"
-                        )
-                        if migration
-                        else None,
-                        "state_source_age_seconds": migration.get(
-                            "state_source_age_seconds"
-                        )
-                        if migration
-                        else None,
-                        "state_is_fallback": migration.get("state_is_fallback")
-                        if migration
-                        else None,
-                        "candidate_rank": candidate_rank,
-                        "candidate_score_v1": candidate_score,
-                        "turnover_share_rank": turnover_rank,
-                        **{
-                            field: state.get(field) if state else None
-                            for field in CONCEPT_INTRADAY_FIELDS
-                        },
-                    }
-                )
-                rank_nodes.append(
-                    {
-                        "node_seq": node["node_seq"],
-                        "scheduled_time": node["scheduled_time"],
-                        "candidate_rank": candidate_rank,
-                        "turnover_share_rank": turnover_rank,
-                    }
-                )
-            trajectories.append(
-                {
-                    **config,
-                    "nodes": trajectory_nodes,
-                    "rank_trajectory_intraday": rank_nodes,
-                }
-            )
-        return {
-            "concept_universe": universe_rows,
-            "concept_trajectories": trajectories,
-        }
+            for row in rows
+        ]
 
     def _market_intervals(
         self,
@@ -1151,8 +921,11 @@ class MarketStatePackageBuilder:
         delta = self._table_row(
             "market.hithink_market_delta_15m", trade_date_value, collection_id
         )
-        emotion = self._table_row(
+        current_emotion = self._table_row(
             "market.hithink_emotion_state", trade_date_value, collection_id
+        )
+        emotion_intraday_trajectory = self._emotion_intraday_trajectory(
+            trade_date_value, target_scheduled_time
         )
         current_state_source = _text(
             delta.get("state_source_collection_id") if delta else None
@@ -1207,7 +980,7 @@ class MarketStatePackageBuilder:
         core_trajectories = self._core_sector_trajectories(
             trade_date_value,
             target_scheduled_time,
-            target_nodes,
+            intraday_nodes,
             selected_core_sector_rows,
         )
         core_sectors: dict[str, list[dict[str, Any]]] = {}
@@ -1231,9 +1004,27 @@ class MarketStatePackageBuilder:
                     {"recent": [], "key_nodes": []},
                 )
                 item["trajectory_recent_5_nodes"] = trajectory["recent"]
-                item["trajectory_15m_last_5"] = trajectory["key_nodes"]
+                item["trajectory_15m_last_5"] = trajectory["key_nodes"][-5:]
                 items.append(item)
             core_sectors[sector_type] = items
+
+        core_sector_intraday = {
+            "current_core_sector_count": len(selected_core_sector_rows),
+            "trajectories": [
+                {
+                    "sector_type": _text(row["sector_type"]),
+                    "sector_code": row["sector_code"],
+                    "sector_name": row["sector_name"],
+                    "current_candidate_rank": row["candidate_rank"],
+                    "current_candidate_score_v1": row["candidate_score_v1"],
+                    "nodes": core_trajectories.get(
+                        (_text(row["sector_type"]) or "", row["sector_code"]),
+                        {"key_nodes": []},
+                    )["key_nodes"],
+                }
+                for row in selected_core_sector_rows
+            ],
+        }
 
         all_stock_rows = self._rows(
             """
@@ -1259,13 +1050,6 @@ class MarketStatePackageBuilder:
             core_stocks.append(item)
 
         watchlist = self._watchlist(trade_date_value, historical_watchlist)
-        core_sector_intraday = self._concept_intraday_block(
-            trade_date_value,
-            collection_id,
-            intraday_nodes,
-            migration_rows,
-            watchlist,
-        )
         sector_state_map = self._sector_state_map(trade_date_value, migration_rows)
         history_rows = self._rows(
             """
@@ -1481,16 +1265,18 @@ class MarketStatePackageBuilder:
                 "market_state_source_age_seconds": delta.get("state_source_age_seconds")
                 if delta
                 else None,
-                "emotion_pool_data_status": emotion.get("pool_data_status")
-                if emotion
+                "emotion_pool_data_status": current_emotion.get("pool_data_status")
+                if current_emotion
                 else "MISSING",
-                "emotion_pool_source_scheduled_time": emotion.get(
+                "emotion_pool_source_scheduled_time": current_emotion.get(
                     "pool_source_scheduled_time"
                 )
-                if emotion
+                if current_emotion
                 else None,
-                "emotion_pool_source_age_seconds": emotion.get("pool_source_age_seconds")
-                if emotion
+                "emotion_pool_source_age_seconds": current_emotion.get(
+                    "pool_source_age_seconds"
+                )
+                if current_emotion
                 else None,
                 "capital_migration_status_counts": dict(migration_statuses),
                 "core_sector_status_counts": dict(core_sector_statuses),
@@ -1498,9 +1284,9 @@ class MarketStatePackageBuilder:
                 "strategic_watch_total": sum(len(rows) for rows in strategic_watch.values()),
                 "strategic_watch_with_state": strategic_state_count,
                 "intraday_target_node_count": len(intraday_nodes),
-                "concept_intraday_universe_count": len(
-                    core_sector_intraday["concept_universe"]
-                ),
+                "core_sector_intraday_count": core_sector_intraday[
+                    "current_core_sector_count"
+                ],
                 "strategic_watch_basis": "HISTORICAL_EFFECTIVE_WINDOW"
                 if historical_watchlist
                 else "CURRENT_ACTIVE_RETROSPECTIVE",
@@ -1513,7 +1299,9 @@ class MarketStatePackageBuilder:
                 ),
                 "intraday_trajectory": market_intraday_trajectory,
             },
-            "emotion": _strip_internal(emotion),
+            "emotion": {
+                "intraday_trajectory": emotion_intraday_trajectory,
+            },
             "capital_migration": self._capital_block(migration_rows, capital_top_n),
             "core_sectors": core_sectors,
             "core_sector_intraday": core_sector_intraday,
