@@ -61,11 +61,11 @@ market
     从09:25到当前包的固定15分钟节点市场路径
 emotion
   intraday_trajectory
-    从09:25到当前包的固定15分钟节点情绪路径；每个节点只保留节点时间和19个业务字段
+    从09:25到当前包的固定15分钟节点情绪路径；每个节点保留节点时间、三项池来源状态和19个业务字段
 capital_migration
   concept / industry / style
-    share_rising_top
-    share_falling_top
+    cumulative_share_rising_top / cumulative_share_falling_top
+    instant_1m_share_rising_top / instant_1m_share_falling_top
 core_sectors
   concept / industry
   每个候选带显式候选原因、最近5个有效原始节点轨迹、最近5个15分钟关键节点轨迹
@@ -129,7 +129,9 @@ get_market_state_package(target_time="10:15")
 两套轨迹都返回价格、广度、累计和即时成交份额、涨停/炸板、新高/新低以及数据来源状态。
 原始节点没有候选计算，因此其 `candidate_rank`、`candidate_score_v1` 固定为NULL。15分钟关键节点
 如果当时没有进入候选，这两个字段同样为NULL，禁止从前后节点补排名或分数。轨迹保持真实NULL，
-保留FALLBACK来源时间和年龄，下午从13:00重新开始，不跨午休。
+同时用 `candidate_rank_status` 明确区分：原始节点为 `NOT_EVALUATED`，进入候选前列为 `RANKED`，
+当时未进入候选前列为 `OUTSIDE_TOP_N`。轨迹保留FALLBACK来源时间和年龄，下午从13:00重新开始，
+不跨午休。
 
 战略观察排名轨迹仍来自 `hithink_sector_capital_migration` 的完整同类成交份额排名，所以战略板块
 即使没有进入候选也保留轨迹。
@@ -148,8 +150,14 @@ V2不新增数据库表，只在生成JSON时按既有19个固定节点临时组
 禁止包含未来数据。13:00保留为下午基线，路径可以同时展示上午和下午，但不把午休解释成连续变化。
 
 `emotion.intraday_trajectory` 使用同一组固定节点，返回从09:25到当前包的情绪路径。每个节点只保留
-计划时间以及涨停、跌停、炸板、封板率、连板梯队、晋级率和高位板等19个业务字段，不返回采集编号、
-来源编号、来源时间、回退标识或来源年龄。当前节点的数据质量仍统一记录在顶层 `data_quality` 中。
+计划时间、`pool_data_status`、`pool_source_scheduled_time`、`pool_source_age_seconds`，以及涨停、
+跌停、炸板、封板率、连板梯队、晋级率和高位板等19个业务字段。不返回采集编号和来源编号。
+因此每个历史情绪节点都能判断三池数据是否来自当前分钟或向前回退；当前节点的数据质量仍同时记录
+在顶层 `data_quality` 中。
+
+`capital_migration` 明确分成四张榜：`cumulative_share_*` 按累计成交额市场份额的15分钟变化排序，
+`instant_1m_share_*` 按即时1分钟成交额市场份额的15分钟变化排序。一个板块可以同时出现在“累计下降”
+和“即时上升”中，这代表两个不同观察口径，不再混用同一个榜名。
 
 `core_sector_intraday.trajectories` 只取当前包实际入选的核心概念和核心行业，不再纳入历史退出板块、
 资金迁移异常板块或战略观察并集。每个板块保存从09:25到当前包的固定节点事实路径；候选排名和

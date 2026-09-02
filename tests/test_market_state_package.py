@@ -7,6 +7,7 @@ from app.hithink.candidate_config import CAPITAL_SECTOR_TYPES, CORE_SECTOR_TYPES
 from app.hithink.schedule import MARKET_REVIEW_NODE_SEQUENCES
 from app.market_state_package import (
     EMOTION_BUSINESS_FIELDS,
+    EMOTION_POOL_SOURCE_FIELDS,
     MarketStatePackageBuilder,
     _business_period,
     _json_safe,
@@ -41,28 +42,45 @@ def test_json_conversion_preserves_decimal_precision_and_fixed_strings() -> None
     assert value == {"amount": "123.45", "collection_id": "20260828072"}
 
 
-def test_capital_top_lists_only_use_signed_share_changes() -> None:
+def test_capital_top_lists_separate_cumulative_and_instant_share_changes() -> None:
     builder = MarketStatePackageBuilder(client=None)
     rows = [
         {
             "sector_type": "concept",
             "sector_code": "A",
             "turnover_market_share_delta_15m": 2.0,
+            "turnover_1m_market_share_delta_15m": -1.0,
         },
         {
             "sector_type": "concept",
             "sector_code": "B",
             "turnover_market_share_delta_15m": -3.0,
+            "turnover_1m_market_share_delta_15m": 4.0,
         },
         {
             "sector_type": "concept",
             "sector_code": "C",
             "turnover_market_share_delta_15m": 0.0,
+            "turnover_1m_market_share_delta_15m": 0.0,
         },
     ]
     block = builder._capital_block(rows, 10)
-    assert [row["sector_code"] for row in block["concept"]["share_rising_top"]] == ["A"]
-    assert [row["sector_code"] for row in block["concept"]["share_falling_top"]] == ["B"]
+    assert [
+        row["sector_code"]
+        for row in block["concept"]["cumulative_share_rising_top"]
+    ] == ["A"]
+    assert [
+        row["sector_code"]
+        for row in block["concept"]["cumulative_share_falling_top"]
+    ] == ["B"]
+    assert [
+        row["sector_code"]
+        for row in block["concept"]["instant_1m_share_rising_top"]
+    ] == ["B"]
+    assert [
+        row["sector_code"]
+        for row in block["concept"]["instant_1m_share_falling_top"]
+    ] == ["A"]
 
 
 def test_style_remains_in_capital_but_not_core_sector_competition() -> None:
@@ -148,9 +166,19 @@ def test_v2_market_intraday_path_uses_the_fixed_axis_without_future_nodes() -> N
     assert current["state_source_age_seconds"] == 60
 
 
-def test_emotion_intraday_keeps_only_node_time_and_business_fields() -> None:
-    columns = ["scheduled_time", *EMOTION_BUSINESS_FIELDS]
-    values = [datetime.fromisoformat("2026-09-01T10:30:15+08:00"), *range(19)]
+def test_emotion_intraday_keeps_business_fields_and_pool_source_status() -> None:
+    columns = [
+        "scheduled_time",
+        *EMOTION_POOL_SOURCE_FIELDS,
+        *EMOTION_BUSINESS_FIELDS,
+    ]
+    values = [
+        datetime.fromisoformat("2026-09-01T10:30:15+08:00"),
+        "CURRENT",
+        datetime.fromisoformat("2026-09-01T10:30:15+08:00"),
+        0,
+        *range(19),
+    ]
 
     class Result:
         def __init__(self) -> None:
@@ -174,15 +202,26 @@ def test_emotion_intraday_keeps_only_node_time_and_business_fields() -> None:
     )
 
     assert len(rows) == 1
-    assert set(rows[0]) == {"scheduled_time", *EMOTION_BUSINESS_FIELDS}
+    assert set(rows[0]) == {
+        "scheduled_time",
+        *EMOTION_POOL_SOURCE_FIELDS,
+        *EMOTION_BUSINESS_FIELDS,
+    }
     assert "collection_id" not in rows[0]
     assert "pool_source_collection_id" not in rows[0]
     assert "state_data_status" not in rows[0]
+    assert rows[0]["pool_data_status"] == "CURRENT"
+    assert rows[0]["pool_source_age_seconds"] == 0
     assert "node_seq IN" in client.sql
     assert "scheduled_time<=" in client.sql
     assert client.parameters["node_sequences"] == sorted(
         MARKET_REVIEW_NODE_SEQUENCES
     )
+
+
+def test_core_sector_rank_nulls_have_explicit_statuses() -> None:
+    assert '"candidate_rank_status": "NOT_EVALUATED"' in PACKAGE_SOURCE
+    assert 'else "OUTSIDE_TOP_N"' in PACKAGE_SOURCE
 
 
 def test_current_package_uses_only_current_core_sector_intraday_trajectories() -> None:

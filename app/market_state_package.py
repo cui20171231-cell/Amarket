@@ -106,6 +106,12 @@ EMOTION_BUSINESS_FIELDS = (
     "high_board_fail_count",
 )
 
+EMOTION_POOL_SOURCE_FIELDS = (
+    "pool_data_status",
+    "pool_source_scheduled_time",
+    "pool_source_age_seconds",
+)
+
 CAPITAL_FIELDS = (
     "sector_type",
     "sector_code",
@@ -414,7 +420,8 @@ class MarketStatePackageBuilder:
         """Return fixed review-node emotion facts through the package target."""
         rows = self._rows(
             f"""
-            SELECT scheduled_time,{', '.join(EMOTION_BUSINESS_FIELDS)}
+            SELECT scheduled_time,{', '.join(EMOTION_POOL_SOURCE_FIELDS)},
+                {', '.join(EMOTION_BUSINESS_FIELDS)}
             FROM market.hithink_emotion_state FINAL
             WHERE trade_date={{trade_date:Date}}
               AND node_seq IN {{node_sequences:Array(UInt16)}}
@@ -430,6 +437,7 @@ class MarketStatePackageBuilder:
         return [
             {
                 "scheduled_time": row["scheduled_time"],
+                **{field: row.get(field) for field in EMOTION_POOL_SOURCE_FIELDS},
                 **{field: row.get(field) for field in EMOTION_BUSINESS_FIELDS},
             }
             for row in rows
@@ -504,28 +512,61 @@ class MarketStatePackageBuilder:
         result: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for sector_type in CAPITAL_SECTOR_TYPES:
             typed = [row for row in rows if _text(row.get("sector_type")) == sector_type]
-            rising = [
+            cumulative_rising = [
                 row
                 for row in typed
                 if (_number(row.get("turnover_market_share_delta_15m")) or 0) > 0
             ]
-            falling = [
+            cumulative_falling = [
                 row
                 for row in typed
                 if (_number(row.get("turnover_market_share_delta_15m")) or 0) < 0
             ]
-            rising.sort(
+            instant_1m_rising = [
+                row
+                for row in typed
+                if (_number(row.get("turnover_1m_market_share_delta_15m")) or 0) > 0
+            ]
+            instant_1m_falling = [
+                row
+                for row in typed
+                if (_number(row.get("turnover_1m_market_share_delta_15m")) or 0) < 0
+            ]
+            cumulative_rising.sort(
                 key=lambda row: _number(row.get("turnover_market_share_delta_15m"))
                 or float("-inf"),
                 reverse=True,
             )
-            falling.sort(
+            cumulative_falling.sort(
                 key=lambda row: _number(row.get("turnover_market_share_delta_15m"))
                 or float("inf")
             )
+            instant_1m_rising.sort(
+                key=lambda row: _number(
+                    row.get("turnover_1m_market_share_delta_15m")
+                )
+                or float("-inf"),
+                reverse=True,
+            )
+            instant_1m_falling.sort(
+                key=lambda row: _number(
+                    row.get("turnover_1m_market_share_delta_15m")
+                )
+                or float("inf")
+            )
             result[sector_type] = {
-                "share_rising_top": [_pick(row, CAPITAL_FIELDS) for row in rising[:top_n]],
-                "share_falling_top": [_pick(row, CAPITAL_FIELDS) for row in falling[:top_n]],
+                "cumulative_share_rising_top": [
+                    _pick(row, CAPITAL_FIELDS) for row in cumulative_rising[:top_n]
+                ],
+                "cumulative_share_falling_top": [
+                    _pick(row, CAPITAL_FIELDS) for row in cumulative_falling[:top_n]
+                ],
+                "instant_1m_share_rising_top": [
+                    _pick(row, CAPITAL_FIELDS) for row in instant_1m_rising[:top_n]
+                ],
+                "instant_1m_share_falling_top": [
+                    _pick(row, CAPITAL_FIELDS) for row in instant_1m_falling[:top_n]
+                ],
             }
         return result
 
@@ -559,16 +600,20 @@ class MarketStatePackageBuilder:
         keys = {(_text(row["sector_type"]), row["sector_code"]) for row in rows}
         result: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for key in keys:
-            result[key] = [
-                {
-                    "scheduled_time": node["scheduled_time"],
-                    "node_seq": node["node_seq"],
-                    "candidate_rank": rank_map.get(
-                        (node["collection_id"], key[0], key[1])
-                    ),
-                }
-                for node in nodes
-            ]
+            history = []
+            for node in nodes:
+                rank = rank_map.get((node["collection_id"], key[0], key[1]))
+                history.append(
+                    {
+                        "scheduled_time": node["scheduled_time"],
+                        "node_seq": node["node_seq"],
+                        "candidate_rank": rank,
+                        "candidate_rank_status": (
+                            "RANKED" if rank is not None else "OUTSIDE_TOP_N"
+                        ),
+                    }
+                )
+            result[key] = history
         return result
 
     def _core_sector_trajectories(
@@ -641,6 +686,7 @@ class MarketStatePackageBuilder:
                         "scheduled_time": row["scheduled_time"],
                         "node_seq": row["node_seq"],
                         "candidate_rank": None,
+                        "candidate_rank_status": "NOT_EVALUATED",
                         "candidate_score_v1": None,
                         **{field: row.get(field) for field in CORE_TRAJECTORY_STATE_FIELDS},
                         "state_data_status": "CURRENT",
@@ -751,6 +797,12 @@ class MarketStatePackageBuilder:
                             "candidate_rank": candidate.get("candidate_rank")
                             if candidate
                             else None,
+                            "candidate_rank_status": (
+                                "RANKED"
+                                if candidate
+                                and candidate.get("candidate_rank") is not None
+                                else "OUTSIDE_TOP_N"
+                            ),
                             "candidate_score_v1": candidate.get("candidate_score_v1")
                             if candidate
                             else None,
