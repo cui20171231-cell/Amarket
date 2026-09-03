@@ -10,11 +10,13 @@ from time import perf_counter
 
 from app.hithink.schedule import MARKET_REVIEW_NODE_SEQUENCES, SHANGHAI, ScheduleNode
 from app.hithink.writer import ClickHouseWriter
+from app.market_state_compact import build_market_state_compact_v3
 from app.market_state_package import MarketStatePackageBuilder
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = ROOT / "data" / "market_state_packages"
+FULL_PACKAGE_ROOT = ROOT / "data" / "market_state_packages_full"
 # Public aggregation name retained for status and review-package callers.
 TARGET_NODE_SEQUENCES = MARKET_REVIEW_NODE_SEQUENCES
 
@@ -89,14 +91,30 @@ class MarketAggregationPipeline:
         started = perf_counter()
         self._set_task(node, "market_package", "RUNNING")
         try:
-            package = MarketStatePackageBuilder(self.writer.client).build(
+            builder = MarketStatePackageBuilder(self.writer.client)
+            full_package = builder.build(
                 str(node.trade_date), node.scheduled_time.strftime("%H:%M:%S")
             )
-            if package.get("package_id") != node.collection_id:
+            if full_package.get("package_id") != node.collection_id:
                 raise RuntimeError(
-                    f"package target mismatch: {package.get('package_id')}/{node.collection_id}"
+                    "package target mismatch: "
+                    f"{full_package.get('package_id')}/{node.collection_id}"
                 )
-            package["generated_at"] = datetime.now(SHANGHAI).isoformat()
+            full_package["generated_at"] = datetime.now(SHANGHAI).isoformat()
+            package = build_market_state_compact_v3(full_package, builder)
+
+            full_output_dir = FULL_PACKAGE_ROOT / node.trade_date.strftime("%Y%m%d")
+            full_output_dir.mkdir(parents=True, exist_ok=True)
+            full_output_path = full_output_dir / f"{node.collection_id}.json"
+            full_temporary_path = (
+                full_output_dir / f".{node.collection_id}.{os.getpid()}.tmp"
+            )
+            full_data = json.dumps(
+                full_package, ensure_ascii=False, separators=(",", ":")
+            )
+            full_temporary_path.write_text(full_data, encoding="utf-8")
+            full_temporary_path.replace(full_output_path)
+
             output_dir = self.package_root / node.trade_date.strftime("%Y%m%d")
             output_dir.mkdir(parents=True, exist_ok=True)
             output_path = output_dir / f"{node.collection_id}.json"
