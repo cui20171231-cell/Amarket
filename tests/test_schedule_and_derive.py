@@ -96,6 +96,25 @@ def test_schedule_switches_to_earlier_seconds_without_rewriting_history():
     assert (current[250].scheduled_time - current[249].scheduled_time).total_seconds() == 7
 
 
+def test_closing_auction_nodes_switch_to_second_08_without_rewriting_history():
+    historical = build_daily_schedule(date(2026, 9, 3))
+    current = build_daily_schedule(date(2026, 9, 4))
+
+    assert [
+        node.scheduled_time.timetz().replace(tzinfo=None)
+        for node in historical[250:254]
+    ] == [time(14, 57), time(14, 58), time(14, 59), time(15)]
+    assert [
+        node.scheduled_time.timetz().replace(tzinfo=None)
+        for node in current[250:254]
+    ] == [time(14, 57, 8), time(14, 58, 8), time(14, 59, 8), time(15, 0, 8)]
+    assert (current[250].scheduled_time - current[249].scheduled_time).total_seconds() == 15
+    assert all(
+        (right.scheduled_time - left.scheduled_time).total_seconds() == 60
+        for left, right in pairwise(current[250:254])
+    )
+
+
 def test_limit_pools_run_only_at_meaningful_nodes():
     nodes = build_daily_schedule(date(2026, 8, 27))
     applicable = [node.sequence_no for node in nodes if node.limit_pools_applicable]

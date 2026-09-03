@@ -1975,10 +1975,14 @@ class ClickHouseWriter:
                     133 + dateDiff('minute', toDateTime64(concat(toString(trade_date), ' 13:00:00'), 3, 'Asia/Shanghai'), scheduled_time),
                 (trade_date < toDate('2026-09-02') AND scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:56:55'), 3, 'Asia/Shanghai'))
                     OR (trade_date >= toDate('2026-09-02') AND scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:56:53'), 3, 'Asia/Shanghai')), 250,
-                scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:57:00'), 3, 'Asia/Shanghai'), 251,
-                scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:58:00'), 3, 'Asia/Shanghai'), 252,
-                scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:59:00'), 3, 'Asia/Shanghai'), 253,
-                scheduled_time = toDateTime64(concat(toString(trade_date), ' 15:00:00'), 3, 'Asia/Shanghai'), 254,
+                (trade_date < toDate('2026-09-04') AND scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:57:00'), 3, 'Asia/Shanghai'))
+                    OR (trade_date >= toDate('2026-09-04') AND scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:57:08'), 3, 'Asia/Shanghai')), 251,
+                (trade_date < toDate('2026-09-04') AND scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:58:00'), 3, 'Asia/Shanghai'))
+                    OR (trade_date >= toDate('2026-09-04') AND scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:58:08'), 3, 'Asia/Shanghai')), 252,
+                (trade_date < toDate('2026-09-04') AND scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:59:00'), 3, 'Asia/Shanghai'))
+                    OR (trade_date >= toDate('2026-09-04') AND scheduled_time = toDateTime64(concat(toString(trade_date), ' 14:59:08'), 3, 'Asia/Shanghai')), 253,
+                (trade_date < toDate('2026-09-04') AND scheduled_time = toDateTime64(concat(toString(trade_date), ' 15:00:00'), 3, 'Asia/Shanghai'))
+                    OR (trade_date >= toDate('2026-09-04') AND scheduled_time = toDateTime64(concat(toString(trade_date), ' 15:00:08'), 3, 'Asia/Shanghai')), 254,
                 0
             )
         """

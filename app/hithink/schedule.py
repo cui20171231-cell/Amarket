@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SCHEDULE_V2_EFFECTIVE_DATE = date(2026, 9, 2)
+CLOSING_AUCTION_SECOND_EFFECTIVE_DATE = date(2026, 9, 4)
 
 # Shared fixed axis for 15-minute derivatives and the 19 market review packages.
 MARKET_REVIEW_NODE_SEQUENCES = frozenset(
@@ -55,6 +56,9 @@ def build_daily_schedule(trade_date: date) -> list[ScheduleNode]:
     shifted = trade_date >= SCHEDULE_V2_EFFECTIVE_DATE
     regular_second = 8 if shifted else 15
     pre_close_second = 53 if shifted else 55
+    closing_auction_second = (
+        8 if trade_date >= CLOSING_AUCTION_SECOND_EFFECTIVE_DATE else 0
+    )
     slots: list[tuple[datetime, str]] = []
     slots.extend(
         _every_minute(
@@ -84,10 +88,10 @@ def build_daily_schedule(trade_date: date) -> list[ScheduleNode]:
         (_at(trade_date, value), "auction_close")
         for value in (
             time(14, 56, pre_close_second),
-            time(14, 57),
-            time(14, 58),
-            time(14, 59),
-            time(15),
+            time(14, 57, closing_auction_second),
+            time(14, 58, closing_auction_second),
+            time(14, 59, closing_auction_second),
+            time(15, 0, closing_auction_second),
         )
     )
     nodes = [

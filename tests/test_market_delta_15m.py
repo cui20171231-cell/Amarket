@@ -209,6 +209,15 @@ def test_new_schedule_keeps_the_19_review_nodes_and_closing_base() -> None:
     assert (targets[-1].scheduled_time - targets[-2].scheduled_time).total_seconds() == 892
 
 
+def test_closing_second_08_restores_a_full_15_minute_final_delta() -> None:
+    nodes = build_daily_schedule(date(2026, 9, 4))
+    targets = [node for node in nodes if node.sequence_no in TARGET_NODE_SEQUENCES]
+
+    assert targets[-2].scheduled_time.timetz().replace(tzinfo=None) == time(14, 45, 8)
+    assert targets[-1].scheduled_time.timetz().replace(tzinfo=None) == time(15, 0, 8)
+    assert (targets[-1].scheduled_time - targets[-2].scheduled_time).total_seconds() == 900
+
+
 def test_all_delta_fields_are_nullable_in_the_ddl() -> None:
     ddl = Path("sql/hithink_snapshot.sql").read_text(encoding="utf-8")
     table_ddl = ddl.split(
