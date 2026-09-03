@@ -9,6 +9,7 @@ from pathlib import Path
 from time import perf_counter, sleep
 
 from app.hithink.api import HithinkClient
+from app.hithink.auction_collector import AuctionCollectorRunner
 from app.hithink.concurrent_api_test import ConcurrentApiTester, print_report
 from app.hithink.config import Settings
 from app.hithink.daily_pipeline import DailyPipeline
@@ -85,6 +86,25 @@ def _run_daily_collection_with_fresh_connection(
         DailyPipeline(api, writer).run_pipeline(trade_date, initialize=initialize)
         status = writer.daily_status(trade_date, "daily_collection")
         return status in {"SUCCESS", "SKIPPED"}
+    finally:
+        api.close()
+        writer.close()
+
+
+def _run_auction_collection_with_fresh_connection(
+    settings: Settings, trade_date: object
+) -> None:
+    """Run opening-auction collection inside the resident service with isolated clients."""
+    writer = ClickHouseWriter(
+        settings.clickhouse_host,
+        settings.clickhouse_port,
+        settings.clickhouse_database,
+        settings.clickhouse_username,
+        settings.clickhouse_password,
+    )
+    api = HithinkClient(settings.api_key)
+    try:
+        AuctionCollectorRunner(api, writer).run_day(trade_date)
     finally:
         api.close()
         writer.close()
@@ -252,7 +272,7 @@ def main() -> None:
         service_lock.acquire()
         COLLECTOR_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
         COLLECTOR_PID_PATH.write_text(str(os.getpid()), encoding="ascii")
-        LOG.info("STARTUP_LOCK acquired pid=%s", os.getpid())
+        LOG.info("STARTUP_LOCK service=%s pid=%s", args.command, os.getpid())
 
     settings = Settings.load()
     writer = (
@@ -399,6 +419,11 @@ def main() -> None:
                         writer,
                         daily_collection_job=lambda trade_date: (
                             _run_daily_collection_with_fresh_connection(
+                                settings, trade_date
+                            )
+                        ),
+                        auction_collection_job=lambda trade_date: (
+                            _run_auction_collection_with_fresh_connection(
                                 settings, trade_date
                             )
                         ),

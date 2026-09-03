@@ -136,3 +136,14 @@ def test_daily_worker_retries_once_per_minute_fifteen_times(
     assert len(calls) == 16
     assert pauses == [60] * 15
     assert current["value"] == datetime(2026, 8, 31, 16, 15, tzinfo=SHANGHAI)
+
+
+def test_auction_worker_runs_through_the_resident_collector() -> None:
+    trade_date = date(2026, 9, 4)
+    calls: list[date] = []
+    runner = object.__new__(CollectorRunner)
+    runner.auction_collection_job = lambda value: calls.append(value)
+
+    runner._execute_auction_collection(trade_date)
+
+    assert calls == [trade_date]

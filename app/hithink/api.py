@@ -18,6 +18,8 @@ URL = "https://fuyao.aicubes.cn/api/a-share/prices/snapshot?limit=10000&offset=0
 TRADING_DAYS_URL = "https://fuyao.aicubes.cn/api/a-share/calendar/trading-days"
 LIMIT_POOL_URL = "https://fuyao.aicubes.cn/api/a-share/special-data/{pool_name}"
 SECTOR_INDEX_SNAPSHOT_URL = "https://fuyao.aicubes.cn/api/a-share-index/prices/snapshot"
+AUCTION_SNAPSHOT_URL = "https://fuyao.aicubes.cn/api/a-share/auction/snapshot"
+AUCTION_SNAPSHOT_MAX_CODES = 100
 DUMP_URLS = {
     "daily_k": "https://fuyao.aicubes.cn/api/dump/market-dumps/daily-k/download-url",
     "daily_k_10d": "https://fuyao.aicubes.cn/api/dump/market-dumps/daily-k-10d/download-url",
@@ -98,6 +100,23 @@ class ApiSnapshot:
     source_time: datetime
     total: int
     items: list[dict[str, Any]]
+    duration_ms: int
+    retry_count: int
+
+
+@dataclass(frozen=True)
+class AuctionApiSnapshot:
+    code: int
+    message: str
+    request_id: str
+    source_timestamp: int
+    source_time: datetime
+    auction_phase: str
+    data_status: str
+    total: int
+    items: list[dict[str, Any]]
+    request_started_at: datetime
+    request_ended_at: datetime
     duration_ms: int
     retry_count: int
 
@@ -408,6 +427,86 @@ class HithinkClient:
                 )
             except (httpx.HTTPError, ValueError, KeyError, HithinkApiError) as exc:
                 error = exc if isinstance(exc, HithinkApiError) else HithinkApiError(None, str(exc))
+                error.retry_index = max(error.retry_index, attempt)
+                last_error = error
+                if error.code not in RETRYABLE_CODES and error.code is not None:
+                    break
+        assert last_error is not None
+        raise last_error
+
+    def fetch_auction_snapshot(
+        self,
+        thscodes: list[str],
+        stage: str,
+        *,
+        deadline: float | None = None,
+        rate_limit_deadline: float | None = None,
+        allow_retries: bool = True,
+    ) -> AuctionApiSnapshot:
+        codes = list(dict.fromkeys(str(code).strip().upper() for code in thscodes))
+        if not codes:
+            raise ValueError("Auction snapshot requires at least one thscode")
+        if len(codes) > AUCTION_SNAPSHOT_MAX_CODES:
+            raise ValueError(
+                f"Auction snapshot accepts at most {AUCTION_SNAPSHOT_MAX_CODES} thscodes"
+            )
+        if stage not in {"live", "final"}:
+            raise ValueError(f"Unsupported auction stage: {stage}")
+
+        last_error: HithinkApiError | None = None
+        retry_pauses = RETRY_PAUSES_SECONDS if allow_retries else (0.0,)
+        for attempt, pause_seconds in enumerate(retry_pauses):
+            self._sleep_before_retry(pause_seconds, "auction_snapshot", deadline)
+            started = perf_counter()
+            request_started_at = datetime.now(SHANGHAI)
+            try:
+                response, payload, rate_retries = self._request_json(
+                    "auction_snapshot",
+                    AUCTION_SNAPSHOT_URL,
+                    deadline=deadline,
+                    rate_limit_deadline=rate_limit_deadline,
+                    allow_retries=allow_retries,
+                    params={"thscodes": ",".join(codes), "stage": stage},
+                )
+                request_ended_at = datetime.now(SHANGHAI)
+                code = int(payload.get("code", response.status_code))
+                if response.status_code >= 400 or code != 0:
+                    raise HithinkApiError(
+                        code,
+                        str(payload.get("message", response.text[:300])),
+                    )
+                data = payload.get("data") or {}
+                items = data.get("item") or []
+                total = int(data.get("total", -1))
+                returned_codes = [str(item.get("thscode", "")).upper() for item in items]
+                if total != len(items) or returned_codes != codes:
+                    raise HithinkApiError(
+                        code,
+                        "Auction snapshot response does not match requested thscodes: "
+                        f"requested={len(codes)} total={total} items={len(items)}",
+                    )
+                timestamp = int(data["timestamp"])
+                return AuctionApiSnapshot(
+                    code=code,
+                    message=str(payload.get("message", "")),
+                    request_id=str(payload.get("request_id", "")),
+                    source_timestamp=timestamp,
+                    source_time=datetime.fromtimestamp(timestamp / 1000, tz=SHANGHAI),
+                    auction_phase=str(data.get("auction_phase", "")),
+                    data_status=str(data.get("data_status", "")),
+                    total=total,
+                    items=items,
+                    request_started_at=request_started_at,
+                    request_ended_at=request_ended_at,
+                    duration_ms=round((perf_counter() - started) * 1000),
+                    retry_count=attempt + rate_retries,
+                )
+            except (httpx.HTTPError, ValueError, KeyError, HithinkApiError) as exc:
+                error = (
+                    exc
+                    if isinstance(exc, HithinkApiError)
+                    else HithinkApiError(None, str(exc))
+                )
                 error.retry_index = max(error.retry_index, attempt)
                 last_error = error
                 if error.code not in RETRYABLE_CODES and error.code is not None:

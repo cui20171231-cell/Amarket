@@ -16,6 +16,7 @@
 
 - `market.hithink_snapshot_schedule`：交易日固定 254 个计划节点和执行状态。
 - `market.hithink_snapshot_raw`：同花顺全市场原始快照。
+- `market.hithink_auction_snapshot`：交易日09:15:00—09:25:00的全A集合竞价原始快照。
 - `market.hithink_snapshot_derived`：个股一分钟派生数据。
 - `market.hithink_limit_up_pool`：每个采集节点的官方涨停池。
 - `market.hithink_limit_down_pool`：每个采集节点的官方跌停池。
@@ -68,6 +69,8 @@ Windows 计划任务名：
 ```text
 HithinkSnapshotCollector
 ```
+
+集合竞价采集已并入 `HithinkSnapshotCollector`，使用内部独立执行通道。交易日从09:15:00到09:25:00按整数分钟采集11张全A集合竞价快照，不使用08秒延迟。08:50先申请一次当天全A名单，09:13:50重新申请并以新名单为准；重新申请失败时使用上一交易日收盘名单。09:15—09:24请求实时阶段，09:25请求终态，结果写入 `market.hithink_auction_snapshot`。
 
 N100 开机后服务自动启动并持续在线。每天 08:50 刷新同花顺交易日历：
 

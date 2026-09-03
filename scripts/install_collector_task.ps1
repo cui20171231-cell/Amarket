@@ -16,7 +16,7 @@ if ($null -ne $existingTask) {
 # This exact command-line match excludes the daily-K, sector, and Tencent jobs.
 $collectorProcesses = Get-CimInstance Win32_Process | Where-Object {
     $_.Name -in @('py.exe', 'python.exe', 'pythonw.exe') -and
-    $_.CommandLine -match 'app\.hithink\.cli\s+serve'
+    $_.CommandLine -match 'app\.hithink\.cli\s+serve(?:\s|$)'
 } | Sort-Object { if ($_.Name -eq 'py.exe') { 1 } else { 0 } }
 foreach ($collectorProcess in $collectorProcesses) {
     Stop-Process -Id $collectorProcess.ProcessId -Force -ErrorAction SilentlyContinue

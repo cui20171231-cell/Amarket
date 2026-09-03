@@ -8,6 +8,7 @@ from app.hithink.writer import ClickHouseWriter
 
 COLLECTION_ID_TABLES = {
     "hithink_adjustment_events",
+    "hithink_auction_snapshot",
     "hithink_concept_state",
     "hithink_core_sector_candidate",
     "hithink_core_stock_candidate",
@@ -29,6 +30,7 @@ COLLECTION_ID_TABLES = {
 }
 
 A_TABLES = {
+    "hithink_auction_snapshot",
     "hithink_snapshot_raw",
     "hithink_sector_index_snapshot",
     "hithink_limit_up_pool",
@@ -60,6 +62,7 @@ B_TABLES = {
 B2_TABLES = {"hithink_daily_k_forward"}
 
 CLOSING_254_CONSTRAINTS = {
+    "hithink_auction_snapshot": "ck_auction_snapshot_closing_254",
     "hithink_snapshot_raw": "ck_snapshot_raw_closing_254",
     "hithink_sector_index_snapshot": "ck_sector_index_closing_254",
     "hithink_limit_up_pool": "ck_limit_up_closing_254",
@@ -101,8 +104,9 @@ def test_all_business_tables_have_one_fixed_classification() -> None:
         assert document.count(f"`market.{table}`") == 1
 
 
-def test_a_class_is_exactly_the_five_intraday_raw_tables() -> None:
+def test_a_class_is_exactly_the_six_intraday_raw_tables() -> None:
     assert A_TABLES == {
+        "hithink_auction_snapshot",
         "hithink_snapshot_raw",
         "hithink_sector_index_snapshot",
         "hithink_limit_up_pool",

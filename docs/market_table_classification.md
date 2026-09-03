@@ -15,11 +15,12 @@
 
 ### A类：盘中原始采集表
 
-正常交易日按001—254节点采集，保存外部接口返回的原始事实，共5张：
+正常交易日按各自固定节点采集，保存外部接口返回的原始事实，共6张：
 
 | 表 | 内容 |
 |---|---|
 | `market.hithink_snapshot_raw` | 全A行情快照 |
+| `market.hithink_auction_snapshot` | 09:15:00—09:25:00全A集合竞价快照 |
 | `market.hithink_sector_index_snapshot` | 板块指数快照 |
 | `market.hithink_limit_up_pool` | 涨停池 |
 | `market.hithink_limit_down_pool` | 跌停池 |
@@ -105,7 +106,7 @@ node_seq UInt16 MATERIALIZED toUInt16(substring(toString(collection_id), 9, 3))
 
 `node_seq = 254` 是15:00正式收盘节点，A类和B类表都禁止用此前节点冒充。
 
-A类5张表统一满足：
+A类中使用254号收盘节点的表统一满足：
 
 1. `scheduled_time` 自2026-09-04起必须是所属交易日15:00:08；更早历史保持15:00:00。
 2. `ingest_time` 必须不早于该交易日的正式收盘计划时间，证明该行是在收盘节点到达后落库。

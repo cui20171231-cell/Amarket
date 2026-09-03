@@ -1,6 +1,6 @@
 # A-market 整机灾难恢复手册
 
-更新日期：2026-09-02（北京时间）
+更新日期：2026-09-03（北京时间）
 
 ## 先说结论
 
@@ -11,7 +11,7 @@ Git 仓库不能保存密码、接口密钥和不断增长的历史行情数据�
 2026-09-02 的现场检查结果：
 
 - 代码和数据库结构可以由仓库重建；
-- 当前业务库共有 26 张表，其中 25 张正式表都已写入 `sql/hithink_snapshot.sql`；多出的旧表 `hithink_auction_snapshot` 为空，不属于当前运行链路；
+- `hithink_auction_snapshot` 已纳入正式结构，并由主采集服务内部执行集合竞价采集；
 - 当前业务库约 12,818,111 行、761,899,376 字节；
 - 本机已有一个 1,606,673,359 字节的数据库归档，但它位于 `D:\Amarket\.runtime`，与项目在同一块硬盘，不能算灾难备份；
 - 本机没有发现可用于保存完整数据备份的第二块物理硬盘；因此历史数据的异机备份目前仍未达标。
@@ -48,13 +48,13 @@ Git 仓库不能保存密码、接口密钥和不断增长的历史行情数据�
 | 名称 | 身份 | 作用 | 仓库内恢复入口 |
 |---|---|---|---|
 | `AmarketLinuxInfrastructure` | 当前 Windows 用户，最高权限、无需登录 | 启动 Ubuntu、Docker 和数据库看护 | `scripts/bootstrap_linux_infrastructure.ps1` |
-| `HithinkSnapshotCollector` | `SYSTEM` | 常驻采集、派生和聚合 | `scripts/install_collector_task.ps1` |
+| `HithinkSnapshotCollector` | `SYSTEM` | 常驻采集、集合竞价、派生和聚合 | `scripts/install_collector_task.ps1` |
 | `MarketOSStatus-TrayIcons` | 当前登录用户，最高权限 | 桌面状态图标 | `scripts/install_tray_task.ps1` |
 | `MarketOS-Gateway` | `SYSTEM`，按需 | 本机人工智能读取网关 | `INSTALL_AI_GATEWAY.cmd` 和 `scripts/install_gateway_tasks.ps1` |
 | `MarketOS-Tunnel` | `SYSTEM`，按需 | 外部安全通道 | `scripts/install_gateway_tasks.ps1` |
 | `AmarketEmailNotifier` | `SYSTEM`，按需 | 独立邮件告警 | `scripts/configure_email_notifications.ps1` |
 
-`HithinkDailyPipeline` 和 `HithinkSectorMapping` 不应单独安装；它们已经由主采集服务内部调度。测试和一次性核对任务不属于正式恢复范围。
+集合竞价、`HithinkDailyPipeline` 和 `HithinkSectorMapping` 都不应单独安装；它们已经由主采集服务内部调度。测试和一次性核对任务不属于正式恢复范围。
 
 ## 固定的软件版本
 

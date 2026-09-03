@@ -9,7 +9,7 @@ from typing import Any
 
 import clickhouse_connect
 
-from app.hithink.api import LimitPoolSnapshot, SectorIndexSnapshot
+from app.hithink.api import AuctionApiSnapshot, LimitPoolSnapshot, SectorIndexSnapshot
 from app.hithink.models import DerivedSnapshot, RawSnapshot
 from app.hithink.schedule import ScheduleNode
 
@@ -31,6 +31,7 @@ DAILY_TASKS = (
     "hithink_adjustment_events_sync",
 )
 SECTOR_INDEX = "market.hithink_sector_index_snapshot"
+AUCTION_SNAPSHOT = "market.hithink_auction_snapshot"
 SECTOR_STATES = {
     "concept": "market.hithink_concept_state",
     "industry": "market.hithink_industry_state",
@@ -556,6 +557,110 @@ class ClickHouseWriter:
 
     def insert_raw_once(self, rows: list[RawSnapshot]) -> tuple[int, int]:
         return self._insert_once(RAW, rows, [field for field in RawSnapshot.__dataclass_fields__])
+
+    def latest_all_a_codes_before(self, trade_date: object) -> list[str]:
+        result = self.client.query(
+            f"""
+            SELECT DISTINCT thscode
+            FROM {RAW} FINAL
+            WHERE trade_date =
+            (
+                SELECT max(trade_date)
+                FROM {RAW} FINAL
+                WHERE trade_date < {{trade_date:Date}}
+            )
+            ORDER BY thscode
+            """,
+            parameters={"trade_date": trade_date},
+        )
+        return [str(row[0]) for row in result.result_rows]
+
+    def auction_snapshot_count(self, collection_id: str) -> int:
+        return self._scalar(
+            f"SELECT count() FROM {AUCTION_SNAPSHOT} FINAL "
+            "WHERE collection_id = {collection_id:String}",
+            {"collection_id": collection_id},
+        )
+
+    def insert_auction_snapshot_once(
+        self,
+        node: ScheduleNode,
+        snapshots: list[AuctionApiSnapshot],
+        *,
+        batch_id: str,
+        status: str,
+        raw_completed_at: datetime,
+        total_duration_ms: int,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> tuple[int, int]:
+        row_count = sum(snapshot.total for snapshot in snapshots)
+        rows: list[tuple[Any, ...]] = []
+        for snapshot in snapshots:
+            for item in snapshot.items:
+                rows.append(
+                    (
+                        node.trade_date,
+                        node.collection_id,
+                        node.scheduled_time,
+                        snapshot.source_timestamp,
+                        snapshot.source_time,
+                        node.session,
+                        status,
+                        batch_id,
+                        snapshot.request_started_at,
+                        snapshot.request_ended_at,
+                        raw_completed_at,
+                        snapshot.code,
+                        snapshot.message,
+                        snapshot.request_id,
+                        snapshot.auction_phase,
+                        snapshot.data_status,
+                        snapshot.total,
+                        snapshot.total,
+                        snapshot.duration_ms,
+                        row_count,
+                        None,
+                        total_duration_ms,
+                        snapshot.retry_count,
+                        error_code,
+                        error_message,
+                        str(item["thscode"]),
+                        str(item["ticker"]),
+                        str(item.get("name") or ""),
+                        _optional_float(item.get("auction_price")),
+                        _optional_float(item.get("auction_pct")),
+                        _optional_int(item.get("auction_volume")),
+                        _optional_float(item.get("auction_amount")),
+                        _optional_int(item.get("auction_unmatched")),
+                        _optional_float(item.get("auction_turnover_pct")),
+                        _optional_float(item.get("auction_yesterday_ratio_pct")),
+                        _optional_float(item.get("auction_volume_ratio")),
+                        _optional_float(item.get("pre_close_price")),
+                        _optional_float(item.get("open_price")),
+                        _optional_float(item.get("last_price")),
+                        _optional_float(item.get("float_market_cap")),
+                    )
+                )
+        columns = [
+            "trade_date", "collection_id", "scheduled_time", "source_timestamp",
+            "source_time", "session", "status", "batch_id", "request_start_time",
+            "request_end_time", "raw_completed_at", "api_code", "api_message",
+            "request_id", "auction_phase", "data_status", "api_total",
+            "received_count", "api_duration_ms", "raw_insert_count", "raw_insert_ms",
+            "total_duration_ms", "retry_count", "error_code", "error_message",
+            "thscode", "ticker", "name", "auction_price", "auction_pct",
+            "auction_volume", "auction_amount", "auction_unmatched",
+            "auction_turnover_pct", "auction_yesterday_ratio_pct",
+            "auction_volume_ratio", "pre_close_price", "open_price", "last_price",
+            "float_market_cap",
+        ]
+        return self._insert_once(
+            AUCTION_SNAPSHOT,
+            rows,
+            columns,
+            batch_id=batch_id,
+        )
 
     def insert_derived_once(self, rows: list[DerivedSnapshot]) -> tuple[int, int]:
         flattened = [

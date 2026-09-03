@@ -1415,3 +1415,64 @@ ALTER TABLE market.hithink_industry_state DROP CONSTRAINT IF EXISTS ck_industry_
 ALTER TABLE market.hithink_industry_state ADD CONSTRAINT IF NOT EXISTS ck_industry_state_closing_254 CHECK node_seq != 254 OR (toDate(scheduled_time) = trade_date AND toHour(scheduled_time) = 15 AND toMinute(scheduled_time) = 0 AND ((trade_date < toDate('2026-09-04') AND toSecond(scheduled_time) = 0) OR (trade_date >= toDate('2026-09-04') AND toSecond(scheduled_time) = 8)) AND stock_source_time >= scheduled_time - INTERVAL 60 SECOND AND index_source_time IS NOT NULL AND index_source_time >= scheduled_time - INTERVAL 60 SECOND AND calculated_at >= scheduled_time);
 ALTER TABLE market.hithink_style_state DROP CONSTRAINT IF EXISTS ck_style_state_closing_254;
 ALTER TABLE market.hithink_style_state ADD CONSTRAINT IF NOT EXISTS ck_style_state_closing_254 CHECK node_seq != 254 OR (toDate(scheduled_time) = trade_date AND toHour(scheduled_time) = 15 AND toMinute(scheduled_time) = 0 AND ((trade_date < toDate('2026-09-04') AND toSecond(scheduled_time) = 0) OR (trade_date >= toDate('2026-09-04') AND toSecond(scheduled_time) = 8)) AND stock_source_time >= scheduled_time - INTERVAL 60 SECOND AND index_source_time IS NOT NULL AND index_source_time >= scheduled_time - INTERVAL 60 SECOND AND calculated_at >= scheduled_time);
+
+CREATE TABLE IF NOT EXISTS market.hithink_auction_snapshot
+(
+    trade_date Date,
+    collection_id FixedString(11),
+    node_seq UInt16 MATERIALIZED toUInt16(substring(toString(collection_id), 9, 3)),
+    scheduled_time DateTime64(3, 'Asia/Shanghai'),
+    source_timestamp UInt64,
+    source_time DateTime64(3, 'Asia/Shanghai'),
+    session LowCardinality(String),
+    auction_period LowCardinality(String) MATERIALIZED if(node_seq <= 11, '早盘竞价', '尾盘竞价'),
+    status LowCardinality(String) DEFAULT 'PENDING',
+    batch_id String,
+    request_start_time Nullable(DateTime64(3, 'Asia/Shanghai')),
+    request_end_time Nullable(DateTime64(3, 'Asia/Shanghai')),
+    raw_completed_at Nullable(DateTime64(3, 'Asia/Shanghai')),
+    api_code Int32,
+    api_message String,
+    request_id String,
+    auction_phase LowCardinality(String),
+    data_status LowCardinality(String),
+    api_total UInt32,
+    received_count Nullable(UInt32),
+    api_duration_ms Nullable(UInt32),
+    raw_insert_count Nullable(UInt32),
+    raw_insert_ms Nullable(UInt32),
+    total_duration_ms Nullable(UInt32),
+    retry_count UInt8 DEFAULT 0,
+    error_code Nullable(String),
+    error_message Nullable(String),
+    thscode LowCardinality(String),
+    ticker FixedString(6),
+    name String,
+    auction_price Nullable(Float64),
+    auction_pct Nullable(Float64),
+    auction_volume Nullable(UInt64),
+    auction_amount Nullable(Float64),
+    auction_unmatched Nullable(Int64),
+    auction_turnover_pct Nullable(Float64),
+    auction_yesterday_ratio_pct Nullable(Float64),
+    auction_volume_ratio Nullable(Float64),
+    pre_close_price Nullable(Float64),
+    open_price Nullable(Float64),
+    last_price Nullable(Float64),
+    float_market_cap Nullable(Float64),
+    ingest_time DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3),
+    version_time DateTime64(6, 'Asia/Shanghai') DEFAULT now64(6),
+    updated_at DateTime64(6, 'Asia/Shanghai') DEFAULT now64(6),
+    CONSTRAINT ck_auction_collection_digits CHECK match(toString(collection_id), '^[0-9]{11}$'),
+    CONSTRAINT ck_auction_collection_date CHECK substring(toString(collection_id), 1, 8) = formatDateTime(trade_date, '%Y%m%d'),
+    CONSTRAINT ck_auction_scheduled_date CHECK toDate(scheduled_time) = trade_date,
+    CONSTRAINT ck_auction_snapshot_node_seq CHECK node_seq BETWEEN 1 AND 11 OR node_seq BETWEEN 251 AND 254,
+    CONSTRAINT ck_auction_snapshot_closing_254 CHECK node_seq != 254 OR (toHour(scheduled_time) = 15 AND toMinute(scheduled_time) = 0 AND ((trade_date < toDate('2026-09-04') AND toSecond(scheduled_time) = 0) OR (trade_date >= toDate('2026-09-04') AND toSecond(scheduled_time) = 8)))
+)
+ENGINE = ReplacingMergeTree(version_time)
+PARTITION BY toYYYYMM(trade_date)
+ORDER BY (trade_date, collection_id, thscode);
+
+ALTER TABLE market.hithink_auction_snapshot ADD COLUMN IF NOT EXISTS node_seq UInt16 MATERIALIZED toUInt16(substring(toString(collection_id), 9, 3)) AFTER collection_id;
+ALTER TABLE market.hithink_auction_snapshot DROP CONSTRAINT IF EXISTS ck_auction_snapshot_closing_254;
+ALTER TABLE market.hithink_auction_snapshot ADD CONSTRAINT IF NOT EXISTS ck_auction_snapshot_closing_254 CHECK node_seq != 254 OR (toHour(scheduled_time) = 15 AND toMinute(scheduled_time) = 0 AND ((trade_date < toDate('2026-09-04') AND toSecond(scheduled_time) = 0) OR (trade_date >= toDate('2026-09-04') AND toSecond(scheduled_time) = 8)));

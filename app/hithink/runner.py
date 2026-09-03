@@ -34,6 +34,7 @@ CLOSE_COMPLETENESS_CHECK_TIME = time(16, 20)
 SECTOR_MAPPING_DEADLINE_TIME = time(9, 10)
 
 DailyCollectionJob = Callable[[date], bool]
+AuctionCollectionJob = Callable[[date], None]
 HealthProbe = Callable[[date], dict[str, object]]
 
 
@@ -63,6 +64,7 @@ class CollectorRunner:
         writer: ClickHouseWriter,
         *,
         daily_collection_job: DailyCollectionJob | None = None,
+        auction_collection_job: AuctionCollectionJob | None = None,
         health_probe: HealthProbe | None = None,
     ):
         self.api = api
@@ -75,7 +77,10 @@ class CollectorRunner:
         self.sector_mapping = SectorMappingSync(api, writer)
         self.daily_pipeline = DailyPipeline(api, writer)
         self.daily_collection_job = daily_collection_job
+        self.auction_collection_job = auction_collection_job
         self.health_probe = health_probe
+        self._auction_thread_lock = Lock()
+        self._auction_threads: dict[date, Thread] = {}
         self._daily_thread_lock = Lock()
         self._daily_threads: dict[date, Thread] = {}
         self._monitor_thread_lock = Lock()
@@ -194,6 +199,7 @@ class CollectorRunner:
                     nodes[0].scheduled_time,
                     nodes[-1].scheduled_time,
                 )
+                self._start_auction_collection_worker(prepared_date)
                 self._start_daily_collection_worker(prepared_date)
                 self._start_day_monitor(prepared_date)
                 if not should_run_mapping_after_confirmation(
@@ -237,6 +243,32 @@ class CollectorRunner:
         except Exception:
             # Mapping failure must not terminate or restart the 254-node collector.
             LOG.exception("SECTOR_MAPPING_FAILED; intraday collector will continue")
+
+    def _start_auction_collection_worker(self, trade_date: date) -> None:
+        if self.auction_collection_job is None:
+            return
+        with self._auction_thread_lock:
+            existing = self._auction_threads.get(trade_date)
+            if existing is not None and existing.is_alive():
+                return
+            worker = Thread(
+                target=self._execute_auction_collection,
+                args=(trade_date,),
+                name=f"auction-collection-{trade_date:%Y%m%d}",
+                daemon=True,
+            )
+            self._auction_threads[trade_date] = worker
+            worker.start()
+
+    def _execute_auction_collection(self, trade_date: date) -> None:
+        try:
+            if self.auction_collection_job is not None:
+                self.auction_collection_job(trade_date)
+        except Exception:
+            LOG.exception(
+                "AUCTION_COLLECTION_JOB_FAILED date=%s; intraday collector will continue",
+                trade_date,
+            )
 
     def _run_daily_collection(self, trade_date: object) -> bool:
         try:
