@@ -107,3 +107,32 @@ def test_daily_worker_can_run_while_closing_node_is_still_retrying(
     runner._daily_collection_retry_loop(trade_date, run_immediately=True)
 
     assert calls == [trade_date]
+
+
+def test_daily_worker_retries_once_per_minute_fifteen_times(
+    monkeypatch,
+) -> None:
+    trade_date = date(2026, 8, 31)
+    calls: list[date] = []
+    pauses: list[float] = []
+    current = {"value": datetime(2026, 8, 31, 16, 0, tzinfo=SHANGHAI)}
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current["value"]
+
+    def advance(seconds: float) -> None:
+        pauses.append(seconds)
+        current["value"] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(runner_module, "datetime", FixedDateTime)
+    monkeypatch.setattr(runner_module, "sleep", advance)
+    runner = object.__new__(CollectorRunner)
+    runner.daily_collection_job = lambda value: calls.append(value) or False
+
+    runner._daily_collection_retry_loop(trade_date, run_immediately=True)
+
+    assert len(calls) == 16
+    assert pauses == [60] * 15
+    assert current["value"] == datetime(2026, 8, 31, 16, 15, tzinfo=SHANGHAI)

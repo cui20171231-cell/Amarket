@@ -27,8 +27,10 @@ CLOSING_NODE_RETRY_SECONDS = 60
 CLOSING_NODE_RETRY_CUTOFF_TIME = time(16, 0)
 COLLECTOR_PREPARE_TIME = time(8, 50)
 DAILY_COLLECTION_TIME = time(16, 0)
-DAILY_RETRY_DEADLINE_TIME = time(8, 30)
-DAILY_RETRY_SECONDS = 600
+DAILY_RETRY_DEADLINE_TIME = time(16, 15)
+DAILY_RETRY_SECONDS = 60
+DAILY_MAX_RETRIES = 15
+CLOSE_COMPLETENESS_CHECK_TIME = time(16, 20)
 SECTOR_MAPPING_DEADLINE_TIME = time(9, 10)
 
 DailyCollectionJob = Callable[[date], bool]
@@ -165,7 +167,6 @@ class CollectorRunner:
     def serve_forever(self) -> None:
         startup_now = datetime.now(SHANGHAI)
         prepared_date = None
-        self._start_previous_daily_catchup(startup_now)
         while True:
             now = datetime.now(SHANGHAI)
             if prepared_date == now.date():
@@ -298,7 +299,7 @@ class CollectorRunner:
             trade_date, DAILY_COLLECTION_TIME, tzinfo=SHANGHAI
         )
         retry_deadline = datetime.combine(
-            trade_date + timedelta(days=1),
+            trade_date,
             DAILY_RETRY_DEADLINE_TIME,
             tzinfo=SHANGHAI,
         )
@@ -306,32 +307,24 @@ class CollectorRunner:
         if not run_immediately and now < scheduled_at:
             sleep(max(1.0, (scheduled_at - now).total_seconds()))
 
+        retry_count = 0
         while datetime.now(SHANGHAI) <= retry_deadline:
             if self._execute_daily_collection(trade_date):
                 return
+            if retry_count >= DAILY_MAX_RETRIES:
+                break
             now = datetime.now(SHANGHAI)
             if now >= retry_deadline:
                 break
-            if now >= datetime.combine(
-                trade_date, time(16, 30), tzinfo=SHANGHAI
-            ):
-                LOG.critical(
-                    "CHECKPOINT_ALERT date=%s time=16:30 daily-K has not succeeded",
-                    trade_date,
-                )
+            retry_count += 1
             sleep(min(DAILY_RETRY_SECONDS, (retry_deadline - now).total_seconds()))
 
         LOG.critical(
-            "DAILY_COLLECTION_DEADLINE_EXCEEDED date=%s deadline=%s",
+            "DAILY_COLLECTION_DEADLINE_EXCEEDED date=%s retries=%s deadline=%s",
             trade_date,
+            retry_count,
             retry_deadline,
         )
-
-    def _start_previous_daily_catchup(self, startup_now: datetime) -> None:
-        if startup_now.time() > DAILY_RETRY_DEADLINE_TIME:
-            return
-        previous_date = startup_now.date() - timedelta(days=1)
-        self._start_daily_collection_worker(previous_date, run_immediately=True)
 
     def _mark_non_trading_day_skipped(self, trade_date: date) -> None:
         for task_name in (
@@ -426,8 +419,8 @@ class CollectorRunner:
                 "16:00日K尚未开始或已经失败",
             ),
             (
-                time(16, 30),
-                "16:30",
+                CLOSE_COMPLETENESS_CHECK_TIME,
+                "16:20",
                 lambda state: state.get("daily_collection_status") == "SUCCESS",
                 "16:00日K尚未成功",
             ),

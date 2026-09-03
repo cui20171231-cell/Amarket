@@ -38,6 +38,7 @@ STATE_PATH = Path(
 )
 LOG_PATH = ROOT / "data" / "logs" / "email_notifier.log"
 COLLECTOR_PID_PATH = ROOT / "data" / "hithink_snapshot_collector.pid"
+CLOSE_SUMMARY_TIME = time(16, 20)
 LOG = logging.getLogger(__name__)
 
 
@@ -304,9 +305,9 @@ def _issues(report: dict[str, Any], now: datetime) -> dict[str, str]:
             f"第254号收盘节点状态为{_status_text(closing.get('status'))}。"
         )
     daily = _daily_statuses(report)
-    if now.time() >= time(16, 30) and daily.get("daily_collection") != "SUCCESS":
+    if now.time() >= CLOSE_SUMMARY_TIME and daily.get("daily_collection") != "SUCCESS":
         issues[f"DAILY_K_FAILED:{report_date}"] = (
-            "16点日K任务尚未成功，系统应继续自动重试。"
+            "16点日K任务在16:15结束重试后仍未成功。"
         )
     intraday = report.get("intraday", {})
     if now.time() >= time(15, 5) and any(
@@ -369,7 +370,7 @@ def monitor_once(
         }
         if now.time() >= time(8, 55):
             state.setdefault("morning_dates", []).append(today)
-        if now.time() >= time(16, 30):
+        if now.time() >= CLOSE_SUMMARY_TIME:
             state.setdefault("close_dates", []).append(today)
         _save_state(state, state_path)
         return sent
@@ -437,7 +438,7 @@ def monitor_once(
 
     close_dates = state.setdefault("close_dates", [])
     if (
-        now.time() >= time(16, 30)
+        now.time() >= CLOSE_SUMMARY_TIME
         and _trading_day(report) is True
         and today not in close_dates
     ):

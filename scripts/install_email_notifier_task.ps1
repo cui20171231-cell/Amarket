@@ -34,7 +34,7 @@ Register-ScheduledTask `
     -Trigger @($bootTrigger, $repeatTrigger) `
     -Settings $taskSettings `
     -Principal $taskPrincipal `
-    -Description 'Independent Amarket health checks, recovery messages, 08:55 confirmation and 16:30 close summary by email.' `
+    -Description 'Independent Amarket health checks, recovery messages, 08:55 confirmation and 16:20 close summary by email.' `
     -Force | Out-Null
 Start-ScheduledTask -TaskName $taskName
 Start-Sleep -Seconds 3

@@ -85,6 +85,25 @@ def test_first_monitor_run_seeds_state_without_historical_email(tmp_path: Path) 
     assert state_path.exists()
 
 
+def test_close_summary_moves_to_1620(tmp_path: Path) -> None:
+    sent: list[tuple[str, str]] = []
+    state_path = tmp_path / "state.json"
+    send = lambda subject, body: sent.append((subject, body))
+    before = datetime(2026, 9, 1, 16, 19, tzinfo=SHANGHAI)
+
+    monitor_once(now=before, report=_report(), state_path=state_path, send=send)
+    assert sent == []
+
+    monitor_once(
+        now=before.replace(minute=20),
+        report=_report(),
+        state_path=state_path,
+        send=send,
+    )
+
+    assert any("[收盘汇总]" in subject for subject, _ in sent)
+
+
 def test_new_issue_alerts_after_two_checks_and_then_recovers(
     tmp_path: Path, monkeypatch
 ) -> None:
