@@ -24,6 +24,7 @@ LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
 ACTIVE_NODE_PATH = ROOT / ".runtime" / "hithink_snapshot_active_node.json"
 CLOSING_NODE_RETRY_SECONDS = 60
+CLOSING_NODE_RETRY_CUTOFF_TIME = time(8, 30)
 COLLECTOR_PREPARE_TIME = time(8, 50)
 DAILY_COLLECTION_TIME = time(16, 0)
 DAILY_RETRY_DEADLINE_TIME = time(8, 30)
@@ -136,7 +137,22 @@ class CollectorRunner:
     def _run_closing_node_until_success(self, node: ScheduleNode) -> None:
         if node.sequence_no != 254:
             raise ValueError("Persistent closing execution is only valid for node 254")
+        retry_cutoff = datetime.combine(
+            node.trade_date + timedelta(days=1),
+            CLOSING_NODE_RETRY_CUTOFF_TIME,
+            tzinfo=SHANGHAI,
+        )
         while True:
+            now = datetime.now(SHANGHAI)
+            if now >= retry_cutoff:
+                LOG.critical(
+                    "CLOSING_NODE_RETRY_CUTOFF collection_id=%s cutoff=%s; "
+                    "stopping the old trading-day retry so the next 08:50 "
+                    "confirmation can run",
+                    node.collection_id,
+                    retry_cutoff,
+                )
+                return
             self.run_node(node)
             if self.writer.statuses(node.trade_date).get(node.scheduled_time) == "SUCCESS":
                 return

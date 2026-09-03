@@ -213,6 +213,13 @@ def test_254_whole_node_retries_until_final_status_is_success(
     node = closing_node()
     pauses: list[float] = []
     calls: list[str] = []
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 28, 15, 1, tzinfo=tz)
+
+    monkeypatch.setattr(runner_module, "datetime", FixedDateTime)
     monkeypatch.setattr(runner_module, "sleep", pauses.append)
 
     class Writer:
@@ -228,6 +235,26 @@ def test_254_whole_node_retries_until_final_status_is_success(
 
     assert calls == [node.collection_id, node.collection_id]
     assert pauses == [runner_module.CLOSING_NODE_RETRY_SECONDS]
+
+
+def test_254_retry_stops_before_next_trading_day_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = closing_node()
+    calls: list[str] = []
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 29, 8, 30, tzinfo=tz)
+
+    monkeypatch.setattr(runner_module, "datetime", FixedDateTime)
+    runner = object.__new__(CollectorRunner)
+    runner.run_node = lambda current_node: calls.append(current_node.collection_id)
+
+    runner._run_closing_node_until_success(node)
+
+    assert calls == []
 
 
 def test_254_database_constraint_requires_own_collection_id() -> None:
