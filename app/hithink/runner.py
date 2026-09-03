@@ -416,7 +416,7 @@ class CollectorRunner:
                 time(15, 5),
                 "15:05",
                 lambda state: state.get("closing_node_status") == "SUCCESS",
-                "第254号节点尚未成功，程序应继续重试",
+                "第254号节点尚未成功，程序将每分钟重试到16:00",
             ),
             (
                 time(16, 5),
