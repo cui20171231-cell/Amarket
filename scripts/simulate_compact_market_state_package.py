@@ -199,6 +199,11 @@ def minute_metric_context(value: Any) -> str:
     return "NORMAL"
 
 
+def comparable_new_high_ratio(scheduled_time: Any, value: Any) -> Any:
+    """09:30 is an opening transition baseline, not a comparable new-high sample."""
+    return None if short_time(scheduled_time) == "09:30" else value
+
+
 def short_time(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.strftime("%H:%M")
@@ -299,7 +304,9 @@ def compact_core_trajectory(source: dict[str, Any]) -> dict[str, Any]:
                     node.get("turnover_1m_market_share_delta_15m"),
                     node.get("limit_up_count"),
                     node.get("limit_break_count"),
-                    node.get("new_high_ratio"),
+                    comparable_new_high_ratio(
+                        node.get("scheduled_time"), node.get("new_high_ratio")
+                    ),
                 ]
             )
     return {"schema": CORE_TRAJECTORY_SCHEMA, "rows": rows}
@@ -508,7 +515,9 @@ def build_key_core_trajectory(builder: Any, full: dict[str, Any]) -> dict[str, A
                     migration.get("turnover_1m_market_share_delta_15m"),
                     migration.get("limit_up_count"),
                     migration.get("limit_break_count"),
-                    migration.get("new_high_ratio"),
+                    comparable_new_high_ratio(
+                        node["scheduled_time"], migration.get("new_high_ratio")
+                    ),
                 ]
             )
     return {
