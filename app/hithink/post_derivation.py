@@ -141,7 +141,10 @@ class PostDerivationPipeline:
             )
             return PostDerivationResult(success=False)
 
-        if not sector_states_ready:
+        # Intraday review nodes may use the latest complete sector-state minute.
+        # The capital-migration SQL resolves and labels that source as FALLBACK.
+        # The closing node remains strict and must use its own complete state.
+        if not sector_states_ready and node.sequence_no == 254:
             self._block_from(
                 node,
                 "capital_migration",

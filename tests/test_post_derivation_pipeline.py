@@ -106,6 +106,39 @@ def test_post_derivatives_run_in_fixed_dependency_order() -> None:
     ]
 
 
+def test_intraday_target_continues_to_fallback_when_current_sector_states_are_missing() -> None:
+    pipeline = RecordingPipeline(FakeWriter())
+
+    result = pipeline.run(_node(57), sector_states_ready=False)
+
+    assert result.success is True
+    assert pipeline.calls == [
+        "emotion",
+        "market_delta_15m",
+        "capital_migration",
+        "core_sector_candidate",
+        "core_stock_candidate",
+    ]
+    assert all("BLOCKED" not in item.values() for item in pipeline.writer.statuses)
+
+
+def test_closing_target_still_requires_current_sector_states() -> None:
+    pipeline = RecordingPipeline(FakeWriter())
+
+    result = pipeline.run(_node(254), sector_states_ready=False)
+
+    assert result.success is False
+    assert pipeline.calls == ["emotion", "market_delta_15m"]
+    assert pipeline.writer.statuses[-3]["capital_migration_status"] == "BLOCKED"
+    assert pipeline.writer.statuses[-2]["core_sector_candidate_status"] == "BLOCKED"
+    assert pipeline.writer.statuses[-1]["core_stock_candidate_status"] == "BLOCKED"
+    assert {
+        item.get("capital_migration_error_code")
+        for item in pipeline.writer.statuses
+        if "capital_migration_error_code" in item
+    } == {"SECTOR_STATES_UNAVAILABLE"}
+
+
 def test_non_target_node_only_generates_emotion() -> None:
     pipeline = RecordingPipeline(FakeWriter())
 
