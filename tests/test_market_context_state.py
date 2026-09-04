@@ -4,7 +4,9 @@ from datetime import UTC, date, datetime, time, timedelta
 from itertools import pairwise
 from pathlib import Path
 
+from app.market_context_compact import compact_market_context_response
 from app.market_context_state import (
+    AUCTION_TRAJECTORY_SCHEMA,
     _compress_sector_trajectory,
     _compress_stock_trajectory,
     _normalize_sector_name,
@@ -13,6 +15,7 @@ from app.market_context_state import (
     _row_offsets,
     _sector_metrics,
     _select_stock_sectors,
+    _stock_auction_context,
     _stock_current_block,
     get_market_context_state,
 )
@@ -212,6 +215,135 @@ def test_stock_current_uses_minute_windows_and_turnover_comparisons() -> None:
     assert current["turnover_5m"] == 500
     assert current["prev_turnover_15m"] == 1500
     assert current["turnover_1m_change_pct"] is not None
+
+
+def test_stock_auction_context_keeps_business_facts_and_key_nodes_only() -> None:
+    auction_rows = [
+        {
+            "node_seq": node_seq,
+            "time": f"09:{minute:02d}",
+            "auction_phase": phase,
+            "auction_price": price,
+            "auction_pct": change_pct,
+            "auction_amount": amount,
+            "auction_volume": volume,
+            "auction_turnover_pct": turnover_pct,
+            "auction_yesterday_ratio_pct": yesterday_ratio,
+            "pre_close_price": 86.35,
+            "collection_id": f"20260904{node_seq:03d}",
+            "request_id": "must-not-leak",
+        }
+        for node_seq, minute, phase, price, change_pct, amount, volume, turnover_pct,
+        yesterday_ratio in (
+            (1, 15, "order_entry", 88.0, 1.91, None, None, None, None),
+            (6, 20, "no_cancel", 87.8, 1.68, 10_000_000.123, 1200, 0.01, 0.2),
+            (10, 24, "no_cancel", 87.5, 1.33, 40_000_000.456, 4600, 0.03, 0.4),
+            (11, 25, "matched", 87.25, 1.0423, 50_736_137.0, 5815, 0.0396, 0.52),
+        )
+    ]
+    stock_rows = [
+        {
+            "scheduled_time": datetime.fromisoformat("2026-09-04T09:30:08+08:00"),
+            "last_price": 86.35,
+            "price_change_ratio_pct": 0.0,
+        },
+        {
+            "scheduled_time": datetime.fromisoformat("2026-09-04T09:45:08+08:00"),
+            "last_price": 80.0,
+            "price_change_ratio_pct": -7.35,
+        },
+    ]
+
+    context = _stock_auction_context(
+        auction_rows,
+        stock_rows,
+        datetime.fromisoformat("2026-09-04T10:00:08+08:00"),
+    )
+
+    assert context["final"] == {
+        "time": "09:25",
+        "price": 87.25,
+        "change_pct": 1.0423,
+        "amount": 50_736_137.0,
+        "volume": 5815,
+        "turnover_pct": 0.0396,
+        "yesterday_ratio_pct": 0.52,
+        "pre_close_price": 86.35,
+    }
+    assert context["trajectory"]["schema"] == AUCTION_TRAJECTORY_SCHEMA
+    assert [row[0] for row in context["trajectory"]["rows"]] == [
+        "09:15",
+        "09:20",
+        "09:24",
+        "09:25",
+    ]
+    assert context["trajectory"]["rows"][0][-1] is None
+    comparison = context["auction_to_open"]
+    assert comparison["open_price"] == 86.35
+    assert comparison["open_pct"] == 0.0
+    assert round(comparison["change_from_auction_to_open_pct"], 4) == -1.0423
+    assert round(comparison["first_15m_pct"], 2) == -7.35
+    assert "collection_id" not in str(context)
+    assert "request_id" not in str(context)
+
+
+def test_stock_api_compacts_and_rounds_auction_context() -> None:
+    auction_context = {
+        "final": {
+            "time": "09:25",
+            "price": 87.251,
+            "change_pct": 1.0423,
+            "amount": 50_736_137.0,
+            "volume": 5815,
+            "turnover_pct": 0.0396,
+            "yesterday_ratio_pct": 0.519,
+            "pre_close_price": 86.35,
+            "request_id": "must-not-leak",
+        },
+        "trajectory": {
+            "schema": AUCTION_TRAJECTORY_SCHEMA,
+            "rows": [["09:15", None, None, None], ["09:25", 87.251, 1.0423, 50_736_137.0]],
+        },
+        "auction_to_open": {
+            "auction_final_pct": 1.0423,
+            "open_price": 86.35,
+            "open_pct": 0.0,
+            "change_from_auction_to_open_pct": -1.0423,
+            "first_15m_pct": -5.394,
+        },
+        "collection_id": "20260904011",
+    }
+    response = {
+        "status": "OK",
+        "target_type": "stock",
+        "resolved": {
+            "trade_date": date(2026, 9, 4),
+            "requested_time": "10:00",
+            "actual_time": datetime.fromisoformat("2026-09-04T10:00:08+08:00"),
+        },
+        "data": {
+            "stocks": [
+                {
+                    "status": "OK",
+                    "ticker": "000977",
+                    "thscode": "000977.SZ",
+                    "name": "浪潮信息",
+                    "auction_context": auction_context,
+                }
+            ]
+        },
+    }
+
+    compact = compact_market_context_response(response)["auction_context"]
+
+    assert compact["final"]["price"] == 87.25
+    assert compact["final"]["change_pct"] == 1.04
+    assert compact["final"]["turnover_pct"] == 0.04
+    assert compact["auction_to_open"]["change_from_auction_to_open_pct"] == -1.04
+    assert compact["auction_to_open"]["first_15m_pct"] == -5.39
+    assert compact["trajectory"]["rows"][0] == ["09:15", None, None, None]
+    assert "collection_id" not in str(compact)
+    assert "request_id" not in str(compact)
 
 
 def test_sector_current_and_trajectory_are_minute_level() -> None:

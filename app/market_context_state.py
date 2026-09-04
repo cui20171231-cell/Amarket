@@ -30,6 +30,8 @@ STOCK_TRAJECTORY_MINUTES = 30
 MULTI_STOCK_TRAJECTORY_MINUTES = 20
 SECTOR_TRAJECTORY_MINUTES = 30
 CORE_STOCK_TRAJECTORY_MINUTES = 15
+AUCTION_KEY_NODE_SEQUENCES = (1, 6, 10, 11)
+AUCTION_TRAJECTORY_SCHEMA = ["time", "price", "change_pct", "amount"]
 
 
 def _json_safe(value: Any) -> Any:
@@ -410,6 +412,31 @@ class MarketContextReader:
             ORDER BY d.scheduled_time
             """,
             {"trade_date": trade_date, "actual_at": actual_at, "thscode": thscode},
+        )
+
+    def stock_auction_rows(
+        self, trade_date: date, actual_at: datetime, thscode: str
+    ) -> list[dict[str, Any]]:
+        return self.rows(
+            """
+            SELECT node_seq,formatDateTime(scheduled_time,'%H:%i') AS time,
+                   auction_phase,auction_price,auction_pct,auction_amount,
+                   auction_volume,auction_turnover_pct,
+                   auction_yesterday_ratio_pct,pre_close_price
+            FROM market.hithink_auction_snapshot FINAL
+            WHERE trade_date={trade_date:Date} AND thscode={thscode:String}
+              AND node_seq IN {node_sequences:Array(UInt16)}
+              AND scheduled_time<={actual_at:DateTime64(3,'Asia/Shanghai')}
+              AND (node_seq!=11 OR (auction_phase='matched' AND data_status='final'))
+            ORDER BY node_seq
+            """,
+            {
+                "trade_date": trade_date,
+                "actual_at": actual_at,
+                "thscode": thscode,
+                "node_sequences": list(AUCTION_KEY_NODE_SEQUENCES),
+            },
+            max_rows=len(AUCTION_KEY_NODE_SEQUENCES),
         )
 
     def stock_sector_rows(
@@ -1010,6 +1037,93 @@ def _compress_stock_trajectory(
     return result
 
 
+def _stock_auction_context(
+    auction_rows: list[dict[str, Any]],
+    stock_rows: list[dict[str, Any]],
+    actual_at: datetime,
+) -> dict[str, Any]:
+    """Compress opening-auction facts without exposing collection metadata."""
+    final_row = next(
+        (
+            row
+            for row in auction_rows
+            if int(row.get("node_seq") or 0) == 11
+            and row.get("auction_phase") == "matched"
+        ),
+        None,
+    )
+    final = (
+        {
+            "time": "09:25",
+            "price": final_row.get("auction_price"),
+            "change_pct": final_row.get("auction_pct"),
+            "amount": final_row.get("auction_amount"),
+            "volume": final_row.get("auction_volume"),
+            "turnover_pct": final_row.get("auction_turnover_pct"),
+            "yesterday_ratio_pct": final_row.get("auction_yesterday_ratio_pct"),
+            "pre_close_price": final_row.get("pre_close_price"),
+        }
+        if final_row
+        else None
+    )
+    trajectory = {
+        "schema": AUCTION_TRAJECTORY_SCHEMA,
+        "rows": [
+            [
+                row.get("time"),
+                row.get("auction_price"),
+                row.get("auction_pct"),
+                row.get("auction_amount"),
+            ]
+            for row in auction_rows
+        ],
+    }
+
+    open_start = datetime.combine(actual_at.date(), time(9, 30), tzinfo=SHANGHAI)
+    first_15m_ready = datetime.combine(actual_at.date(), time(9, 45), tzinfo=SHANGHAI)
+    first_15m_end = datetime.combine(actual_at.date(), time(9, 45, 59), tzinfo=SHANGHAI)
+    open_row = next(
+        (
+            row
+            for row in stock_rows
+            if row.get("scheduled_time") is not None
+            and row["scheduled_time"] >= open_start
+        ),
+        None,
+    )
+    open_price = _number(open_row.get("last_price")) if open_row else None
+    pre_close_price = _number(final_row.get("pre_close_price")) if final_row else None
+    open_pct = _number(open_row.get("price_change_ratio_pct")) if open_row else None
+    if open_pct is None:
+        open_pct = _pct_change(open_price, pre_close_price)
+
+    first_15m_rows = [
+        row
+        for row in stock_rows
+        if row.get("scheduled_time") is not None
+        and open_start <= row["scheduled_time"] <= first_15m_end
+    ]
+    first_15m_pct = (
+        _pct_change(first_15m_rows[-1].get("last_price"), open_price)
+        if actual_at >= first_15m_ready and first_15m_rows
+        else None
+    )
+    auction_final_pct = _number(final_row.get("auction_pct")) if final_row else None
+    return {
+        "final": final,
+        "trajectory": trajectory,
+        "auction_to_open": {
+            "auction_final_pct": auction_final_pct,
+            "open_price": open_price,
+            "open_pct": open_pct,
+            "change_from_auction_to_open_pct": _difference(
+                open_pct, auction_final_pct
+            ),
+            "first_15m_pct": first_15m_pct,
+        },
+    }
+
+
 def _compress_sector_trajectory(
     rows: list[dict[str, Any]], recent_minutes: int = SECTOR_TRAJECTORY_MINUTES
 ) -> list[dict[str, Any]]:
@@ -1538,6 +1652,9 @@ def _build_stock_context(
             "thscode": thscode,
             "error": "目标时间及之前没有找到该股票的有效分钟派生行情",
         }
+    auction_rows = reader.stock_auction_rows(
+        trade_date, node["scheduled_time"], thscode
+    )
     sector_rows = reader.stock_sector_rows(trade_date, node["scheduled_time"], thscode)
     profiles = reader.stock_sector_profiles(
         trade_date,
@@ -1582,6 +1699,9 @@ def _build_stock_context(
         "current_state": _stock_current_block(stock_rows),
         "key_trajectory": _compress_stock_trajectory(
             stock_rows, recent_minutes=trajectory_minutes
+        ),
+        "auction_context": _stock_auction_context(
+            auction_rows, stock_rows, node["scheduled_time"]
         ),
         "direction_selection": {
             "model": "TRADING_DIRECTION_V2",

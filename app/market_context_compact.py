@@ -22,6 +22,8 @@ STOCK_TRAJECTORY_SCHEMA = [
     "event",
 ]
 
+AUCTION_TRAJECTORY_SCHEMA = ["time", "price", "change_pct", "amount"]
+
 REFERENCE_STOCK_SCHEMA = [
     "ticker",
     "name",
@@ -158,6 +160,40 @@ def _stock_trajectory(source: list[dict[str, Any]]) -> dict[str, Any]:
             ]
         )
     return {"schema": STOCK_TRAJECTORY_SCHEMA, "rows": rows}
+
+
+def _auction_context(source: dict[str, Any]) -> dict[str, Any]:
+    final_source = source.get("final")
+    final = None
+    if isinstance(final_source, dict):
+        final = {
+            "time": final_source.get("time"),
+            "price": final_source.get("price"),
+            "change_pct": final_source.get("change_pct"),
+            "amount": final_source.get("amount"),
+            "volume": final_source.get("volume"),
+            "turnover_pct": final_source.get("turnover_pct"),
+            "yesterday_ratio_pct": final_source.get("yesterday_ratio_pct"),
+            "pre_close_price": final_source.get("pre_close_price"),
+        }
+    trajectory_source = source.get("trajectory") or {}
+    comparison = source.get("auction_to_open") or {}
+    return {
+        "final": final,
+        "trajectory": {
+            "schema": AUCTION_TRAJECTORY_SCHEMA,
+            "rows": list(trajectory_source.get("rows") or []),
+        },
+        "auction_to_open": {
+            "auction_final_pct": comparison.get("auction_final_pct"),
+            "open_price": comparison.get("open_price"),
+            "open_pct": comparison.get("open_pct"),
+            "change_from_auction_to_open_pct": comparison.get(
+                "change_from_auction_to_open_pct"
+            ),
+            "first_15m_pct": comparison.get("first_15m_pct"),
+        },
+    }
 
 
 def _selection_reasons(direction: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
@@ -336,6 +372,7 @@ def _compact_stock(context: dict[str, Any], resolved: dict[str, Any]) -> dict[st
         "comparison_window": _comparison_window(current),
         "stock_current": current_compact,
         "stock_trajectory": _stock_trajectory(context.get("key_trajectory") or []),
+        "auction_context": _auction_context(context.get("auction_context") or {}),
         "directions": [
             _compact_direction(item) for item in (context.get("primary_sectors") or [])[:5]
         ],
