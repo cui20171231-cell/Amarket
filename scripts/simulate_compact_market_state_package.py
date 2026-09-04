@@ -92,6 +92,29 @@ CORE_STOCK_SCHEMA = [
     "main_sector_memberships",
 ]
 
+OPEN_AUCTION_CURRENT_SCHEMA = [
+    "stock_code",
+    "stock_name",
+    "auction_price",
+    "auction_pct",
+    "auction_amount",
+    "auction_amount_rank",
+    "auction_turnover_pct",
+    "auction_yesterday_ratio_pct",
+    "auction_unmatched",
+]
+
+OPEN_AUCTION_TRAJECTORY_SCHEMA = [
+    "stock_code",
+    "time",
+    "auction_phase",
+    "auction_pct",
+    "auction_amount",
+    "auction_turnover_pct",
+    "auction_yesterday_ratio_pct",
+    "auction_unmatched",
+]
+
 STRATEGIC_SCHEMA = [
     "strategic_theme",
     "strategic_subtheme",
@@ -531,7 +554,16 @@ def build_key_core_trajectory(builder: Any, full: dict[str, Any]) -> dict[str, A
     }
 
 
-def compact_core_stocks(source: list[dict[str, Any]]) -> dict[str, Any]:
+def compact_core_stocks(source: Any) -> dict[str, Any]:
+    if isinstance(source, dict) and source.get("data_context") == "OPEN_AUCTION":
+        return {
+            "data_context": "OPEN_AUCTION",
+            "current_schema": list(source.get("current_schema") or []),
+            "current_rows": list(source.get("current_rows") or []),
+            "trajectory_schema": list(source.get("trajectory_schema") or []),
+            "trajectory_rows": list(source.get("trajectory_rows") or []),
+        }
+
     rows: list[list[Any]] = []
     for item in source[:20]:
         memberships = [
@@ -849,13 +881,32 @@ def build_compact(
 
 def validate_compact(compact: dict[str, Any]) -> None:
     core_sector_rows = compact["core_sectors"]["current_top20"]["rows"]
-    core_stock_rows = compact["core_stocks"]["rows"]
+    core_stock_block = compact["core_stocks"]
     strategic_rows = compact["strategic_watch"]["rows"]
     trajectory_rows = compact["core_sector_trajectory"]["rows"]
     if len(core_sector_rows) > 20:
         raise ValueError(f"核心板块超过20个：{len(core_sector_rows)}")
-    if len(core_stock_rows) > 20:
-        raise ValueError(f"核心个股超过20只：{len(core_stock_rows)}")
+    if core_stock_block.get("data_context") == "OPEN_AUCTION":
+        current_rows = core_stock_block.get("current_rows") or []
+        auction_rows = core_stock_block.get("trajectory_rows") or []
+        if core_stock_block.get("current_schema") != OPEN_AUCTION_CURRENT_SCHEMA:
+            raise ValueError("09:25竞价个股当前结构不正确")
+        if core_stock_block.get("trajectory_schema") != OPEN_AUCTION_TRAJECTORY_SCHEMA:
+            raise ValueError("09:25竞价个股轨迹结构不正确")
+        if len(current_rows) > 30:
+            raise ValueError(f"09:25竞价核心个股超过30只：{len(current_rows)}")
+        expected_times = [f"09:{minute:02d}" for minute in range(15, 26)]
+        current_codes = [row[0] for row in current_rows]
+        if len(auction_rows) != len(current_codes) * 11:
+            raise ValueError("09:25竞价核心个股没有完整保留11个节点")
+        for stock_code in current_codes:
+            times = [row[1] for row in auction_rows if row[0] == stock_code]
+            if times != expected_times:
+                raise ValueError(f"{stock_code}竞价轨迹不是09:15至09:25完整11节点")
+    else:
+        core_stock_rows = core_stock_block["rows"]
+        if len(core_stock_rows) > 20:
+            raise ValueError(f"核心个股超过20只：{len(core_stock_rows)}")
     if len(strategic_rows) != 57:
         raise ValueError(f"战略方向观察不是57条：{len(strategic_rows)}")
     selection = compact["core_sector_trajectory"].get("selection") or {}

@@ -6,7 +6,8 @@ import argparse
 import json
 from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
+from math import isfinite
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -158,6 +159,29 @@ CORE_STATE_TABLES = {
     "industry": "market.hithink_industry_state",
 }
 
+OPEN_AUCTION_NODE_SEQUENCES = tuple(range(1, 12))
+OPEN_AUCTION_CURRENT_SCHEMA = [
+    "stock_code",
+    "stock_name",
+    "auction_price",
+    "auction_pct",
+    "auction_amount",
+    "auction_amount_rank",
+    "auction_turnover_pct",
+    "auction_yesterday_ratio_pct",
+    "auction_unmatched",
+]
+OPEN_AUCTION_TRAJECTORY_SCHEMA = [
+    "stock_code",
+    "time",
+    "auction_phase",
+    "auction_pct",
+    "auction_amount",
+    "auction_turnover_pct",
+    "auction_yesterday_ratio_pct",
+    "auction_unmatched",
+]
+
 
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -187,6 +211,22 @@ def _number(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _auction_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    number = float(value)
+    return number if isfinite(number) else None
+
+
+def _round_auction_number(value: Any) -> float | None:
+    number = _auction_number(value)
+    if number is None:
+        return None
+    return float(
+        Decimal(str(number)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    )
 
 
 def _subtract(current: Any, base: Any) -> Any:
@@ -841,6 +881,221 @@ class MarketStatePackageBuilder:
                 result[key]["key_nodes"] = key_rows
         return result
 
+    def _opening_auction_core_stocks(
+        self,
+        trade_date_value: date,
+        stock_top_n: int,
+    ) -> dict[str, Any]:
+        """Build the 09:25 stock layer from all eleven opening-auction minutes."""
+        rows = self._rows(
+            """
+            SELECT node_seq,scheduled_time,auction_phase,
+                toString(thscode) stock_code,name stock_name,
+                auction_price,auction_pct,auction_amount,auction_unmatched,
+                auction_turnover_pct,auction_yesterday_ratio_pct
+            FROM market.hithink_auction_snapshot FINAL
+            WHERE trade_date={trade_date:Date}
+              AND node_seq BETWEEN 1 AND 11
+            ORDER BY stock_code,node_seq
+            """,
+            {"trade_date": trade_date_value},
+        )
+        grouped: defaultdict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
+        for row in rows:
+            stock_code = _text(row.get("stock_code")) or ""
+            node_seq = int(row.get("node_seq") or 0)
+            if stock_code and node_seq in OPEN_AUCTION_NODE_SEQUENCES:
+                grouped[stock_code][node_seq] = row
+
+        complete = {
+            stock_code: nodes
+            for stock_code, nodes in grouped.items()
+            if tuple(sorted(nodes)) == OPEN_AUCTION_NODE_SEQUENCES
+            and _text(nodes[11].get("auction_phase")) == "matched"
+        }
+        final_rows = {
+            stock_code: nodes[11] for stock_code, nodes in complete.items()
+        }
+
+        amount_order = sorted(
+            (
+                (_auction_number(row.get("auction_amount")), stock_code)
+                for stock_code, row in final_rows.items()
+                if _auction_number(row.get("auction_amount")) is not None
+            ),
+            key=lambda item: (-item[0], item[1]),
+        )
+        amount_rank = {
+            stock_code: rank
+            for rank, (_, stock_code) in enumerate(amount_order, start=1)
+        }
+
+        def ranked_codes(metric, *, positive: bool = False) -> list[str]:
+            values: list[tuple[float, str]] = []
+            for stock_code, nodes in complete.items():
+                value = metric(nodes)
+                if value is None or (positive and value <= 0):
+                    continue
+                values.append((value, stock_code))
+            values.sort(key=lambda item: (-item[0], item[1]))
+            return [stock_code for _, stock_code in values]
+
+        def pct(nodes: dict[int, dict[str, Any]], node_seq: int) -> float | None:
+            return _auction_number(nodes[node_seq].get("auction_pct"))
+
+        def amount(nodes: dict[int, dict[str, Any]], node_seq: int) -> float | None:
+            return _auction_number(nodes[node_seq].get("auction_amount"))
+
+        def delta(
+            nodes: dict[int, dict[str, Any]],
+            field,
+            start_node: int,
+            end_node: int,
+        ) -> float | None:
+            start = field(nodes, start_node)
+            end = field(nodes, end_node)
+            return None if start is None or end is None else end - start
+
+        def early_extreme(nodes: dict[int, dict[str, Any]]) -> float | None:
+            values = [
+                abs(value)
+                for node_seq in range(1, 6)
+                for value in [pct(nodes, node_seq)]
+                if value is not None
+            ]
+            return max(values) if values else None
+
+        def early_final_contrast(nodes: dict[int, dict[str, Any]]) -> float | None:
+            final = pct(nodes, 11)
+            if final is None:
+                return None
+            values = [
+                abs(final - value)
+                for node_seq in range(1, 6)
+                for value in [pct(nodes, node_seq)]
+                if value is not None
+            ]
+            return max(values) if values else None
+
+        per_category = max(4, min(8, stock_top_n // 2))
+        candidate_lists = [
+            [stock_code for _, stock_code in amount_order[: max(10, stock_top_n)]],
+            ranked_codes(
+                lambda nodes: pct(nodes, 11)
+                if (amount(nodes, 11) or 0) > 0
+                else None,
+                positive=True,
+            )[:per_category],
+            ranked_codes(
+                lambda nodes: -pct(nodes, 11)
+                if pct(nodes, 11) is not None and (amount(nodes, 11) or 0) > 0
+                else None,
+                positive=True,
+            )[:per_category],
+            ranked_codes(
+                lambda nodes: _auction_number(
+                    nodes[11].get("auction_yesterday_ratio_pct")
+                ),
+                positive=True,
+            )[:per_category],
+            ranked_codes(early_extreme, positive=True)[:per_category],
+            ranked_codes(early_final_contrast, positive=True)[:per_category],
+            ranked_codes(
+                lambda nodes: delta(nodes, pct, 6, 11), positive=True
+            )[:per_category],
+            ranked_codes(
+                lambda nodes: (
+                    -value if (value := delta(nodes, pct, 6, 11)) is not None else None
+                ),
+                positive=True,
+            )[:per_category],
+            ranked_codes(
+                lambda nodes: (
+                    abs(value)
+                    if (value := delta(nodes, pct, 10, 11)) is not None
+                    else None
+                ),
+                positive=True,
+            )[:per_category],
+            ranked_codes(
+                lambda nodes: delta(nodes, amount, 6, 11), positive=True
+            )[:per_category],
+            ranked_codes(
+                lambda nodes: delta(nodes, amount, 10, 11), positive=True
+            )[:per_category],
+        ]
+
+        limit = min(stock_top_n, 30)
+        selected: list[str] = []
+        seen: set[str] = set()
+        for index in range(max((len(items) for items in candidate_lists), default=0)):
+            for items in candidate_lists:
+                if index >= len(items):
+                    continue
+                stock_code = items[index]
+                if stock_code in seen:
+                    continue
+                selected.append(stock_code)
+                seen.add(stock_code)
+                if len(selected) == limit:
+                    break
+            if len(selected) == limit:
+                break
+
+        selected.sort(
+            key=lambda stock_code: (
+                amount_rank.get(stock_code) is None,
+                amount_rank.get(stock_code) or 0,
+                stock_code,
+            )
+        )
+        current_rows: list[list[Any]] = []
+        trajectory_rows: list[list[Any]] = []
+        for stock_code in selected:
+            current = final_rows[stock_code]
+            current_rows.append(
+                [
+                    stock_code,
+                    current.get("stock_name"),
+                    _round_auction_number(current.get("auction_price")),
+                    _round_auction_number(current.get("auction_pct")),
+                    _round_auction_number(current.get("auction_amount")),
+                    amount_rank.get(stock_code),
+                    _round_auction_number(current.get("auction_turnover_pct")),
+                    _round_auction_number(
+                        current.get("auction_yesterday_ratio_pct")
+                    ),
+                    current.get("auction_unmatched"),
+                ]
+            )
+            for node_seq in OPEN_AUCTION_NODE_SEQUENCES:
+                row = complete[stock_code][node_seq]
+                scheduled_time = row.get("scheduled_time")
+                trajectory_rows.append(
+                    [
+                        stock_code,
+                        scheduled_time.strftime("%H:%M")
+                        if isinstance(scheduled_time, datetime)
+                        else str(scheduled_time)[11:16],
+                        _text(row.get("auction_phase")),
+                        _round_auction_number(row.get("auction_pct")),
+                        _round_auction_number(row.get("auction_amount")),
+                        _round_auction_number(row.get("auction_turnover_pct")),
+                        _round_auction_number(
+                            row.get("auction_yesterday_ratio_pct")
+                        ),
+                        row.get("auction_unmatched"),
+                    ]
+                )
+
+        return {
+            "data_context": "OPEN_AUCTION",
+            "current_schema": OPEN_AUCTION_CURRENT_SCHEMA,
+            "current_rows": current_rows,
+            "trajectory_schema": OPEN_AUCTION_TRAJECTORY_SCHEMA,
+            "trajectory_rows": trajectory_rows,
+        }
+
     def _stock_memberships(
         self,
         trade_date_value: date,
@@ -1091,15 +1346,22 @@ class MarketStatePackageBuilder:
         memberships = self._stock_memberships(
             trade_date_value, collection_id, stock_codes
         )
-        core_stocks = []
-        for row in all_stock_rows[:stock_top_n]:
-            item = _strip_internal(row) or {}
-            thscode = _text(row["thscode"]) or ""
-            item["candidate_reasons"] = [
-                label for field, label in STOCK_REASON_FIELDS.items() if row.get(field) == 1
-            ]
-            item["core_sector_memberships"] = memberships.get(thscode, [])
-            core_stocks.append(item)
+        if target["node_seq"] == 11:
+            core_stocks: Any = self._opening_auction_core_stocks(
+                trade_date_value, stock_top_n
+            )
+        else:
+            core_stocks = []
+            for row in all_stock_rows[:stock_top_n]:
+                item = _strip_internal(row) or {}
+                thscode = _text(row["thscode"]) or ""
+                item["candidate_reasons"] = [
+                    label
+                    for field, label in STOCK_REASON_FIELDS.items()
+                    if row.get(field) == 1
+                ]
+                item["core_sector_memberships"] = memberships.get(thscode, [])
+                core_stocks.append(item)
 
         watchlist = self._watchlist(trade_date_value, historical_watchlist)
         sector_state_map = self._sector_state_map(trade_date_value, migration_rows)
