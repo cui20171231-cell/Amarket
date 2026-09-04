@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from collections import defaultdict
@@ -15,6 +14,7 @@ from typing import Any
 from app.hithink.config import Settings
 from app.hithink.schedule import SHANGHAI
 from app.hithink.writer import ClickHouseWriter
+from app.market_context_compact import compact_market_context_response
 from app.market_state_package_reader import PACKAGE_ROOT, _default_trade_date
 
 SECTOR_STATE_TABLES = {
@@ -26,6 +26,10 @@ TIME_PATTERN = re.compile(r"^(\d{2}):(\d{2})(?::(\d{2}))?$")
 DATE_PATTERN = re.compile(r"^(\d{4})-?(\d{2})-?(\d{2})$")
 SECTOR_NAME_NORMALIZER = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
 MAX_STOCKS = 5
+STOCK_TRAJECTORY_MINUTES = 30
+MULTI_STOCK_TRAJECTORY_MINUTES = 20
+SECTOR_TRAJECTORY_MINUTES = 30
+CORE_STOCK_TRAJECTORY_MINUTES = 15
 
 
 def _json_safe(value: Any) -> Any:
@@ -68,6 +72,25 @@ def _parse_time(value: str) -> tuple[time, bool]:
     return parsed, second_text is not None
 
 
+def _requested_time_quality(
+    trade_date: date,
+    parsed_time: time | None,
+    has_seconds: bool,
+    requested_time: str | None,
+    actual_at: datetime,
+) -> tuple[str, int]:
+    if parsed_time is None:
+        return actual_at.strftime("%H:%M"), 0
+    requested_at = datetime.combine(trade_date, parsed_time, tzinfo=SHANGHAI)
+    if has_seconds:
+        age = max(0, round((requested_at - actual_at).total_seconds()))
+    else:
+        actual_minute = actual_at.replace(second=0, microsecond=0)
+        age = max(0, round((requested_at - actual_minute).total_seconds()))
+    assert requested_time is not None
+    return requested_time, age
+
+
 def _normalize_stock_code(value: Any) -> tuple[str, str]:
     text = str(value).strip().upper()
     if re.fullmatch(r"\d{1,6}", text):
@@ -86,6 +109,30 @@ def _normalize_stock_code(value: Any) -> tuple[str, str]:
     if match:
         return match.group(2), f"{match.group(2)}.{match.group(1)}"
     raise ValueError(f"股票代码{text!r}无效，需使用6位代码或带交易所后缀的代码")
+
+
+def _stock_code_from_thscode(thscode: str) -> tuple[str, str]:
+    match = re.search(r"(\d{6})", str(thscode))
+    if not match:
+        raise ValueError(f"本地名称映射返回了无法识别的股票代码：{thscode}")
+    return _normalize_stock_code(match.group(1))
+
+
+def _resolve_stock_input(
+    reader: MarketContextReader, trade_date: date, value: Any
+) -> tuple[str, str]:
+    try:
+        return _normalize_stock_code(value)
+    except ValueError:
+        name = str(value).strip()
+        if not name:
+            raise ValueError("股票名称不能为空") from None
+        matches = reader.resolve_stock_name(trade_date, name)
+        if not matches:
+            raise ValueError(f"本地股票名称映射中没有找到{name!r}") from None
+        if len(matches) > 1:
+            raise ValueError(f"股票名称{name!r}对应多个代码，请改用6位代码") from None
+        return _stock_code_from_thscode(matches[0]["thscode"])
 
 
 def _normalize_sector_name(value: str) -> str:
@@ -168,19 +215,159 @@ class MarketContextReader:
         )
         return rows[0]["trade_date"] if rows and rows[0].get("trade_date") else None
 
-    def resolve_node(self, trade_date: date, target_at: datetime) -> dict[str, Any] | None:
+    def resolve_stock_node(
+        self, trade_date: date, target_at: datetime, thscodes: list[str]
+    ) -> dict[str, Any] | None:
         rows = self.rows(
             """
-            SELECT toString(collection_id) AS collection_id,scheduled_time,session,node_seq
-            FROM market.hithink_market_state FINAL
+            SELECT toString(collection_id) AS collection_id,scheduled_time,
+                   any(session) AS session,any(node_seq) AS node_seq
+            FROM market.hithink_snapshot_derived
             WHERE trade_date={trade_date:Date}
               AND scheduled_time<={target_at:DateTime64(3,'Asia/Shanghai')}
+              AND thscode IN {thscodes:Array(String)}
+            GROUP BY collection_id,scheduled_time
+            HAVING uniqExact(thscode)={stock_count:UInt8}
             ORDER BY scheduled_time DESC
             LIMIT 1
             """,
-            {"trade_date": trade_date, "target_at": target_at},
+            {
+                "trade_date": trade_date,
+                "target_at": target_at,
+                "thscodes": thscodes,
+                "stock_count": len(thscodes),
+            },
         )
         return rows[0] if rows else None
+
+    def resolve_sector_node(
+        self,
+        trade_date: date,
+        target_at: datetime,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        codes_by_type: dict[str, list[str]] = defaultdict(list)
+        for candidate in candidates:
+            codes_by_type[str(candidate["sector_type"])].append(str(candidate["sector_code"]))
+        unions = []
+        parameters: dict[str, Any] = {"trade_date": trade_date, "target_at": target_at}
+        for index, (sector_type, codes) in enumerate(codes_by_type.items()):
+            table = SECTOR_STATE_TABLES[sector_type]
+            parameter = f"sector_codes_{index}"
+            parameters[parameter] = list(dict.fromkeys(codes))
+            unions.append(
+                f"""
+                SELECT toString(collection_id) AS collection_id,scheduled_time,
+                       session,node_seq
+                FROM {table} FINAL
+                WHERE trade_date={{trade_date:Date}}
+                  AND scheduled_time<={{target_at:DateTime64(3,'Asia/Shanghai')}}
+                  AND sector_code IN {{{parameter}:Array(String)}}
+                """
+            )
+        if not unions:
+            return None
+        rows = self.rows(
+            f"""
+            SELECT collection_id,scheduled_time,session,node_seq
+            FROM ({' UNION ALL '.join(unions)})
+            ORDER BY scheduled_time DESC
+            LIMIT 1
+            """,
+            parameters,
+        )
+        return rows[0] if rows else None
+
+    def resolve_stock_name(self, trade_date: date, stock_name: str) -> list[dict[str, Any]]:
+        return self.rows(
+            """
+            SELECT thscode,any(stock_name) AS resolved_name
+            FROM
+            (
+                SELECT thscode,stock_name
+                FROM market.sector_membership_history FINAL
+                WHERE stock_name={stock_name:String}
+                  AND observed_from<={trade_date:Date}
+                  AND (observed_to IS NULL OR observed_to>={trade_date:Date})
+            )
+            GROUP BY thscode
+            ORDER BY thscode
+            LIMIT 2
+            """,
+            {"trade_date": trade_date, "stock_name": stock_name.strip()},
+        )
+
+    def sector_market_facts(
+        self,
+        trade_date: date,
+        collection_ids: list[str],
+        sector_type: str,
+        sector_codes: list[str],
+    ) -> list[dict[str, Any]]:
+        if not collection_ids or not sector_codes:
+            return []
+        table = SECTOR_STATE_TABLES[sector_type]
+        return self.rows(
+            f"""
+            WITH ranked AS
+            (
+                SELECT toString(collection_id) AS collection_id,
+                       sector_code,turnover_market_share_pct,
+                       turnover_1m_market_share_pct,
+                       turnover_market_share_delta_1m,
+                       turnover_1m_market_share_delta_1m,
+                       rank() OVER (
+                         PARTITION BY collection_id
+                         ORDER BY turnover_market_share_pct DESC
+                       ) AS turnover_share_rank,
+                       rank() OVER (
+                         PARTITION BY collection_id
+                         ORDER BY turnover_1m_market_share_pct DESC
+                       ) AS turnover_1m_share_rank
+                FROM {table} FINAL
+                WHERE trade_date={{trade_date:Date}}
+                  AND toString(collection_id) IN {{collection_ids:Array(String)}}
+            )
+            SELECT r.*,
+                   nullIf(c.candidate_rank,0) AS candidate_rank
+            FROM ranked AS r
+            LEFT JOIN market.hithink_core_sector_candidate AS c FINAL
+              ON c.trade_date={{trade_date:Date}}
+             AND toString(c.collection_id)=r.collection_id
+             AND c.sector_type={{sector_type:String}}
+             AND c.sector_code=r.sector_code
+            WHERE r.sector_code IN {{sector_codes:Array(String)}}
+            """,
+            {
+                "trade_date": trade_date,
+                "collection_ids": collection_ids,
+                "sector_type": sector_type,
+                "sector_codes": sector_codes,
+            },
+        )
+
+    def strategic_relations(
+        self, trade_date: date, sector_type: str, sector_codes: list[str]
+    ) -> list[dict[str, Any]]:
+        if not sector_codes:
+            return []
+        return self.rows(
+            """
+            SELECT sector_type,sector_code,sector_name,watch_level,
+                   strategic_theme,strategic_subtheme
+            FROM market.strategic_sector_watchlist FINAL
+            WHERE is_active=1 AND effective_from<={trade_date:Date}
+              AND (effective_to IS NULL OR effective_to>={trade_date:Date})
+              AND sector_type={sector_type:String}
+              AND sector_code IN {sector_codes:Array(String)}
+            ORDER BY watch_level,strategic_theme,strategic_subtheme
+            """,
+            {
+                "trade_date": trade_date,
+                "sector_type": sector_type,
+                "sector_codes": sector_codes,
+            },
+        )
 
     def available_time_range(self, trade_date: date) -> dict[str, Any]:
         rows = self.rows(
@@ -268,57 +455,25 @@ class MarketContextReader:
             ),
             points AS
             (
-                SELECT *,1 AS relative_row
+                SELECT *
                 FROM
                 (
                     SELECT *,row_number() OVER (
                       PARTITION BY sector_type,sector_code ORDER BY scheduled_time DESC
-                    ) AS point_rank
+                    ) AS relative_row
                     FROM filtered
                 )
-                WHERE point_rank=1
-                UNION ALL
-                SELECT *,16 AS relative_row
-                FROM
-                (
-                    SELECT *,row_number() OVER (
-                      PARTITION BY sector_type,sector_code
-                      ORDER BY abs(dateDiff('millisecond',scheduled_time,
-                        subtractMinutes({actual_at:DateTime64(3,'Asia/Shanghai')},15)))
-                    ) AS point_rank
-                    FROM filtered
-                    WHERE scheduled_time BETWEEN
-                      subtractSeconds(subtractMinutes(
-                        {actual_at:DateTime64(3,'Asia/Shanghai')},15),90)
-                      AND addSeconds(subtractMinutes(
-                        {actual_at:DateTime64(3,'Asia/Shanghai')},15),90)
-                      AND scheduled_time<{actual_at:DateTime64(3,'Asia/Shanghai')}
-                )
-                WHERE point_rank=1
-                UNION ALL
-                SELECT *,31 AS relative_row
-                FROM
-                (
-                    SELECT *,row_number() OVER (
-                      PARTITION BY sector_type,sector_code
-                      ORDER BY abs(dateDiff('millisecond',scheduled_time,
-                        subtractMinutes({actual_at:DateTime64(3,'Asia/Shanghai')},30)))
-                    ) AS point_rank
-                    FROM filtered
-                    WHERE scheduled_time BETWEEN
-                      subtractSeconds(subtractMinutes(
-                        {actual_at:DateTime64(3,'Asia/Shanghai')},30),90)
-                      AND addSeconds(subtractMinutes(
-                        {actual_at:DateTime64(3,'Asia/Shanghai')},30),90)
-                      AND scheduled_time<{actual_at:DateTime64(3,'Asia/Shanghai')}
-                )
-                WHERE point_rank=1
+                WHERE relative_row<=31
             )
             SELECT sector_type,sector_code,sector_name,relative_row,scheduled_time,
-                   member_total,valid_member_count,index_change_ratio_pct,index_change_1m_pct,
+                   member_total,valid_member_count,index_last_price,
+                   index_change_ratio_pct,index_change_1m_pct,
                    up_count,down_count,flat_count,up_ratio,down_ratio,
                    limit_up_count,limit_down_count,limit_break_count,
-                   turnover_total,turnover_delta_1m_total,turnover_growth_1m,
+                   turnover_total,turnover_delta_1m_total,prev_turnover_delta_1m_total,
+                   turnover_growth_1m,turnover_market_share_pct,
+                   turnover_1m_market_share_pct,turnover_market_share_delta_1m,
+                   turnover_1m_market_share_delta_1m,
                    new_high_count,new_low_count,new_high_ratio,new_low_ratio,
                    turnover_1m_top1_share_pct,turnover_1m_top3_share_pct,
                    turnover_1m_top5_share_pct
@@ -480,7 +635,7 @@ class MarketContextReader:
         actual_at: datetime,
     ) -> list[dict[str, Any]]:
         table = SECTOR_STATE_TABLES[sector_type]
-        return self.rows(
+        timeline = self.rows(
             f"""
             SELECT toString(collection_id) AS collection_id,node_seq,scheduled_time,session,
                    sector_code,sector_name,member_total,valid_member_count,
@@ -489,7 +644,10 @@ class MarketContextReader:
                    limit_up_count,up_5_to_limit_count,up_1_to_5_count,up_0_to_1_count,
                    down_0_to_1_count,down_1_to_5_count,down_5_to_limit_count,
                    limit_down_count,limit_break_count,turnover_total,
-                   turnover_delta_1m_total,turnover_growth_1m,new_high_count,new_low_count,
+                   turnover_delta_1m_total,prev_turnover_delta_1m_total,
+                   turnover_growth_1m,turnover_market_share_pct,
+                   turnover_1m_market_share_pct,turnover_market_share_delta_1m,
+                   turnover_1m_market_share_delta_1m,new_high_count,new_low_count,
                    new_high_ratio,new_low_ratio,turnover_1m_top1_share_pct,
                    turnover_1m_top3_share_pct,turnover_1m_top5_share_pct
             FROM {table} FINAL
@@ -503,11 +661,20 @@ class MarketContextReader:
                 "actual_at": actual_at,
             },
         )
+        facts = self.sector_market_facts(
+            trade_date,
+            [str(row["collection_id"]) for row in timeline],
+            sector_type,
+            [sector_code],
+        )
+        fact_map = {row["collection_id"]: row for row in facts}
+        return [{**row, **fact_map.get(str(row["collection_id"]), {})} for row in timeline]
 
     def resolve_sector_candidates(
         self,
         sector_id: str | None,
         sector_name: str | None,
+        trade_date: date,
     ) -> tuple[list[dict[str, Any]], str]:
         if sector_id:
             rows = self.rows(
@@ -542,7 +709,36 @@ class MarketContextReader:
             {"name": normalized},
         )
         exact = [row for row in rows if _normalize_sector_name(row["sector_name"]) == normalized]
-        return (exact or rows), ("sector_name_exact" if exact else "sector_name_fuzzy")
+        if exact or rows:
+            return (exact or rows), ("sector_name_exact" if exact else "sector_name_fuzzy")
+        rows = self.rows(
+            """
+            SELECT sector_type,sector_code,
+                   argMax(sector_name,version_time) AS matched_sector_name
+            FROM market.strategic_sector_watchlist FINAL
+            WHERE is_active=1 AND effective_from<={trade_date:Date}
+              AND (effective_to IS NULL OR effective_to>={trade_date:Date})
+              AND (
+                positionCaseInsensitiveUTF8(strategic_theme,{name:String})>0
+                OR positionCaseInsensitiveUTF8({name:String},strategic_theme)>0
+                OR positionCaseInsensitiveUTF8(strategic_subtheme,{name:String})>0
+                OR positionCaseInsensitiveUTF8({name:String},strategic_subtheme)>0
+                OR positionCaseInsensitiveUTF8(sector_name,{name:String})>0
+              )
+            GROUP BY sector_type,sector_code
+            ORDER BY sector_type,matched_sector_name
+            LIMIT 50
+            """,
+            {"trade_date": trade_date, "name": sector_name.strip()},
+        )
+        return [
+            {
+                "sector_type": row["sector_type"],
+                "sector_code": row["sector_code"],
+                "sector_name": row["matched_sector_name"],
+            }
+            for row in rows
+        ], "strategic_direction"
 
     def current_sector_states(
         self, trade_date: date, collection_id: str, sector_codes: list[str]
@@ -671,39 +867,46 @@ class MarketContextReader:
         )
 
 
-def _row_offsets(
-    rows: list[dict[str, Any]],
-) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
-    current = rows[-1]
-    current_at = current["scheduled_time"]
+def _same_session_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    current_at = rows[-1]["scheduled_time"]
     is_morning = current_at.hour < 12
-    same_half_day = [
+    return [
         row
         for row in rows
         if (row["scheduled_time"].hour < 12) == is_morning
         and (is_morning or row["scheduled_time"].hour >= 13)
     ]
 
-    def nearest_to_offset(minutes: int) -> dict[str, Any] | None:
-        expected = current_at - timedelta(minutes=minutes)
-        candidates = [
-            row
-            for row in same_half_day
-            if row["scheduled_time"] < current_at
-            and abs((row["scheduled_time"] - expected).total_seconds()) <= 90
-        ]
-        return (
-            min(
-                candidates,
-                key=lambda row: abs((row["scheduled_time"] - expected).total_seconds()),
-            )
-            if candidates
-            else None
-        )
 
-    base = nearest_to_offset(15)
-    prebase = nearest_to_offset(30)
-    return current, base, prebase
+def _row_at_offset(rows: list[dict[str, Any]], minutes: int) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    current_at = rows[-1]["scheduled_time"]
+    expected = current_at - timedelta(minutes=minutes)
+    candidates = [
+        row
+        for row in _same_session_rows(rows)
+        if row["scheduled_time"] < current_at
+        and abs((row["scheduled_time"] - expected).total_seconds()) <= 30
+    ]
+    return (
+        min(candidates, key=lambda row: abs((row["scheduled_time"] - expected).total_seconds()))
+        if candidates
+        else None
+    )
+
+
+def _row_offsets(
+    rows: list[dict[str, Any]],
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
+    return rows[-1], _row_at_offset(rows, 1), _row_at_offset(rows, 5), _row_at_offset(rows, 15)
 
 
 def _volume_price_label(row: dict[str, Any]) -> str | None:
@@ -720,16 +923,18 @@ def _volume_price_label(row: dict[str, Any]) -> str | None:
     return None
 
 
-def _compress_stock_trajectory(rows: list[dict[str, Any]], limit: int = 16) -> list[dict[str, Any]]:
+def _compress_stock_trajectory(
+    rows: list[dict[str, Any]],
+    recent_minutes: int = STOCK_TRAJECTORY_MINUTES,
+    early_event_limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Return continuous recent minutes plus a few earlier event nodes."""
     candidates: dict[int, set[str]] = defaultdict(set)
     if not rows:
         return []
     candidates[0].add("首个有效节点")
     candidates[len(rows) - 1].add("当前节点")
     for index, row in enumerate(rows):
-        scheduled = row["scheduled_time"]
-        if scheduled.minute % 15 == 0:
-            candidates[index].add("15分钟节点")
         previous = rows[index - 1] if index else None
         for field, label in (
             ("new_high_flag", "创新高"),
@@ -769,17 +974,23 @@ def _compress_stock_trajectory(rows: list[dict[str, Any]], limit: int = 16) -> l
         "区间最大1分钟成交": 70,
         "价格拐点": 60,
         "首个有效节点": 50,
-        "15分钟节点": 20,
     }
-    if len(candidates) > limit:
-        keep = sorted(
-            candidates,
-            key=lambda index: max(priority.get(reason, 0) for reason in candidates[index]),
-            reverse=True,
-        )[:limit]
-        candidates = {index: candidates[index] for index in keep}
+    recent_rows = _same_session_rows(rows)[-recent_minutes:]
+    recent_times = {row["scheduled_time"] for row in recent_rows}
+    recent_indexes = {
+        index for index, row in enumerate(rows) if row["scheduled_time"] in recent_times
+    }
+    earlier = [index for index in candidates if index not in recent_indexes]
+    earlier.sort(
+        key=lambda index: (
+            max(priority.get(reason, 0) for reason in candidates[index]),
+            rows[index]["scheduled_time"],
+        ),
+        reverse=True,
+    )
+    selected_indexes = sorted(set(earlier[:early_event_limit]) | recent_indexes)
     result = []
-    for index in sorted(candidates):
+    for index in selected_indexes:
         row = rows[index]
         result.append(
             {
@@ -788,50 +999,40 @@ def _compress_stock_trajectory(rows: list[dict[str, Any]], limit: int = 16) -> l
                 "change_pct": row.get("price_change_ratio_pct"),
                 "turnover": row.get("turnover"),
                 "turnover_1m": row.get("turnover_delta_1m"),
+                "price_change_1m_pct": row.get("price_change_1m_pct"),
                 "new_high": bool(row.get("new_high_flag")),
                 "new_low": bool(row.get("new_low_flag")),
                 "limit_up": bool(row.get("is_limit_up")),
                 "limit_break": bool(row.get("is_limit_break")),
-                "reasons": sorted(candidates[index]),
+                "event": sorted(candidates.get(index, set())),
             }
         )
     return result
 
 
 def _compress_sector_trajectory(
-    rows: list[dict[str, Any]], limit: int = 14
+    rows: list[dict[str, Any]], recent_minutes: int = SECTOR_TRAJECTORY_MINUTES
 ) -> list[dict[str, Any]]:
     if not rows:
         return []
-    indexes = {0, len(rows) - 1}
-    for index, row in enumerate(rows):
-        if row["scheduled_time"].minute % 15 == 0:
-            indexes.add(index)
-    for field in ("index_change_ratio_pct", "turnover_delta_1m_total", "up_ratio"):
-        values = [(i, _number(row.get(field))) for i, row in enumerate(rows)]
-        values = [(i, value) for i, value in values if value is not None]
-        if values:
-            indexes.add(max(values, key=lambda item: item[1])[0])
-            indexes.add(min(values, key=lambda item: item[1])[0])
-    if len(indexes) > limit:
-        anchors = {0, len(rows) - 1}
-        extras = sorted(
-            indexes - anchors,
-            key=lambda i: abs(_number(rows[i].get("index_change_1m_pct")) or 0),
-            reverse=True,
-        )
-        indexes = anchors | set(extras[: limit - len(anchors)])
+    selected = _same_session_rows(rows)[-recent_minutes:]
     return [
         {
-            "time": rows[index]["scheduled_time"],
-            "change_pct": rows[index].get("index_change_ratio_pct"),
-            "up_ratio": rows[index].get("up_ratio"),
-            "turnover": rows[index].get("turnover_total"),
-            "turnover_1m": rows[index].get("turnover_delta_1m_total"),
-            "limit_up_count": rows[index].get("limit_up_count"),
-            "limit_break_count": rows[index].get("limit_break_count"),
+            "time": row["scheduled_time"],
+            "change_pct": row.get("index_change_ratio_pct"),
+            "up_ratio": row.get("up_ratio"),
+            "turnover_1m": row.get("turnover_delta_1m_total"),
+            "cum_share": row.get("turnover_market_share_pct"),
+            "instant_share": row.get("turnover_1m_market_share_pct"),
+            "limit_up_count": row.get("limit_up_count"),
+            "limit_break_count": row.get("limit_break_count"),
+            "new_high_ratio": (
+                None
+                if row["scheduled_time"].strftime("%H:%M") == "09:30"
+                else row.get("new_high_ratio")
+            ),
         }
-        for index in sorted(indexes)
+        for row in selected
     ]
 
 
@@ -955,36 +1156,47 @@ def _group_relative_rows(
 
 
 def _stock_current_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    current, base, prebase = _row_offsets(rows)
-    recent_turnover = _difference(current.get("turnover"), base.get("turnover") if base else None)
-    prior_turnover = (
-        _difference(base.get("turnover"), prebase.get("turnover")) if base and prebase else None
+    current, prev_1m, prev_5m, prev_15m = _row_offsets(rows)
+    prev_10m = _row_at_offset(rows, 10)
+    prev_30m = _row_at_offset(rows, 30)
+    turnover_5m = _difference(
+        current.get("turnover"), prev_5m.get("turnover") if prev_5m else None
     )
-    previous_minutes = [
-        _number(row.get("turnover_delta_1m"))
-        for row in rows[-16:-1]
-        if _number(row.get("turnover_delta_1m")) is not None
-    ]
-    previous_average = sum(previous_minutes) / len(previous_minutes) if previous_minutes else None
+    prev_turnover_5m = (
+        _difference(prev_5m.get("turnover"), prev_10m.get("turnover"))
+        if prev_5m and prev_10m
+        else None
+    )
+    turnover_15m = _difference(
+        current.get("turnover"), prev_15m.get("turnover") if prev_15m else None
+    )
+    prev_turnover_15m = (
+        _difference(prev_15m.get("turnover"), prev_30m.get("turnover"))
+        if prev_15m and prev_30m
+        else None
+    )
+    turnover_1m = current.get("turnover_delta_1m")
+    prev_turnover_1m = prev_1m.get("turnover_delta_1m") if prev_1m else None
     return {
         "price": current.get("last_price"),
         "change_pct": current.get("price_change_ratio_pct"),
         "turnover": current.get("turnover"),
-        "turnover_1m": current.get("turnover_delta_1m"),
-        "price_change_1m_pct": current.get("price_change_1m_pct"),
-        "price_change_15m_pct": _pct_change(
-            current.get("last_price"), base.get("last_price") if base else None
+        "change_1m_pct": current.get("price_change_1m_pct"),
+        "change_5m_pct": _pct_change(
+            current.get("last_price"), prev_5m.get("last_price") if prev_5m else None
         ),
-        "change_pct_delta_15m": _difference(
-            current.get("price_change_ratio_pct"),
-            base.get("price_change_ratio_pct") if base else None,
+        "change_15m_pct": _pct_change(
+            current.get("last_price"), prev_15m.get("last_price") if prev_15m else None
         ),
-        "turnover_15m": recent_turnover,
-        "prior_turnover_15m": prior_turnover,
-        "turnover_attention_change_15m_pct": _pct_change(recent_turnover, prior_turnover),
-        "turnover_1m_vs_previous_15m_average_pct": _pct_change(
-            current.get("turnover_delta_1m"), previous_average
-        ),
+        "turnover_1m": turnover_1m,
+        "turnover_5m": turnover_5m,
+        "turnover_15m": turnover_15m,
+        "prev_turnover_1m": prev_turnover_1m,
+        "prev_turnover_5m": prev_turnover_5m,
+        "prev_turnover_15m": prev_turnover_15m,
+        "turnover_1m_change_pct": _pct_change(turnover_1m, prev_turnover_1m),
+        "turnover_5m_change_pct": _pct_change(turnover_5m, prev_turnover_5m),
+        "turnover_15m_change_pct": _pct_change(turnover_15m, prev_turnover_15m),
         "new_high": bool(current.get("new_high_flag")),
         "new_low": bool(current.get("new_low_flag")),
         "limit_up": bool(current.get("is_limit_up")),
@@ -992,8 +1204,10 @@ def _stock_current_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "limit_break": bool(current.get("is_limit_break")),
         "volume_price_fact": _volume_price_label(current),
         "comparison_window": {
-            "base_time": base.get("scheduled_time") if base else None,
-            "prior_base_time": prebase.get("scheduled_time") if prebase else None,
+            "current_time": current.get("scheduled_time"),
+            "prev_1m_time": prev_1m.get("scheduled_time") if prev_1m else None,
+            "prev_5m_time": prev_5m.get("scheduled_time") if prev_5m else None,
+            "prev_15m_time": prev_15m.get("scheduled_time") if prev_15m else None,
             "same_half_day_only": True,
         },
     }
@@ -1006,6 +1220,7 @@ def _public_member(row: dict[str, Any]) -> dict[str, Any]:
         "name": row.get("stock_name"),
         "price": row.get("last_price"),
         "change_pct": row.get("price_change_ratio_pct"),
+        "change_1m_pct": row.get("price_change_1m_pct"),
         "turnover": row.get("turnover"),
         "turnover_1m": row.get("turnover_delta_1m"),
         "turnover_rank": row.get("turnover_rank"),
@@ -1064,52 +1279,145 @@ def _member_groups(rows: list[dict[str, Any]], limit: int) -> dict[str, list[dic
     }
 
 
+def _core_member_trajectories(
+    reader: MarketContextReader,
+    trade_date: date,
+    actual_at: datetime,
+    ranked_rows: list[dict[str, Any]],
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in sorted(
+        ranked_rows,
+        key=lambda item: (
+            int(item.get("turnover_1m_rank") or 999999),
+            int(item.get("turnover_rank") or 999999),
+        ),
+    ):
+        thscode = str(row.get("thscode") or "")
+        if thscode and thscode not in seen:
+            selected.append(row)
+            seen.add(thscode)
+        if len(selected) >= limit:
+            break
+    result = []
+    for member in selected:
+        timeline = reader.stock_timeline(trade_date, actual_at, str(member["thscode"]))
+        result.append(
+            {
+                "ticker": member.get("thscode") or member.get("ticker"),
+                "name": member.get("stock_name"),
+                "trajectory": _compress_stock_trajectory(
+                    timeline,
+                    recent_minutes=CORE_STOCK_TRAJECTORY_MINUTES,
+                    early_event_limit=0,
+                ),
+            }
+        )
+    return result
+
+
 def _sector_metrics(
-    current: dict[str, Any], base: dict[str, Any] | None, prebase: dict[str, Any] | None
+    current: dict[str, Any],
+    prev_1m: dict[str, Any] | None,
+    prev_5m: dict[str, Any] | None,
+    prev_15m: dict[str, Any] | None,
+    prev_10m: dict[str, Any] | None = None,
+    prev_30m: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    recent_turnover = _difference(
-        current.get("turnover_total"), base.get("turnover_total") if base else None
+    turnover_1m = current.get("turnover_delta_1m_total")
+    prev_turnover_1m = prev_1m.get("turnover_delta_1m_total") if prev_1m else None
+    turnover_5m = _difference(
+        current.get("turnover_total"), prev_5m.get("turnover_total") if prev_5m else None
     )
-    prior_turnover = (
-        _difference(base.get("turnover_total"), prebase.get("turnover_total"))
-        if base and prebase
+    prev_turnover_5m = (
+        _difference(prev_5m.get("turnover_total"), prev_10m.get("turnover_total"))
+        if prev_5m and prev_10m
+        else None
+    )
+    turnover_15m = _difference(
+        current.get("turnover_total"), prev_15m.get("turnover_total") if prev_15m else None
+    )
+    prev_turnover_15m = (
+        _difference(prev_15m.get("turnover_total"), prev_30m.get("turnover_total"))
+        if prev_15m and prev_30m
         else None
     )
     return {
         "change_pct": current.get("index_change_ratio_pct"),
         "change_1m_pct": current.get("index_change_1m_pct"),
+        "change_5m_pct": _pct_change(
+            current.get("index_last_price"),
+            prev_5m.get("index_last_price") if prev_5m else None,
+        ),
+        "change_15m_pct": _pct_change(
+            current.get("index_last_price"),
+            prev_15m.get("index_last_price") if prev_15m else None,
+        ),
         "member_count": current.get("member_total"),
         "valid_member_count": current.get("valid_member_count"),
         "up_count": current.get("up_count"),
         "down_count": current.get("down_count"),
         "flat_count": current.get("flat_count"),
         "up_ratio": current.get("up_ratio"),
+        "up_ratio_change_1m": _difference(
+            current.get("up_ratio"), prev_1m.get("up_ratio") if prev_1m else None
+        ),
+        "up_ratio_change_5m": _difference(
+            current.get("up_ratio"), prev_5m.get("up_ratio") if prev_5m else None
+        ),
+        "up_ratio_change_15m": _difference(
+            current.get("up_ratio"), prev_15m.get("up_ratio") if prev_15m else None
+        ),
         "down_ratio": current.get("down_ratio"),
         "limit_up_count": current.get("limit_up_count"),
         "limit_down_count": current.get("limit_down_count"),
         "limit_break_count": current.get("limit_break_count"),
         "new_high_count": current.get("new_high_count"),
         "new_low_count": current.get("new_low_count"),
+        "new_high_ratio": current.get("new_high_ratio"),
+        "new_low_ratio": current.get("new_low_ratio"),
         "turnover": current.get("turnover_total"),
-        "turnover_1m": current.get("turnover_delta_1m_total"),
-        "turnover_15m": recent_turnover,
-        "prior_turnover_15m": prior_turnover,
-        "turnover_attention_change_15m_pct": _pct_change(recent_turnover, prior_turnover),
-        "change_pct_delta_15m": _difference(
-            current.get("index_change_ratio_pct"),
-            base.get("index_change_ratio_pct") if base else None,
+        "turnover_1m": turnover_1m,
+        "turnover_5m": turnover_5m,
+        "turnover_15m": turnover_15m,
+        "prev_turnover_1m": prev_turnover_1m,
+        "prev_turnover_5m": prev_turnover_5m,
+        "prev_turnover_15m": prev_turnover_15m,
+        "turnover_1m_change_pct": _pct_change(turnover_1m, prev_turnover_1m),
+        "turnover_5m_change_pct": _pct_change(turnover_5m, prev_turnover_5m),
+        "turnover_15m_change_pct": _pct_change(turnover_15m, prev_turnover_15m),
+        "cum_market_share": current.get("turnover_market_share_pct"),
+        "instant_market_share": current.get("turnover_1m_market_share_pct"),
+        "instant_share_change_1m": _difference(
+            current.get("turnover_1m_market_share_pct"),
+            prev_1m.get("turnover_1m_market_share_pct") if prev_1m else None,
         ),
-        "up_ratio_delta_15m": _difference(
-            current.get("up_ratio"), base.get("up_ratio") if base else None
+        "instant_share_change_5m": _difference(
+            current.get("turnover_1m_market_share_pct"),
+            prev_5m.get("turnover_1m_market_share_pct") if prev_5m else None,
         ),
+        "instant_share_change_15m": _difference(
+            current.get("turnover_1m_market_share_pct"),
+            prev_15m.get("turnover_1m_market_share_pct") if prev_15m else None,
+        ),
+        "cum_rank": current.get("turnover_share_rank"),
+        "instant_rank": current.get("turnover_1m_share_rank"),
+        "candidate_rank": current.get("candidate_rank"),
+        "data_status": current.get("state_data_status"),
+        "source_age_seconds": current.get("state_source_age_seconds"),
+        "is_fallback": current.get("state_is_fallback"),
         "turnover_1m_concentration_pct": {
             "top1": current.get("turnover_1m_top1_share_pct"),
             "top3": current.get("turnover_1m_top3_share_pct"),
             "top5": current.get("turnover_1m_top5_share_pct"),
         },
         "comparison_window": {
-            "base_time": base.get("scheduled_time") if base else None,
-            "prior_base_time": prebase.get("scheduled_time") if prebase else None,
+            "current_time": current.get("scheduled_time"),
+            "prev_1m_time": prev_1m.get("scheduled_time") if prev_1m else None,
+            "prev_5m_time": prev_5m.get("scheduled_time") if prev_5m else None,
+            "prev_15m_time": prev_15m.get("scheduled_time") if prev_15m else None,
             "same_half_day_only": True,
         },
     }
@@ -1127,12 +1435,15 @@ def _stock_sector_contexts(
     ranked: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in ranked_rows:
         ranked[(row["sector_type"], row["sector_code"])].append(row)
-    _, stock_base, _ = _row_offsets(stock_rows)
+    _, _, _, stock_prev_15m = _row_offsets(stock_rows)
     contexts = []
     for selected_row in selected:
         key = (selected_row["sector_type"], selected_row["sector_code"])
         points = relative[key]
-        current, base, prebase = points[1], points.get(16), points.get(31)
+        point_rows = sorted(points.values(), key=lambda row: row["scheduled_time"])
+        current, prev_1m, prev_5m, prev_15m = _row_offsets(point_rows)
+        prev_10m = _row_at_offset(point_rows, 10)
+        prev_30m = _row_at_offset(point_rows, 30)
         members = ranked.get(key, [])
         target = next((row for row in members if row["thscode"] == thscode), None)
         current_excess = _difference(
@@ -1140,9 +1451,10 @@ def _stock_sector_contexts(
         )
         base_excess = (
             _difference(
-                stock_base.get("price_change_ratio_pct"), base.get("index_change_ratio_pct")
+                stock_prev_15m.get("price_change_ratio_pct"),
+                prev_15m.get("index_change_ratio_pct"),
             )
-            if stock_base and base
+            if stock_prev_15m and prev_15m
             else None
         )
         if current_excess is None:
@@ -1191,7 +1503,9 @@ def _stock_sector_contexts(
                         }
                     ),
                 },
-                "current_state": _sector_metrics(current, base, prebase),
+                "current_state": _sector_metrics(
+                    current, prev_1m, prev_5m, prev_15m, prev_10m, prev_30m
+                ),
                 "stock_position": position,
                 "reference_stocks": {
                     "turnover_carriers": _member_groups(members, group_limit)["turnover_top"],
@@ -1214,6 +1528,7 @@ def _build_stock_context(
     *,
     sector_limit: int,
     reference_limit: int,
+    trajectory_minutes: int,
 ) -> dict[str, Any]:
     stock_rows = reader.stock_timeline(trade_date, node["scheduled_time"], thscode)
     if not stock_rows:
@@ -1261,8 +1576,13 @@ def _build_stock_context(
         "ticker": ticker,
         "thscode": thscode,
         "name": current.get("stock_name"),
+        "data_status": node.get("state_data_status"),
+        "source_age_seconds": node.get("state_source_age_seconds"),
+        "is_fallback": node.get("state_is_fallback"),
         "current_state": _stock_current_block(stock_rows),
-        "key_trajectory": _compress_stock_trajectory(stock_rows),
+        "key_trajectory": _compress_stock_trajectory(
+            stock_rows, recent_minutes=trajectory_minutes
+        ),
         "direction_selection": {
             "model": "TRADING_DIRECTION_V2",
             "policy": (
@@ -1290,7 +1610,9 @@ def _build_stock_context(
         ),
         "compression": {
             "source_stock_nodes": len(stock_rows),
-            "returned_trajectory_nodes": len(_compress_stock_trajectory(stock_rows)),
+            "returned_trajectory_nodes": len(
+                _compress_stock_trajectory(stock_rows, recent_minutes=trajectory_minutes)
+            ),
             "valid_sector_memberships_considered": len(
                 {row["sector_code"] for row in sector_rows if row.get("relative_row") == 1}
             ),
@@ -1321,12 +1643,9 @@ def _build_sector_context(
     reader: MarketContextReader,
     trade_date: date,
     node: dict[str, Any],
-    sector_id: str | None,
-    sector_name: str | None,
+    candidates: list[dict[str, Any]],
+    match_type: str,
 ) -> dict[str, Any]:
-    candidates, match_type = reader.resolve_sector_candidates(sector_id, sector_name)
-    if not candidates:
-        return {"status": "NOT_FOUND", "error": "没有找到匹配的有效板块"}
     states = reader.current_sector_states(
         trade_date, node["collection_id"], [row["sector_code"] for row in candidates]
     )
@@ -1340,7 +1659,21 @@ def _build_sector_context(
     timeline = reader.sector_timeline(
         selected["sector_type"], selected["sector_code"], trade_date, node["scheduled_time"]
     )
-    current, base, prebase = _row_offsets(timeline)
+    current, prev_1m, prev_5m, prev_15m = _row_offsets(timeline)
+    prev_10m = _row_at_offset(timeline, 10)
+    prev_30m = _row_at_offset(timeline, 30)
+    matched_facts = reader.sector_market_facts(
+        trade_date,
+        [node["collection_id"]],
+        selected["sector_type"],
+        [row["sector_code"] for row in scored],
+    )
+    matched_fact_map = {row["sector_code"]: row for row in matched_facts}
+    strategic_relation = reader.strategic_relations(
+        trade_date,
+        selected["sector_type"],
+        [row["sector_code"] for row in scored],
+    )
     ranked = reader.ranked_members(
         trade_date,
         node["collection_id"],
@@ -1348,6 +1681,9 @@ def _build_sector_context(
         group_limit=5,
     )
     groups = _member_groups(ranked, 5)
+    core_member_trajectories = _core_member_trajectories(
+        reader, trade_date, node["scheduled_time"], ranked
+    )
     turnover_top = sorted(
         (row for row in ranked if int(row["turnover_rank"]) <= 5),
         key=lambda row: int(row["turnover_rank"]),
@@ -1363,6 +1699,22 @@ def _build_sector_context(
         )
         for count in (1, 3, 5)
     }
+    matched_sectors = []
+    state_map = {(row["sector_type"], row["sector_code"]): row for row in states}
+    for row in scored[:10]:
+        state = state_map.get((row["sector_type"], row["sector_code"]), {})
+        fact = matched_fact_map.get(row["sector_code"], {})
+        matched_sectors.append(
+            {
+                "sector_name": row["sector_name"],
+                "sector_type": row["sector_type"],
+                "sector_id": row["sector_code"],
+                "match_score": row["current_expression_score"],
+                "change_pct": state.get("index_change_ratio_pct"),
+                "instant_share": fact.get("turnover_1m_market_share_pct"),
+                "candidate_rank": fact.get("candidate_rank"),
+            }
+        )
     return {
         "status": "OK",
         "resolution": {
@@ -1382,7 +1734,12 @@ def _build_sector_context(
             ],
         },
         "current_state": {
-            **_sector_metrics(current, base, prebase),
+            **_sector_metrics(
+                current, prev_1m, prev_5m, prev_15m, prev_10m, prev_30m
+            ),
+            "data_status": node.get("state_data_status"),
+            "source_age_seconds": node.get("state_source_age_seconds"),
+            "is_fallback": node.get("state_is_fallback"),
             "price_distribution": {
                 "limit_up": current.get("limit_up_count"),
                 "up_5_to_limit": current.get("up_5_to_limit_count"),
@@ -1398,6 +1755,9 @@ def _build_sector_context(
         },
         "key_trajectory": _compress_sector_trajectory(timeline),
         "key_stocks": groups,
+        "core_stock_trajectories": core_member_trajectories,
+        "strategic_relation": strategic_relation,
+        "matched_sectors": matched_sectors,
         "compression": {
             "source_sector_nodes": len(timeline),
             "returned_trajectory_nodes": len(_compress_sector_trajectory(timeline)),
@@ -1411,7 +1771,7 @@ def _build_sector_context(
 
 def get_market_context_state(
     target_type: str,
-    target_time: str,
+    target_time: str | None = None,
     ticker: str | int | None = None,
     tickers: list[str | int] | None = None,
     sector_id: str | None = None,
@@ -1427,18 +1787,19 @@ def get_market_context_state(
     try:
         if target_type not in {"stock", "stocks", "sector"}:
             raise ValueError("target_type必须是stock、stocks或sector")
-        parsed_time, has_seconds = _parse_time(target_time)
-        normalized_stocks: list[tuple[str, str]] = []
+        parsed_time: time | None = None
+        has_seconds = False
+        if target_time is not None:
+            parsed_time, has_seconds = _parse_time(target_time)
+        stock_inputs: list[Any] = []
         if target_type == "stock":
             if ticker is None:
                 raise ValueError("stock模式必须提供ticker")
-            normalized_stocks = [_normalize_stock_code(ticker)]
+            stock_inputs = [ticker]
         elif target_type == "stocks":
             if not isinstance(tickers, list) or not 2 <= len(tickers) <= MAX_STOCKS:
                 raise ValueError(f"stocks模式必须提供2到{MAX_STOCKS}只股票")
-            normalized_stocks = list(dict.fromkeys(_normalize_stock_code(item) for item in tickers))
-            if len(normalized_stocks) < 2:
-                raise ValueError("stocks模式去重后至少需要2只股票")
+            stock_inputs = tickers
         else:
             if bool(sector_id) == bool(sector_name):
                 raise ValueError("sector模式必须且只能提供sector_id或sector_name中的一个")
@@ -1470,10 +1831,35 @@ def get_market_context_state(
                 date_source = "latest_database_trade_date"
             if selected_date is None:
                 return {"status": "NOT_FOUND", "error": "没有找到可用交易日"}
-        target_at = datetime.combine(selected_date, parsed_time, tzinfo=SHANGHAI)
-        if not has_seconds:
-            target_at += timedelta(seconds=59)
-        node = reader.resolve_node(selected_date, target_at)
+        normalized_stocks: list[tuple[str, str]] = []
+        sector_candidates: list[dict[str, Any]] = []
+        sector_match_type = ""
+        if target_type in {"stock", "stocks"}:
+            normalized_stocks = list(
+                dict.fromkeys(
+                    _resolve_stock_input(reader, selected_date, item) for item in stock_inputs
+                )
+            )
+            if target_type == "stocks" and len(normalized_stocks) < 2:
+                raise ValueError("stocks模式去重后至少需要2只股票")
+        else:
+            sector_candidates, sector_match_type = reader.resolve_sector_candidates(
+                sector_id, sector_name, selected_date
+            )
+            if not sector_candidates:
+                return {"status": "NOT_FOUND", "error": "没有找到匹配的有效板块"}
+        if parsed_time is None:
+            target_at = datetime.combine(selected_date, time.max, tzinfo=SHANGHAI)
+        else:
+            target_at = datetime.combine(selected_date, parsed_time, tzinfo=SHANGHAI)
+            if not has_seconds:
+                target_at += timedelta(seconds=59)
+        if target_type in {"stock", "stocks"}:
+            node = reader.resolve_stock_node(
+                selected_date, target_at, [thscode for _, thscode in normalized_stocks]
+            )
+        else:
+            node = reader.resolve_sector_node(selected_date, target_at, sector_candidates)
         if node is None:
             return {
                 "status": "NOT_FOUND",
@@ -1482,8 +1868,23 @@ def get_market_context_state(
                 "error": "目标时间及之前没有可用市场状态节点",
                 "available_time_range": reader.available_time_range(selected_date),
             }
+        resolved_requested_time, source_age_seconds = _requested_time_quality(
+            selected_date,
+            parsed_time,
+            has_seconds,
+            target_time,
+            node["scheduled_time"],
+        )
+        is_fallback = source_age_seconds > 0
+        node.update(
+            {
+                "state_data_status": "FALLBACK" if is_fallback else "CURRENT",
+                "state_source_age_seconds": source_age_seconds,
+                "state_is_fallback": is_fallback,
+            }
+        )
         if target_type in {"stock", "stocks"}:
-            sector_limit = 5 if target_type == "stock" else 3
+            sector_limit = 5
             reference_limit = 3
             contexts = [
                 _build_stock_context(
@@ -1494,6 +1895,11 @@ def get_market_context_state(
                     thscode,
                     sector_limit=sector_limit,
                     reference_limit=reference_limit,
+                    trajectory_minutes=(
+                        STOCK_TRAJECTORY_MINUTES
+                        if target_type == "stock"
+                        else MULTI_STOCK_TRAJECTORY_MINUTES
+                    ),
                 )
                 for normalized_ticker, thscode in normalized_stocks
             ]
@@ -1511,7 +1917,7 @@ def get_market_context_state(
             )
         else:
             sector_context = _build_sector_context(
-                reader, selected_date, node, sector_id, sector_name
+                reader, selected_date, node, sector_candidates, sector_match_type
             )
             data = {"sector": sector_context}
             overall_status = str(sector_context.get("status", "QUERY_ERROR"))
@@ -1531,14 +1937,13 @@ def get_market_context_state(
                 "trade_date_source": date_source,
                 "collection_id": node["collection_id"],
                 "node_seq": node["node_seq"],
+                "requested_time": resolved_requested_time,
                 "actual_time": node["scheduled_time"],
                 "session": node["session"],
-                "time_offset_seconds": round(
-                    (
-                        node["scheduled_time"]
-                        - datetime.combine(selected_date, parsed_time, tzinfo=SHANGHAI)
-                    ).total_seconds()
-                ),
+                "time_offset_seconds": -source_age_seconds,
+                "data_status": node["state_data_status"],
+                "source_age_seconds": source_age_seconds,
+                "is_fallback": is_fallback,
             },
             "data": data,
             "metric_semantics": {
@@ -1552,7 +1957,7 @@ def get_market_context_state(
             "limitations": [
                 "没有逐笔主动买卖方向，不能可靠计算真实净资金流入或流出",
                 "板块相关性来自现有成员映射和当前市场表达，不代表业务收入相关度",
-                "关键拐点由分钟快照压缩得到，不替代逐笔成交或盘口数据",
+                "近期轨迹来自分钟快照，不替代逐笔成交或盘口数据",
             ],
             "performance": {
                 "query_count": reader.query_count,
@@ -1560,13 +1965,7 @@ def get_market_context_state(
                 "total_elapsed_ms": round((perf_counter() - started) * 1000, 3),
             },
         }
-        safe = _round_metrics(_json_safe(response))
-        safe["performance"]["response_bytes_utf8"] = 0
-        for _ in range(2):
-            safe["performance"]["response_bytes_utf8"] = len(
-                json.dumps(safe, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            )
-        return safe
+        return compact_market_context_response(_json_safe(response))
     except (TypeError, ValueError) as exc:
         return {"status": "INVALID_REQUEST", "error": str(exc)}
     except Exception as exc:  # noqa: BLE001 - MCP调用需要明确返回查询失败事实

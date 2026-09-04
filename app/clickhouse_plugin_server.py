@@ -73,10 +73,11 @@ TOOLS = [
         "name": "get_market_context_state",
         "title": "读取个股或板块上下文",
         "description": (
-            "按需读取指定时间的单只股票、最多5只股票或单个板块上下文。"
-            "stock模式返回个股轨迹、自动筛选的主要方向及板块内地位；"
+            "按需读取单只股票、最多5只股票或单个板块的1分钟上下文。"
+            "不传时间时读取继承交易日的最新有效分钟，传时间时恢复指定分钟并允许向前回退；"
+            "stock模式返回连续分钟轨迹、自动筛选的主要方向及板块内实时地位；"
             "stocks模式分别返回各股票自己的方向上下文；"
-            "sector模式返回板块状态、压缩轨迹和少量关键成员。"
+            "sector模式返回连续分钟板块轨迹、即时成交份额和少量关键成员轨迹。"
             "数据库端完成聚合、排名和筛选，不返回完整成员分钟明细。"
         ),
         "inputSchema": {
@@ -92,10 +93,10 @@ TOOLS = [
                 },
                 "sector_id": {"type": ["string", "null"]},
                 "sector_name": {"type": ["string", "null"]},
-                "target_time": {"type": "string"},
+                "target_time": {"type": ["string", "null"]},
                 "trade_date": {"type": ["string", "null"]},
             },
-            "required": ["target_type", "target_time"],
+            "required": ["target_type"],
             "additionalProperties": False,
         },
     },

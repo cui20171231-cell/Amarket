@@ -151,10 +151,11 @@ def get_market_state_package(
 @mcp.tool(
     title="读取个股或板块上下文",
     description=(
-        "按需读取指定时间的单只股票、最多5只股票或单个板块上下文。"
-        "stock模式返回个股轨迹、自动筛选的主要方向及板块内地位；"
+        "按需读取单只股票、最多5只股票或单个板块的1分钟上下文。"
+        "不传时间时读取继承交易日的最新有效分钟，传时间时恢复指定分钟并允许向前回退；"
+        "stock模式返回连续分钟轨迹、自动筛选的主要方向及板块内实时地位；"
         "stocks模式分别返回各股票自己的方向上下文；"
-        "sector模式返回板块状态、压缩轨迹和少量关键成员。"
+        "sector模式返回连续分钟板块轨迹、即时成交份额和少量关键成员轨迹。"
         "查询在数据库端完成聚合、排名和筛选，不返回完整成员分钟明细。"
     ),
     annotations=READ_ONLY,
@@ -163,7 +164,7 @@ def get_market_state_package(
 @audited
 def get_market_context_state(
     target_type: str,
-    target_time: str,
+    target_time: str | None = None,
     ticker: str | None = None,
     tickers: list[str] | None = None,
     sector_id: str | None = None,
