@@ -9,6 +9,7 @@ from app.market_state_package import (
     EMOTION_BUSINESS_FIELDS,
     EMOTION_POOL_SOURCE_FIELDS,
     OPEN_AUCTION_CURRENT_SCHEMA,
+    OPEN_AUCTION_MARKET_TRAJECTORY_SCHEMA,
     OPEN_AUCTION_TRAJECTORY_SCHEMA,
     MarketStatePackageBuilder,
     _business_period,
@@ -123,6 +124,56 @@ def test_0925_core_stocks_use_all_eleven_opening_auction_minutes() -> None:
     assert first_current[-1] == -89
     assert "auction_volume_ratio" not in block["current_schema"]
     assert "node_seq BETWEEN 1 AND 11" in client.sql
+
+
+def test_0925_auction_market_uses_all_stocks_for_eleven_node_statistics() -> None:
+    rows = []
+    for node_seq, minute in enumerate(range(15, 26), start=1):
+        phase = (
+            "order_entry"
+            if node_seq <= 5
+            else "no_cancel"
+            if node_seq <= 10
+            else "matched"
+        )
+        for stock_code, direction, amount_factor, ratio_factor in (
+            ("000001.SZ", 1, 100, 20),
+            ("000002.SZ", -1, 50, 10),
+        ):
+            rows.append(
+                {
+                    "node_seq": node_seq,
+                    "scheduled_time": datetime.fromisoformat(
+                        f"2026-09-04T09:{minute:02d}:00+08:00"
+                    ),
+                    "auction_phase": phase,
+                    "stock_code": stock_code,
+                    "auction_pct": direction * (node_seq - 1) * 0.3,
+                    "auction_amount": amount_factor * node_seq,
+                    "auction_yesterday_ratio_pct": ratio_factor * node_seq,
+                }
+            )
+
+    block = MarketStatePackageBuilder(client=None)._opening_auction_market(rows)
+
+    assert block["data_context"] == "OPEN_AUCTION"
+    assert block["trajectory"]["schema"] == OPEN_AUCTION_MARKET_TRAJECTORY_SCHEMA
+    assert len(block["trajectory"]["rows"]) == 11
+    assert [row[0] for row in block["trajectory"]["rows"]] == [
+        f"09:{minute:02d}" for minute in range(15, 26)
+    ]
+    current = block["current"]
+    assert current["valid_count"] == 2
+    assert current["up_count"] == 1
+    assert current["down_count"] == 1
+    assert current["auction_amount_total"] == 1650.0
+    assert current["auction_amount_top10_share"] == 100.0
+    assert current["yesterday_ratio_gt_100_count"] == 2
+    assert current["yesterday_ratio_gt_200_count"] == 1
+    first_change = block["change"]["from_09_15_to_09_20"]
+    assert first_change["comparable_stock_count"] == 2
+    assert first_change["stronger_stock_count"] == 1
+    assert first_change["weaker_stock_count"] == 1
 
 
 def test_capital_top_lists_separate_cumulative_and_instant_share_changes() -> None:

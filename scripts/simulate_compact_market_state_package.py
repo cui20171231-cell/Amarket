@@ -115,6 +115,62 @@ OPEN_AUCTION_TRAJECTORY_SCHEMA = [
     "auction_unmatched",
 ]
 
+OPEN_AUCTION_MARKET_TRAJECTORY_SCHEMA = [
+    "time",
+    "auction_phase",
+    "valid_count",
+    "up_count",
+    "down_count",
+    "flat_count",
+    "up_ratio",
+    "down_ratio",
+    "up_5_count",
+    "up_2_to_5_count",
+    "up_0_to_2_count",
+    "down_0_to_2_count",
+    "down_2_to_5_count",
+    "down_5_count",
+    "limit_up_or_near_count",
+    "limit_down_or_near_count",
+    "auction_amount_total",
+    "auction_amount_valid_count",
+    "yesterday_ratio_valid_count",
+    "yesterday_ratio_gt_100_count",
+    "yesterday_ratio_gt_200_count",
+]
+
+OPEN_AUCTION_MARKET_CURRENT_FIELDS = (
+    "valid_count",
+    "up_count",
+    "down_count",
+    "flat_count",
+    "up_ratio",
+    "down_ratio",
+    "up_5_count",
+    "down_5_count",
+    "limit_up_or_near_count",
+    "limit_down_or_near_count",
+    "auction_amount_total",
+    "auction_amount_valid_count",
+    "auction_amount_top10_share",
+    "auction_amount_top20_share",
+    "auction_amount_top50_share",
+    "yesterday_ratio_valid_count",
+    "yesterday_ratio_gt_100_count",
+    "yesterday_ratio_gt_200_count",
+)
+
+OPEN_AUCTION_MARKET_CHANGE_FIELDS = (
+    "up_count_change",
+    "down_count_change",
+    "up_5_count_change",
+    "down_5_count_change",
+    "auction_amount_change",
+    "comparable_stock_count",
+    "stronger_stock_count",
+    "weaker_stock_count",
+)
+
 STRATEGIC_SCHEMA = [
     "strategic_theme",
     "strategic_subtheme",
@@ -554,6 +610,38 @@ def build_key_core_trajectory(builder: Any, full: dict[str, Any]) -> dict[str, A
     }
 
 
+def compact_auction_market(source: dict[str, Any]) -> dict[str, Any]:
+    trajectory = source.get("trajectory") or {}
+    current = source.get("current") or {}
+    change = source.get("change") or {}
+    result = {
+        "data_context": "OPEN_AUCTION",
+        "trajectory": {
+            "schema": OPEN_AUCTION_MARKET_TRAJECTORY_SCHEMA,
+            "rows": list(trajectory.get("rows") or []),
+        },
+        "current": {
+            field: current.get(field) for field in OPEN_AUCTION_MARKET_CURRENT_FIELDS
+        },
+        "change": {
+            "significant_change_threshold_pct_points": change.get(
+                "significant_change_threshold_pct_points"
+            )
+        },
+    }
+    for interval in (
+        "from_09_15_to_09_20",
+        "from_09_20_to_09_25",
+        "from_09_15_to_09_25",
+    ):
+        interval_source = change.get(interval) or {}
+        result["change"][interval] = {
+            field: interval_source.get(field)
+            for field in OPEN_AUCTION_MARKET_CHANGE_FIELDS
+        }
+    return result
+
+
 def compact_core_stocks(source: Any) -> dict[str, Any]:
     if isinstance(source, dict) and source.get("data_context") == "OPEN_AUCTION":
         return {
@@ -863,6 +951,11 @@ def build_compact(
         },
         "quality": compact_quality(full),
         "market": compact_market(full.get("market") or {}),
+        **(
+            {"auction_market": compact_auction_market(full["auction_market"])}
+            if isinstance(full.get("auction_market"), dict)
+            else {}
+        ),
         "emotion": compact_emotion(full.get("emotion") or {}),
         "capital_migration": compact_capital(full.get("capital_migration") or {}),
         "core_sectors": {
@@ -886,6 +979,29 @@ def validate_compact(compact: dict[str, Any]) -> None:
     trajectory_rows = compact["core_sector_trajectory"]["rows"]
     if len(core_sector_rows) > 20:
         raise ValueError(f"核心板块超过20个：{len(core_sector_rows)}")
+    auction_market = compact.get("auction_market")
+    if auction_market is not None:
+        target_node_seq = (compact.get("target") or {}).get("resolved_node_seq")
+        if target_node_seq != 11:
+            raise ValueError("auction_market只能出现在09:25聚合包")
+        auction_trajectory = auction_market.get("trajectory") or {}
+        auction_rows = auction_trajectory.get("rows") or []
+        if auction_market.get("data_context") != "OPEN_AUCTION":
+            raise ValueError("auction_market缺少OPEN_AUCTION语义")
+        if auction_trajectory.get("schema") != OPEN_AUCTION_MARKET_TRAJECTORY_SCHEMA:
+            raise ValueError("auction_market轨迹结构不正确")
+        if len(auction_rows) != 11:
+            raise ValueError("auction_market没有完整保留11个竞价节点")
+        if [row[0] for row in auction_rows] != [
+            f"09:{minute:02d}" for minute in range(15, 26)
+        ]:
+            raise ValueError("auction_market轨迹时间不是09:15至09:25")
+        if [row[1] for row in auction_rows] != [
+            *("order_entry" for _ in range(5)),
+            *("no_cancel" for _ in range(5)),
+            "matched",
+        ]:
+            raise ValueError("auction_market竞价阶段不正确")
     if core_stock_block.get("data_context") == "OPEN_AUCTION":
         current_rows = core_stock_block.get("current_rows") or []
         auction_rows = core_stock_block.get("trajectory_rows") or []

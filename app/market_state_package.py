@@ -181,6 +181,29 @@ OPEN_AUCTION_TRAJECTORY_SCHEMA = [
     "auction_yesterday_ratio_pct",
     "auction_unmatched",
 ]
+OPEN_AUCTION_MARKET_TRAJECTORY_SCHEMA = [
+    "time",
+    "auction_phase",
+    "valid_count",
+    "up_count",
+    "down_count",
+    "flat_count",
+    "up_ratio",
+    "down_ratio",
+    "up_5_count",
+    "up_2_to_5_count",
+    "up_0_to_2_count",
+    "down_0_to_2_count",
+    "down_2_to_5_count",
+    "down_5_count",
+    "limit_up_or_near_count",
+    "limit_down_or_near_count",
+    "auction_amount_total",
+    "auction_amount_valid_count",
+    "yesterday_ratio_valid_count",
+    "yesterday_ratio_gt_100_count",
+    "yesterday_ratio_gt_200_count",
+]
 
 
 def _json_safe(value: Any) -> Any:
@@ -881,13 +904,8 @@ class MarketStatePackageBuilder:
                 result[key]["key_nodes"] = key_rows
         return result
 
-    def _opening_auction_core_stocks(
-        self,
-        trade_date_value: date,
-        stock_top_n: int,
-    ) -> dict[str, Any]:
-        """Build the 09:25 stock layer from all eleven opening-auction minutes."""
-        rows = self._rows(
+    def _opening_auction_rows(self, trade_date_value: date) -> list[dict[str, Any]]:
+        return self._rows(
             """
             SELECT node_seq,scheduled_time,auction_phase,
                 toString(thscode) stock_code,name stock_name,
@@ -900,6 +918,181 @@ class MarketStatePackageBuilder:
             """,
             {"trade_date": trade_date_value},
         )
+
+    def _opening_auction_market(
+        self, rows: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Aggregate all opening-auction stocks into eleven market-level rows."""
+        rows_by_node: defaultdict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            node_seq = int(row.get("node_seq") or 0)
+            if node_seq in OPEN_AUCTION_NODE_SEQUENCES:
+                rows_by_node[node_seq].append(row)
+
+        row_counts = [len(rows_by_node[node_seq]) for node_seq in OPEN_AUCTION_NODE_SEQUENCES]
+        if not row_counts or min(row_counts) == 0 or len(set(row_counts)) != 1:
+            raise RuntimeError(
+                "opening auction does not contain the same full-market stock set "
+                f"for all 11 nodes: {row_counts}"
+            )
+
+        node_stats: dict[int, dict[str, Any]] = {}
+        pct_by_node: dict[int, dict[str, float]] = {}
+        for node_seq in OPEN_AUCTION_NODE_SEQUENCES:
+            node_rows = rows_by_node[node_seq]
+            valid_rows = [
+                row for row in node_rows if _auction_number(row.get("auction_pct")) is not None
+            ]
+            pct_by_node[node_seq] = {
+                str(row["stock_code"]): value
+                for row in valid_rows
+                for value in [_auction_number(row.get("auction_pct"))]
+                if value is not None
+            }
+            pct_values = list(pct_by_node[node_seq].values())
+            amount_values = [
+                value
+                for row in node_rows
+                for value in [_auction_number(row.get("auction_amount"))]
+                if value is not None
+            ]
+            yesterday_ratio_values = [
+                value
+                for row in node_rows
+                for value in [_auction_number(row.get("auction_yesterday_ratio_pct"))]
+                if value is not None
+            ]
+            valid_count = len(pct_values)
+            up_count = sum(value > 0 for value in pct_values)
+            down_count = sum(value < 0 for value in pct_values)
+            node_stats[node_seq] = {
+                "time": f"09:{14 + node_seq:02d}",
+                "auction_phase": (
+                    "order_entry"
+                    if node_seq <= 5
+                    else "no_cancel"
+                    if node_seq <= 10
+                    else "matched"
+                ),
+                "valid_count": valid_count,
+                "up_count": up_count,
+                "down_count": down_count,
+                "flat_count": sum(value == 0 for value in pct_values),
+                "up_ratio": _round_auction_number(
+                    up_count / valid_count * 100 if valid_count else None
+                ),
+                "down_ratio": _round_auction_number(
+                    down_count / valid_count * 100 if valid_count else None
+                ),
+                "up_5_count": sum(value >= 5 for value in pct_values),
+                "up_2_to_5_count": sum(2 <= value < 5 for value in pct_values),
+                "up_0_to_2_count": sum(0 < value < 2 for value in pct_values),
+                "down_0_to_2_count": sum(-2 < value < 0 for value in pct_values),
+                "down_2_to_5_count": sum(-5 < value <= -2 for value in pct_values),
+                "down_5_count": sum(value <= -5 for value in pct_values),
+                "limit_up_or_near_count": sum(value >= 9.5 for value in pct_values),
+                "limit_down_or_near_count": sum(value <= -9.5 for value in pct_values),
+                "auction_amount_total": _round_auction_number(sum(amount_values)),
+                "auction_amount_valid_count": len(amount_values),
+                "yesterday_ratio_valid_count": len(yesterday_ratio_values),
+                "yesterday_ratio_gt_100_count": sum(
+                    value > 100 for value in yesterday_ratio_values
+                ),
+                "yesterday_ratio_gt_200_count": sum(
+                    value > 200 for value in yesterday_ratio_values
+                ),
+            }
+
+        final_stats = node_stats[11]
+        final_amounts = sorted(
+            (
+                value
+                for row in rows_by_node[11]
+                for value in [_auction_number(row.get("auction_amount"))]
+                if value is not None
+            ),
+            reverse=True,
+        )
+        final_amount_total = _auction_number(final_stats["auction_amount_total"])
+
+        def top_share(limit: int) -> float | None:
+            if final_amount_total in (None, 0):
+                return None
+            return _round_auction_number(
+                sum(final_amounts[:limit]) / final_amount_total * 100
+            )
+
+        current_fields = (
+            "valid_count",
+            "up_count",
+            "down_count",
+            "flat_count",
+            "up_ratio",
+            "down_ratio",
+            "up_5_count",
+            "down_5_count",
+            "limit_up_or_near_count",
+            "limit_down_or_near_count",
+            "auction_amount_total",
+            "auction_amount_valid_count",
+            "yesterday_ratio_valid_count",
+            "yesterday_ratio_gt_100_count",
+            "yesterday_ratio_gt_200_count",
+        )
+        current = {field: final_stats[field] for field in current_fields}
+        current.update(
+            auction_amount_top10_share=top_share(10),
+            auction_amount_top20_share=top_share(20),
+            auction_amount_top50_share=top_share(50),
+        )
+
+        def change(start_node: int, end_node: int) -> dict[str, Any]:
+            start, end = node_stats[start_node], node_stats[end_node]
+            start_pct, end_pct = pct_by_node[start_node], pct_by_node[end_node]
+            comparable = sorted(set(start_pct) & set(end_pct))
+            changes = [end_pct[stock_code] - start_pct[stock_code] for stock_code in comparable]
+            return {
+                "up_count_change": end["up_count"] - start["up_count"],
+                "down_count_change": end["down_count"] - start["down_count"],
+                "up_5_count_change": end["up_5_count"] - start["up_5_count"],
+                "down_5_count_change": end["down_5_count"] - start["down_5_count"],
+                "auction_amount_change": _round_auction_number(
+                    _number(end["auction_amount_total"])
+                    - _number(start["auction_amount_total"])
+                ),
+                "comparable_stock_count": len(comparable),
+                "stronger_stock_count": sum(value >= 1 for value in changes),
+                "weaker_stock_count": sum(value <= -1 for value in changes),
+            }
+
+        trajectory_rows = [
+            [node_stats[node_seq][field] for field in OPEN_AUCTION_MARKET_TRAJECTORY_SCHEMA]
+            for node_seq in OPEN_AUCTION_NODE_SEQUENCES
+        ]
+        return {
+            "data_context": "OPEN_AUCTION",
+            "trajectory": {
+                "schema": OPEN_AUCTION_MARKET_TRAJECTORY_SCHEMA,
+                "rows": trajectory_rows,
+            },
+            "current": current,
+            "change": {
+                "significant_change_threshold_pct_points": 1.0,
+                "from_09_15_to_09_20": change(1, 6),
+                "from_09_20_to_09_25": change(6, 11),
+                "from_09_15_to_09_25": change(1, 11),
+            },
+        }
+
+    def _opening_auction_core_stocks(
+        self,
+        trade_date_value: date,
+        stock_top_n: int,
+        rows: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Build the 09:25 stock layer from all eleven opening-auction minutes."""
+        if rows is None:
+            rows = self._opening_auction_rows(trade_date_value)
         grouped: defaultdict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
         for row in rows:
             stock_code = _text(row.get("stock_code")) or ""
@@ -1346,9 +1539,12 @@ class MarketStatePackageBuilder:
         memberships = self._stock_memberships(
             trade_date_value, collection_id, stock_codes
         )
+        auction_market = None
         if target["node_seq"] == 11:
+            auction_rows = self._opening_auction_rows(trade_date_value)
+            auction_market = self._opening_auction_market(auction_rows)
             core_stocks: Any = self._opening_auction_core_stocks(
-                trade_date_value, stock_top_n
+                trade_date_value, stock_top_n, auction_rows
             )
         else:
             core_stocks = []
@@ -1613,6 +1809,7 @@ class MarketStatePackageBuilder:
                 ),
                 "intraday_trajectory": market_intraday_trajectory,
             },
+            **({"auction_market": auction_market} if auction_market is not None else {}),
             "emotion": {
                 "intraday_trajectory": emotion_intraday_trajectory,
             },
