@@ -4,7 +4,10 @@ from app.hithink.models import DerivedSnapshot, RawSnapshot
 
 
 def _empty(
-    raw: RawSnapshot, previous_trade_day_turnover: int | None = None
+    raw: RawSnapshot,
+    previous_trade_day_turnover: int | None = None,
+    total_shares: int | None = None,
+    float_shares: int | None = None,
 ) -> DerivedSnapshot:
     previous_day_delta = (
         raw.turnover - previous_trade_day_turnover
@@ -29,6 +32,8 @@ def _empty(
         previous_trade_day_turnover,
         previous_day_delta,
         previous_day_pct,
+        total_market_cap=_market_cap(raw.last_price, total_shares),
+        float_market_cap=_market_cap(raw.last_price, float_shares),
     )
 
 
@@ -37,9 +42,16 @@ def calculate(
     previous: DerivedSnapshot | None,
     allowed: bool,
     previous_trade_day_turnover: int | None = None,
+    total_shares: int | None = None,
+    float_shares: int | None = None,
 ) -> DerivedSnapshot:
     if not allowed or previous is None:
-        return _empty(raw, previous_trade_day_turnover)
+        return _empty(
+            raw,
+            previous_trade_day_turnover,
+            total_shares,
+            float_shares,
+        )
     prior = previous.raw
     turnover_delta = (
         raw.turnover - prior.turnover
@@ -106,4 +118,12 @@ def calculate(
         prev_trade_day_same_time_turnover=previous_trade_day_turnover,
         turnover_prev_trade_day_delta=previous_day_delta,
         turnover_prev_trade_day_pct=previous_day_pct,
+        total_market_cap=_market_cap(raw.last_price, total_shares),
+        float_market_cap=_market_cap(raw.last_price, float_shares),
     )
+
+
+def _market_cap(price: float | None, shares: int | None) -> float | None:
+    if price is None or shares is None:
+        return None
+    return price * shares

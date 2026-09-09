@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-VERSION = "COMPACT_CONTEXT_1M_V2"
+VERSION = "COMPACT_CONTEXT_V2.1"
 
 STOCK_TRAJECTORY_SCHEMA = [
     "time",
@@ -30,6 +30,9 @@ REFERENCE_STOCK_SCHEMA = [
     "change_pct",
     "turnover",
     "turnover_1m",
+    "total_market_cap",
+    "float_market_cap",
+    "turnover_to_float_cap_pct",
     "turnover_rank",
     "gain_rank",
     "limit_up",
@@ -55,11 +58,23 @@ KEY_STOCK_SCHEMA = [
     "change_1m_pct",
     "turnover",
     "turnover_1m",
+    "float_market_cap",
+    "turnover_to_float_cap_pct",
     "sector_turnover_rank",
     "sector_gain_rank",
     "limit_up",
     "limit_break",
     "new_high",
+]
+
+LARGEST_MEMBER_SCHEMA = [
+    "ticker",
+    "name",
+    "float_market_cap",
+    "total_market_cap",
+    "change_pct",
+    "turnover",
+    "turnover_to_float_cap_pct",
 ]
 
 
@@ -109,6 +124,16 @@ def _stock_current(source: dict[str, Any]) -> dict[str, Any]:
             "change_5m_pct": source.get("change_5m_pct"),
             "change_15m_pct": source.get("change_15m_pct"),
             "turnover": source.get("turnover"),
+            "total_market_cap": source.get("total_market_cap"),
+            "float_market_cap": source.get("float_market_cap"),
+            "turnover_to_float_cap_pct": source.get("turnover_to_float_cap_pct"),
+            "turnover_1m_to_float_cap_pct": source.get(
+                "turnover_1m_to_float_cap_pct"
+            ),
+            "turnover_15m_to_float_cap_pct": source.get(
+                "turnover_15m_to_float_cap_pct"
+            ),
+            "turnover_15m_valid_minutes": source.get("turnover_15m_valid_minutes"),
             "turnover_1m": source.get("turnover_1m"),
             "turnover_5m": source.get("turnover_5m"),
             "turnover_15m": source.get("turnover_15m"),
@@ -234,6 +259,13 @@ def _direction_current(source: dict[str, Any]) -> dict[str, Any]:
             "turnover_1m": source.get("turnover_1m"),
             "turnover_5m": source.get("turnover_5m"),
             "turnover_15m": source.get("turnover_15m"),
+            "total_market_cap": source.get("total_market_cap"),
+            "float_market_cap": source.get("float_market_cap"),
+            "turnover_to_float_cap_pct": source.get("turnover_to_float_cap_pct"),
+            "turnover_15m_to_float_cap_pct": source.get(
+                "turnover_15m_to_float_cap_pct"
+            ),
+            "turnover_15m_valid_minutes": source.get("turnover_15m_valid_minutes"),
             "turnover_1m_change_pct": source.get("turnover_1m_change_pct"),
             "turnover_5m_change_pct": source.get("turnover_5m_change_pct"),
             "turnover_15m_change_pct": source.get("turnover_15m_change_pct"),
@@ -257,6 +289,25 @@ def _stock_position(source: dict[str, Any]) -> dict[str, Any]:
             "stock_turnover_rank": source.get("turnover_rank"),
             "stock_turnover_1m_rank": source.get("turnover_1m_rank"),
             "stock_gain_rank": source.get("gain_rank"),
+            "float_market_cap_rank": source.get("float_market_cap_rank"),
+            "total_market_cap_rank": source.get("total_market_cap_rank"),
+            "turnover_to_float_cap_rank": source.get("turnover_to_float_cap_rank"),
+            "turnover_15m_to_float_cap_rank": source.get(
+                "turnover_15m_to_float_cap_rank"
+            ),
+            "valid_member_count": source.get("valid_member_count"),
+            "float_market_cap_valid_member_count": source.get(
+                "float_market_cap_valid_member_count"
+            ),
+            "total_market_cap_valid_member_count": source.get(
+                "total_market_cap_valid_member_count"
+            ),
+            "turnover_to_float_cap_valid_member_count": source.get(
+                "turnover_to_float_cap_valid_member_count"
+            ),
+            "turnover_15m_to_float_cap_valid_member_count": source.get(
+                "turnover_15m_to_float_cap_valid_member_count"
+            ),
             "stock_turnover_share_pct": source.get("turnover_share_pct"),
             "stock_turnover_1m_share_pct": source.get("turnover_1m_share_pct"),
             "excess_change_pct": source.get("excess_change_pct"),
@@ -274,6 +325,9 @@ def _reference_row(item: dict[str, Any]) -> list[Any]:
         item.get("change_pct"),
         item.get("turnover"),
         item.get("turnover_1m"),
+        item.get("total_market_cap"),
+        item.get("float_market_cap"),
+        item.get("turnover_to_float_cap_pct"),
         item.get("turnover_rank"),
         item.get("gain_rank"),
         item.get("limit_up"),
@@ -390,6 +444,8 @@ def _key_stock_row(item: dict[str, Any]) -> list[Any]:
         item.get("change_1m_pct"),
         item.get("turnover"),
         item.get("turnover_1m"),
+        item.get("float_market_cap"),
+        item.get("turnover_to_float_cap_pct"),
         item.get("turnover_rank"),
         item.get("gain_rank"),
         item.get("limit_up"),
@@ -439,6 +495,13 @@ def _sector_current(source: dict[str, Any]) -> dict[str, Any]:
             "turnover_1m": source.get("turnover_1m"),
             "turnover_5m": source.get("turnover_5m"),
             "turnover_15m": source.get("turnover_15m"),
+            "total_market_cap": source.get("total_market_cap"),
+            "float_market_cap": source.get("float_market_cap"),
+            "turnover_to_float_cap_pct": source.get("turnover_to_float_cap_pct"),
+            "turnover_15m_to_float_cap_pct": source.get(
+                "turnover_15m_to_float_cap_pct"
+            ),
+            "turnover_15m_valid_minutes": source.get("turnover_15m_valid_minutes"),
             "prev_turnover_1m": source.get("prev_turnover_1m"),
             "prev_turnover_5m": source.get("prev_turnover_5m"),
             "prev_turnover_15m": source.get("prev_turnover_15m"),
@@ -490,6 +553,13 @@ def _core_stock_trajectories(source: list[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
+def _largest_members(source: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema": LARGEST_MEMBER_SCHEMA,
+        "rows": [[item.get(field) for field in LARGEST_MEMBER_SCHEMA] for item in source[:5]],
+    }
+
+
 def _compact_sector(response: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     resolved = response.get("resolved") or {}
     resolution = context.get("resolution") or {}
@@ -513,6 +583,9 @@ def _compact_sector(response: dict[str, Any], context: dict[str, Any]) -> dict[s
         "quality": _quality(response, current),
         "comparison_window": _comparison_window(current),
         "sector_current": current_compact,
+        "market_cap_structure": context.get("market_cap_structure") or {},
+        "largest_members": _largest_members(context.get("largest_members") or []),
+        "turnover_structure": context.get("turnover_structure") or {},
         "sector_trajectory": _sector_trajectory(context.get("key_trajectory") or []),
         "market_position": _drop_nulls(
             {

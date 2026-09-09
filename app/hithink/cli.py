@@ -21,12 +21,14 @@ from app.hithink.sector_mapping import SectorMappingSync
 from app.hithink.service_guard import SingleInstanceLock
 from app.hithink.state_deriver import StateDeriver
 from app.hithink.status import check_status, render_combined_status
+from app.hithink.tencent_stock_basic import run_tencent_stock_basic_daily
 from app.hithink.writer import ClickHouseWriter
 from app.logging_utils import configure_bounded_root_logging
 
 ROOT = Path(__file__).resolve().parents[2]
 COLLECTOR_PID_PATH = ROOT / "data" / "hithink_snapshot_collector.pid"
 COLLECTOR_LOCK_PATH = ROOT / ".runtime" / "hithink_snapshot_collector.lock"
+TENCENT_STOCK_BASIC_LOCK_PATH = ROOT / ".runtime" / "tencent_stock_basic.lock"
 LOG = logging.getLogger(__name__)
 
 
@@ -138,6 +140,7 @@ def _collector_health_probe(
             WHERE trade_date = {trade_date:Date}
               AND task_name IN (
                   'calendar_gate',
+                  'tencent_stock_basic_sync',
                   'sector_catalog_sync',
                   'sector_membership_sync',
                   'hithink_daily_k_raw_sync',
@@ -186,6 +189,10 @@ def parser() -> argparse.ArgumentParser:
     )
     sub.add_parser("daily-auto", help="run the independent daily-K pipeline for its current schedule slot")
     sub.add_parser("sector-sync", help="synchronize concept, industry and style sector mappings")
+    sub.add_parser(
+        "tencent-stock-basic",
+        help="collect the independent daily Tencent total-share and float-share snapshot",
+    )
     sub.add_parser("status", help="run one local, read-only combined service and progress check")
     state = sub.add_parser(
         "market-state-backfill", help="recalculate state rows for real snapshots already collected"
@@ -252,11 +259,12 @@ def main() -> None:
         print(render_combined_status(check_status()))
         return
     handlers: list[logging.Handler] = [logging.StreamHandler()]
-    if args.command in {"serve", "daily-auto", "sector-sync"}:
+    if args.command in {"serve", "daily-auto", "sector-sync", "tencent-stock-basic"}:
         log_name = {
             "serve": "collector.log",
             "daily-auto": "daily_pipeline.log",
             "sector-sync": "sector_mapping.log",
+            "tencent-stock-basic": "tencent_stock_basic.log",
         }[args.command]
         log_path = ROOT / "data" / "logs" / log_name
         handlers = configure_bounded_root_logging(log_path)
@@ -274,7 +282,12 @@ def main() -> None:
         COLLECTOR_PID_PATH.write_text(str(os.getpid()), encoding="ascii")
         LOG.info("STARTUP_LOCK service=%s pid=%s", args.command, os.getpid())
 
-    settings = Settings.load()
+    if args.command == "tencent-stock-basic":
+        service_lock = SingleInstanceLock(TENCENT_STOCK_BASIC_LOCK_PATH)
+        service_lock.acquire()
+        LOG.info("STARTUP_LOCK service=%s pid=%s", args.command, os.getpid())
+
+    settings = Settings.load(require_api_key=args.command != "tencent-stock-basic")
     writer = (
         _open_collector_writer(settings)
         if args.command == "serve"
@@ -290,6 +303,9 @@ def main() -> None:
         if args.command == "init-db":
             writer.initialize_schema(ROOT / "sql" / "hithink_snapshot.sql")
             LOG.info("schema initialized")
+            return
+        if args.command == "tencent-stock-basic":
+            run_tencent_stock_basic_daily(writer)
             return
         if args.command == "market-state-backfill":
             trade_date = args.trade_date or datetime.now(SHANGHAI).date()

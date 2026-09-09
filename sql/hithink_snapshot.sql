@@ -290,6 +290,7 @@ CREATE TABLE IF NOT EXISTS market.hithink_snapshot_schedule
     all_a_snapshot_status LowCardinality(String) DEFAULT 'PENDING',
     limit_up_pool_status LowCardinality(String) DEFAULT 'PENDING',
     limit_down_pool_status LowCardinality(String) DEFAULT 'PENDING',
+    market_index_status LowCardinality(String) DEFAULT 'PENDING',
     raw_completed_at Nullable(DateTime64(3, 'Asia/Shanghai')),
     derivation_started_at Nullable(DateTime64(3, 'Asia/Shanghai')),
     derivation_completed_at Nullable(DateTime64(3, 'Asia/Shanghai')),
@@ -320,6 +321,8 @@ CREATE TABLE IF NOT EXISTS market.hithink_snapshot_schedule
     limit_down_received_count Nullable(UInt32),
     limit_up_api_duration_ms Nullable(UInt32),
     limit_down_api_duration_ms Nullable(UInt32),
+    market_index_received_count Nullable(UInt32),
+    market_index_api_duration_ms Nullable(UInt32),
     error_code Nullable(String),
     error_message Nullable(String),
     updated_at DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3)
@@ -387,6 +390,8 @@ CREATE TABLE IF NOT EXISTS market.hithink_snapshot_derived
     prev_trade_day_same_time_turnover Nullable(UInt64),
     turnover_prev_trade_day_delta Nullable(Int64),
     turnover_prev_trade_day_pct Nullable(Float64),
+    total_market_cap Nullable(Float64),
+    float_market_cap Nullable(Float64),
     ingest_time DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3)
 )
 ENGINE = MergeTree
@@ -1116,6 +1121,61 @@ ENGINE = ReplacingMergeTree(version_time)
 PARTITION BY toYYYYMM(trade_date)
 ORDER BY (trade_date, collection_id, sector_type, sector_code);
 
+CREATE TABLE IF NOT EXISTS market.hithink_market_index_snapshot
+(
+    `trade_date` Date,
+    `collection_id` FixedString(11),
+    `node_seq` UInt16 MATERIALIZED
+        toUInt16(substring(toString(collection_id), 9, 3)),
+    `scheduled_time` DateTime64(3, 'Asia/Shanghai'),
+    `source_timestamp` UInt64,
+    `source_time` DateTime64(3, 'Asia/Shanghai'),
+    `session` LowCardinality(String),
+    `batch_id` String,
+    `index_code` LowCardinality(String),
+    `index_name` LowCardinality(String),
+    `index_group` LowCardinality(String),
+    `source_tag` LowCardinality(String),
+    `last_price` Nullable(Float64),
+    `price_change` Nullable(Float64),
+    `price_change_ratio_pct` Nullable(Float64),
+    `open_price` Nullable(Float64),
+    `high_price` Nullable(Float64),
+    `low_price` Nullable(Float64),
+    `prev_price` Nullable(Float64),
+    `volume` Nullable(UInt64),
+    `turnover` Nullable(Float64),
+    `ingest_time` DateTime64(3, 'Asia/Shanghai')
+        DEFAULT now64(3),
+    `version_time` DateTime64(6, 'Asia/Shanghai')
+        DEFAULT now64(6),
+    CONSTRAINT ck_market_index_collection_digits
+        CHECK match(toString(collection_id), '^[0-9]{11}$'),
+    CONSTRAINT ck_market_index_collection_date
+        CHECK substring(toString(collection_id), 1, 8)
+            = formatDateTime(trade_date, '%Y%m%d'),
+    CONSTRAINT ck_market_index_collection_sequence
+        CHECK
+            toUInt16OrZero(substring(toString(collection_id), 9, 3)) >= 1
+            AND
+            toUInt16OrZero(substring(toString(collection_id), 9, 3)) <= 254,
+    CONSTRAINT ck_market_index_scheduled_date
+        CHECK toDate(scheduled_time) = trade_date,
+    CONSTRAINT ck_market_index_node_seq
+        CHECK node_seq >= 1 AND node_seq <= 254
+)
+ENGINE = ReplacingMergeTree(version_time)
+PARTITION BY toYYYYMM(trade_date)
+ORDER BY
+(
+    trade_date,
+    collection_id,
+    index_code
+)
+SETTINGS
+    index_granularity = 8192,
+    deduplicate_merge_projection_mode = 'rebuild';
+
 CREATE TABLE IF NOT EXISTS market.hithink_concept_state
 (
     trade_date Date,
@@ -1150,6 +1210,8 @@ CREATE TABLE IF NOT EXISTS market.hithink_concept_state
     turnover_delta_1m_total Nullable(Float64),
     prev_turnover_delta_1m_total Nullable(Float64),
     turnover_growth_1m Nullable(Float64),
+    total_market_cap Nullable(Float64),
+    float_market_cap Nullable(Float64),
     volume_total UInt64,
     volume_delta_1m_total Nullable(Int64),
     turnover_market_share_pct Nullable(Float64),
@@ -1197,6 +1259,13 @@ ORDER BY (trade_date, collection_id, sector_code);
 
 CREATE TABLE IF NOT EXISTS market.hithink_industry_state AS market.hithink_concept_state;
 CREATE TABLE IF NOT EXISTS market.hithink_style_state AS market.hithink_concept_state;
+
+ALTER TABLE market.hithink_concept_state ADD COLUMN IF NOT EXISTS total_market_cap Nullable(Float64) AFTER turnover_growth_1m;
+ALTER TABLE market.hithink_concept_state ADD COLUMN IF NOT EXISTS float_market_cap Nullable(Float64) AFTER total_market_cap;
+ALTER TABLE market.hithink_industry_state ADD COLUMN IF NOT EXISTS total_market_cap Nullable(Float64) AFTER turnover_growth_1m;
+ALTER TABLE market.hithink_industry_state ADD COLUMN IF NOT EXISTS float_market_cap Nullable(Float64) AFTER total_market_cap;
+ALTER TABLE market.hithink_style_state ADD COLUMN IF NOT EXISTS total_market_cap Nullable(Float64) AFTER turnover_growth_1m;
+ALTER TABLE market.hithink_style_state ADD COLUMN IF NOT EXISTS float_market_cap Nullable(Float64) AFTER total_market_cap;
 
 -- Every table that carries YYYYMMDD001..YYYYMMDD254 exposes the same immutable suffix.
 -- The original collection_id and all existing sorting keys remain unchanged.
@@ -1307,6 +1376,8 @@ ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS is_limit_br
 ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS limit_break_open_times Nullable(UInt16) AFTER is_limit_break;
 ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS is_limit_up Nullable(UInt8) AFTER turnover_prev_trade_day_pct;
 ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS is_limit_down Nullable(UInt8) AFTER is_limit_up;
+ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS total_market_cap Nullable(Float64) AFTER limit_break_open_times;
+ALTER TABLE market.hithink_snapshot_derived ADD COLUMN IF NOT EXISTS float_market_cap Nullable(Float64) AFTER total_market_cap;
 ALTER TABLE market.hithink_market_state ADD COLUMN IF NOT EXISTS limit_break_count Nullable(UInt32) AFTER limit_down_count;
 ALTER TABLE market.hithink_market_state ADD COLUMN IF NOT EXISTS limit_break_count_delta_prev_available Nullable(Int32) AFTER limit_break_count;
 ALTER TABLE market.hithink_concept_state ADD COLUMN IF NOT EXISTS limit_break_count Nullable(UInt32) AFTER limit_down_count;
@@ -1459,6 +1530,7 @@ CREATE TABLE IF NOT EXISTS market.hithink_auction_snapshot
     pre_close_price Nullable(Float64),
     open_price Nullable(Float64),
     last_price Nullable(Float64),
+    total_market_cap Nullable(Float64),
     float_market_cap Nullable(Float64),
     ingest_time DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3),
     version_time DateTime64(6, 'Asia/Shanghai') DEFAULT now64(6),
@@ -1474,5 +1546,41 @@ PARTITION BY toYYYYMM(trade_date)
 ORDER BY (trade_date, collection_id, thscode);
 
 ALTER TABLE market.hithink_auction_snapshot ADD COLUMN IF NOT EXISTS node_seq UInt16 MATERIALIZED toUInt16(substring(toString(collection_id), 9, 3)) AFTER collection_id;
+ALTER TABLE market.hithink_auction_snapshot ADD COLUMN IF NOT EXISTS total_market_cap Nullable(Float64) AFTER last_price;
 ALTER TABLE market.hithink_auction_snapshot DROP CONSTRAINT IF EXISTS ck_auction_snapshot_closing_254;
 ALTER TABLE market.hithink_auction_snapshot ADD CONSTRAINT IF NOT EXISTS ck_auction_snapshot_closing_254 CHECK node_seq != 254 OR (toHour(scheduled_time) = 15 AND toMinute(scheduled_time) = 0 AND ((trade_date < toDate('2026-09-04') AND toSecond(scheduled_time) = 0) OR (trade_date >= toDate('2026-09-04') AND toSecond(scheduled_time) = 8)));
+
+ALTER TABLE market.hithink_snapshot_schedule
+    ADD COLUMN IF NOT EXISTS market_index_status LowCardinality(String)
+    DEFAULT 'PENDING' AFTER limit_break_pool_status;
+ALTER TABLE market.hithink_snapshot_schedule
+    ADD COLUMN IF NOT EXISTS market_index_received_count Nullable(UInt32)
+    AFTER market_index_status;
+ALTER TABLE market.hithink_snapshot_schedule
+    ADD COLUMN IF NOT EXISTS market_index_api_duration_ms Nullable(UInt32)
+    AFTER market_index_received_count;
+
+CREATE TABLE IF NOT EXISTS market.tencent_stock_basic_info
+(
+    `snapshot_date` Date,
+    `scheduled_time` DateTime64(3, 'Asia/Shanghai'),
+    `source_time` Nullable(DateTime64(3, 'Asia/Shanghai')),
+    `batch_id` String,
+    `thscode` LowCardinality(String),
+    `ticker` FixedString(6),
+    `stock_name` String,
+    `total_shares` Nullable(UInt64),
+    `float_shares` Nullable(UInt64),
+    `source_tag` LowCardinality(String) DEFAULT 'tencent',
+    `ingest_time` DateTime64(3, 'Asia/Shanghai') DEFAULT now64(3),
+    `version_time` DateTime64(6, 'Asia/Shanghai') DEFAULT now64(6),
+    CONSTRAINT ck_tencent_stock_basic_scheduled_date
+        CHECK toDate(scheduled_time) = snapshot_date,
+    CONSTRAINT ck_tencent_stock_basic_ticker
+        CHECK match(toString(ticker), '^[0-9]{6}$'),
+    CONSTRAINT ck_tencent_stock_basic_thscode
+        CHECK match(toString(thscode), '^[0-9]{6}\\.(SH|SZ|BJ)$')
+)
+ENGINE = ReplacingMergeTree(version_time)
+ORDER BY thscode
+COMMENT '个股基础信息表';

@@ -191,6 +191,8 @@ class CollectorRunner:
             decision = self._wait_for_trading_day_decision(now.date())
             prepared_date = now.date()
             if decision:
+                # The 254-node plan and every intraday source, including the
+                # fixed market-index batch, start only after this 08:50 gate.
                 nodes = self.initialize_day(prepared_date)
                 LOG.info(
                     "INTRADAY_PLAN_READY date=%s nodes=%s first=%s last=%s",
@@ -360,6 +362,7 @@ class CollectorRunner:
 
     def _mark_non_trading_day_skipped(self, trade_date: date) -> None:
         for task_name in (
+            "tencent_stock_basic_sync",
             "sector_catalog_sync",
             "sector_membership_sync",
             "hithink_daily_k_raw_sync",
@@ -421,7 +424,7 @@ class CollectorRunner:
             (
                 time(9, 0),
                 "09:00",
-                lambda state: int(state.get("daily_plan_count") or 0) >= 5,
+                lambda state: int(state.get("daily_plan_count") or 0) >= 6,
                 "每日任务状态计划未准备完整",
             ),
             (
@@ -541,6 +544,7 @@ class CollectorRunner:
             limit_up_pool_status=pool_initial_status,
             limit_down_pool_status=pool_initial_status,
             limit_break_pool_status=pool_initial_status,
+            market_index_status="RUNNING",
             sector_index_status="RUNNING",
             **self.post_deriver.initial_status_values(node),
             **self.aggregator.initial_status_values(node),
@@ -695,6 +699,15 @@ class CollectorRunner:
             "limit_up_pool_status": task_status("limit_up_pool", facts.limit_up),
             "limit_down_pool_status": task_status("limit_down_pool", facts.limit_down),
             "limit_break_pool_status": task_status("limit_break_pool", facts.limit_break),
+            "market_index_status": (
+                "SUCCESS" if facts.market_index is not None else "FAILED"
+            ),
+            "market_index_received_count": (
+                facts.market_index.total if facts.market_index is not None else None
+            ),
+            "market_index_api_duration_ms": (
+                facts.market_index.duration_ms if facts.market_index is not None else None
+            ),
             "sector_index_status": "SUCCESS" if facts.sector_index is not None else "FAILED",
             "limit_pool_collected": int(
                 facts.limit_up is not None
@@ -748,6 +761,10 @@ class CollectorRunner:
             failure = facts.failures.get("sector_index")
             if isinstance(failure, HithinkApiError) and failure.duration_ms is not None:
                 values["sector_index_api_duration_ms"] = failure.duration_ms
+        if facts.market_index is None:
+            failure = facts.failures.get("market_index")
+            if isinstance(failure, HithinkApiError) and failure.duration_ms is not None:
+                values["market_index_api_duration_ms"] = failure.duration_ms
         return values
 
     def _mark_success(
@@ -811,6 +828,7 @@ class CollectorRunner:
             limit_up_pool_status=pool_status,
             limit_down_pool_status=pool_status,
             limit_break_pool_status=pool_status,
+            market_index_status="FAILED",
             sector_index_status="FAILED",
             sector_state_status="BLOCKED",
             **self.post_deriver.blocked_status_values(
@@ -865,6 +883,7 @@ class CollectorRunner:
             limit_up_pool_status="SKIPPED",
             limit_down_pool_status="SKIPPED",
             limit_break_pool_status="SKIPPED",
+            market_index_status="SKIPPED",
             sector_index_status="SKIPPED",
             error_code=error_code,
         )

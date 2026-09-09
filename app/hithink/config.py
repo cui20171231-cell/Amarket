@@ -29,15 +29,15 @@ class Settings:
     clickhouse_password: str
 
     @classmethod
-    def load(cls) -> Settings:
+    def load(cls, *, require_api_key: bool = True) -> Settings:
         file_values = _read_key_file()
         api_key = os.environ.get("HITHINK_FINANCE_API_KEY") or file_values.get(
             "HITHINK_FINANCE_API_KEY"
         )
-        if not api_key:
+        if require_api_key and not api_key:
             raise RuntimeError(f"HITHINK_FINANCE_API_KEY is missing; expected {KEY_FILE}")
         return cls(
-            api_key=api_key,
+            api_key=api_key or "",
             clickhouse_host=os.environ.get("CLICKHOUSE_HOST")
             or file_values.get("CLICKHOUSE_HOST", "127.0.0.1"),
             clickhouse_port=int(

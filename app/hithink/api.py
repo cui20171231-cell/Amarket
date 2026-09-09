@@ -12,6 +12,10 @@ from typing import Any
 
 import httpx
 
+from app.hithink.market_indices import (
+    HITHINK_MARKET_INDEX_CODES,
+    MARKET_INDEX_BY_CODE,
+)
 from app.hithink.schedule import SHANGHAI
 
 URL = "https://fuyao.aicubes.cn/api/a-share/prices/snapshot?limit=10000&offset=0"
@@ -163,6 +167,22 @@ class SectorIndexItem:
 class SectorIndexSnapshot:
     total: int
     items: list[SectorIndexItem]
+    duration_ms: int
+    retry_count: int
+
+
+@dataclass(frozen=True)
+class MarketIndexItem:
+    index_code: str
+    item: dict[str, Any]
+    source_timestamp: int
+    source_time: datetime
+
+
+@dataclass(frozen=True)
+class MarketIndexSnapshot:
+    total: int
+    items: list[MarketIndexItem]
     duration_ms: int
     retry_count: int
 
@@ -683,6 +703,57 @@ class HithinkClient:
             items=collected,
             duration_ms=round((perf_counter() - started) * 1000),
             retry_count=retries,
+        )
+
+    def fetch_market_index_snapshot(
+        self,
+        trade_date: date,
+        *,
+        deadline: float | None = None,
+        rate_limit_deadline: float | None = None,
+        allow_retries: bool = True,
+    ) -> MarketIndexSnapshot:
+        """Fetch one complete fixed 8-index batch from Hithink."""
+        started = perf_counter()
+        hithink = self.fetch_sector_index_snapshot(
+            list(HITHINK_MARKET_INDEX_CODES),
+            deadline=deadline,
+            rate_limit_deadline=rate_limit_deadline,
+            allow_retries=allow_retries,
+        )
+        items = [
+            MarketIndexItem(
+                index_code=str(record.item["thscode"]),
+                item=record.item,
+                source_timestamp=record.source_timestamp,
+                source_time=record.source_time,
+            )
+            for record in hithink.items
+        ]
+        returned_codes = [record.index_code for record in items]
+        expected_codes = set(MARKET_INDEX_BY_CODE)
+        if len(returned_codes) != len(expected_codes) or set(returned_codes) != expected_codes:
+            missing = sorted(expected_codes - set(returned_codes))
+            unexpected = sorted(set(returned_codes) - expected_codes)
+            raise HithinkApiError(
+                None,
+                f"Market index batch must be {len(expected_codes)}/{len(expected_codes)}; "
+                f"missing={missing} unexpected={unexpected}",
+                error_code="MARKET_INDEX_BATCH_INCOMPLETE",
+                endpoint="market_index",
+            )
+        if len(returned_codes) != len(set(returned_codes)):
+            raise HithinkApiError(
+                None,
+                "Market index batch contains duplicate codes",
+                error_code="MARKET_INDEX_BATCH_DUPLICATE",
+                endpoint="market_index",
+            )
+        return MarketIndexSnapshot(
+            total=len(items),
+            items=items,
+            duration_ms=round((perf_counter() - started) * 1000),
+            retry_count=hithink.retry_count,
         )
 
     def _fetch_sector_index_batch(

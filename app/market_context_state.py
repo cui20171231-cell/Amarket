@@ -25,7 +25,7 @@ SECTOR_STATE_TABLES = {
 TIME_PATTERN = re.compile(r"^(\d{2}):(\d{2})(?::(\d{2}))?$")
 DATE_PATTERN = re.compile(r"^(\d{4})-?(\d{2})-?(\d{2})$")
 SECTOR_NAME_NORMALIZER = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
-MAX_STOCKS = 5
+MAX_STOCKS = 50
 STOCK_TRAJECTORY_MINUTES = 30
 MULTI_STOCK_TRAJECTORY_MINUTES = 20
 SECTOR_TRAJECTORY_MINUTES = 30
@@ -396,6 +396,7 @@ class MarketContextReader:
                       AND (observed_to IS NULL OR observed_to>={trade_date:Date})) AS stock_name,
                    d.last_price,d.price_change_ratio_pct,d.price_change_1m_pct,
                    d.price_delta_1m,d.turnover,d.turnover_delta_1m,d.turnover_growth_1m,
+                   d.total_market_cap,d.float_market_cap,
                    d.new_high_flag,d.new_low_flag,
                    toUInt8((toString(d.collection_id),d.thscode) IN
                      (SELECT toString(collection_id),thscode FROM market.hithink_limit_up_pool FINAL
@@ -503,7 +504,7 @@ class MarketContextReader:
                    turnover_1m_market_share_delta_1m,
                    new_high_count,new_low_count,new_high_ratio,new_low_ratio,
                    turnover_1m_top1_share_pct,turnover_1m_top3_share_pct,
-                   turnover_1m_top5_share_pct
+                   turnover_1m_top5_share_pct,total_market_cap,float_market_cap
             FROM points
             ORDER BY sector_type,sector_code,relative_row
             """,
@@ -676,7 +677,8 @@ class MarketContextReader:
                    turnover_1m_market_share_pct,turnover_market_share_delta_1m,
                    turnover_1m_market_share_delta_1m,new_high_count,new_low_count,
                    new_high_ratio,new_low_ratio,turnover_1m_top1_share_pct,
-                   turnover_1m_top3_share_pct,turnover_1m_top5_share_pct
+                   turnover_1m_top3_share_pct,turnover_1m_top5_share_pct,
+                   total_market_cap,float_market_cap
             FROM {table} FINAL
             WHERE trade_date={{trade_date:Date}} AND sector_code={{sector_code:String}}
               AND scheduled_time<={{actual_at:DateTime64(3,'Asia/Shanghai')}}
@@ -792,7 +794,7 @@ class MarketContextReader:
                    index_change_ratio_pct,index_change_1m_pct,up_ratio,down_ratio,
                    limit_up_count,limit_down_count,limit_break_count,
                    turnover_total,turnover_delta_1m_total,turnover_growth_1m,
-                   new_high_ratio,new_low_ratio
+                   new_high_ratio,new_low_ratio,total_market_cap,float_market_cap
             FROM states
             WHERE sector_code IN {sector_codes:Array(String)}
             """,
@@ -818,18 +820,61 @@ class MarketContextReader:
             """
             WITH members AS
             (
-                SELECT sector_type,sector_code,thscode,any(stock_name) AS stock_name
+                SELECT sector_type,sector_code,thscode AS member_thscode,
+                       any(stock_name) AS stock_name
                 FROM market.sector_membership_history FINAL
                 WHERE sector_code IN {sector_codes:Array(String)}
                   AND observed_from<={trade_date:Date}
                   AND (observed_to IS NULL OR observed_to>={trade_date:Date})
-                GROUP BY sector_type,sector_code,thscode
+                GROUP BY sector_type,sector_code,member_thscode
+            ),
+            target_clock AS
+            (
+                SELECT max(scheduled_time) AS scheduled_time
+                FROM market.hithink_snapshot_derived FINAL
+                WHERE trade_date={trade_date:Date}
+                  AND collection_id={collection_id:String}
+            ),
+            member_minutes AS
+            (
+                SELECT m.sector_type,m.sector_code,d.thscode AS member_thscode,
+                       d.turnover_delta_1m,
+                       row_number() OVER (
+                         PARTITION BY m.sector_type,m.sector_code,d.thscode
+                         ORDER BY d.scheduled_time DESC
+                       ) AS minute_rank
+                FROM members AS m
+                INNER JOIN market.hithink_snapshot_derived AS d
+                  ON d.thscode=m.member_thscode
+                WHERE d.trade_date={trade_date:Date}
+                  AND d.scheduled_time<=(SELECT scheduled_time FROM target_clock)
+                  AND d.scheduled_time>=if(
+                    toHour((SELECT scheduled_time FROM target_clock))<12,
+                    toDateTime64(concat(toString({trade_date:Date}),' 09:30:00'),3,'Asia/Shanghai'),
+                    toDateTime64(concat(toString({trade_date:Date}),' 13:00:00'),3,'Asia/Shanghai')
+                  )
+                  AND d.turnover_delta_1m IS NOT NULL
+            ),
+            member_turnover_15m AS
+            (
+                SELECT sector_type,sector_code,member_thscode,
+                       sumIf(turnover_delta_1m,minute_rank<=15) AS turnover_15m,
+                       countIf(minute_rank<=15) AS turnover_15m_valid_minutes
+                FROM member_minutes
+                GROUP BY sector_type,sector_code,member_thscode
             ),
             joined AS
             (
-                SELECT m.sector_type,m.sector_code,m.thscode,m.stock_name,
+                SELECT m.sector_type AS sector_type,m.sector_code AS sector_code,
+                       m.member_thscode AS thscode,m.stock_name AS stock_name,
                        toString(d.ticker) AS ticker,d.last_price,d.price_change_ratio_pct,
                        d.price_change_1m_pct,d.turnover,d.turnover_delta_1m,
+                       d.total_market_cap,d.float_market_cap,
+                       if(d.float_market_cap>0,d.turnover/d.float_market_cap*100,
+                          CAST(NULL,'Nullable(Float64)')) AS turnover_to_float_cap_pct,
+                       t.turnover_15m,t.turnover_15m_valid_minutes,
+                       if(d.float_market_cap>0,t.turnover_15m/d.float_market_cap*100,
+                          CAST(NULL,'Nullable(Float64)')) AS turnover_15m_to_float_cap_pct,
                        d.turnover_growth_1m,d.new_high_flag,d.new_low_flag,
                        toUInt8(d.thscode IN
                          (SELECT thscode FROM market.hithink_limit_up_pool FINAL
@@ -841,7 +886,11 @@ class MarketContextReader:
                          (SELECT thscode FROM market.hithink_limit_break_pool FINAL
                           WHERE trade_date={trade_date:Date} AND collection_id={collection_id:String})) AS is_limit_break
                 FROM members AS m
-                INNER JOIN market.hithink_snapshot_derived AS d ON d.thscode=m.thscode
+                INNER JOIN market.hithink_snapshot_derived AS d
+                  ON d.thscode=m.member_thscode
+                LEFT JOIN member_turnover_15m AS t
+                  ON t.sector_type=m.sector_type AND t.sector_code=m.sector_code
+                 AND t.member_thscode=m.member_thscode
                 WHERE d.trade_date={trade_date:Date} AND d.collection_id={collection_id:String}
                   AND d.last_price IS NOT NULL
             ),
@@ -852,6 +901,19 @@ class MarketContextReader:
                        rank() OVER (PARTITION BY sector_type,sector_code ORDER BY turnover_delta_1m DESC) AS turnover_1m_rank,
                        rank() OVER (PARTITION BY sector_type,sector_code ORDER BY price_change_ratio_pct DESC) AS gain_rank,
                        rank() OVER (PARTITION BY sector_type,sector_code ORDER BY price_change_ratio_pct ASC) AS loss_rank,
+                       rank() OVER (PARTITION BY sector_type,sector_code ORDER BY float_market_cap DESC NULLS LAST) AS float_market_cap_rank,
+                       rank() OVER (PARTITION BY sector_type,sector_code ORDER BY total_market_cap DESC NULLS LAST) AS total_market_cap_rank,
+                       rank() OVER (PARTITION BY sector_type,sector_code ORDER BY turnover_to_float_cap_pct DESC NULLS LAST) AS turnover_to_float_cap_rank,
+                       rank() OVER (PARTITION BY sector_type,sector_code ORDER BY turnover_15m_to_float_cap_pct DESC NULLS LAST) AS turnover_15m_to_float_cap_rank,
+                       row_number() OVER (PARTITION BY sector_type,sector_code ORDER BY float_market_cap DESC NULLS LAST) AS float_market_cap_order,
+                       row_number() OVER (PARTITION BY sector_type,sector_code ORDER BY total_market_cap DESC NULLS LAST) AS total_market_cap_order,
+                       count() OVER (PARTITION BY sector_type,sector_code) AS valid_member_count,
+                       countIf(float_market_cap IS NOT NULL AND float_market_cap>0) OVER (PARTITION BY sector_type,sector_code) AS float_market_cap_valid_member_count,
+                       countIf(total_market_cap IS NOT NULL AND total_market_cap>0) OVER (PARTITION BY sector_type,sector_code) AS total_market_cap_valid_member_count,
+                       countIf(turnover_to_float_cap_pct IS NOT NULL) OVER (PARTITION BY sector_type,sector_code) AS turnover_to_float_cap_valid_member_count,
+                       countIf(turnover_15m_to_float_cap_pct IS NOT NULL) OVER (PARTITION BY sector_type,sector_code) AS turnover_15m_to_float_cap_valid_member_count,
+                       sum(if(float_market_cap>0,float_market_cap,0)) OVER (PARTITION BY sector_type,sector_code) AS sector_float_market_cap_sum,
+                       sum(if(total_market_cap>0,total_market_cap,0)) OVER (PARTITION BY sector_type,sector_code) AS sector_total_market_cap_sum,
                        row_number() OVER (
                          PARTITION BY sector_type,sector_code
                          ORDER BY (price_change_ratio_pct<0) DESC,
@@ -877,6 +939,8 @@ class MarketContextReader:
                OR turnover_1m_rank<={group_limit:UInt8}
                OR gain_rank<={group_limit:UInt8}
                OR loss_rank<={group_limit:UInt8}
+               OR float_market_cap_order<=5
+               OR total_market_cap_order<=5
                OR (price_change_ratio_pct<0 AND important_weak_rank<={group_limit:UInt8})
                OR is_limit_up=1 OR is_limit_break=1
                OR (new_high_flag=1 AND new_high_rank<={group_limit:UInt8})
@@ -905,6 +969,32 @@ def _same_session_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if (row["scheduled_time"].hour < 12) == is_morning
         and (is_morning or row["scheduled_time"].hour >= 13)
     ]
+
+
+def _turnover_windows(
+    rows: list[dict[str, Any]], field: str, window: int = 15
+) -> tuple[float | None, int, float | None, int]:
+    valid = [
+        _number(row.get(field))
+        for row in _same_session_rows(rows)
+        if _number(row.get(field)) is not None
+    ]
+    current_values = valid[-window:]
+    previous_values = valid[-(window * 2) : -window]
+    return (
+        sum(current_values) if current_values else None,
+        len(current_values),
+        sum(previous_values) if previous_values else None,
+        len(previous_values),
+    )
+
+
+def _turnover_to_float_cap_pct(turnover: Any, float_market_cap: Any) -> float | None:
+    turnover_value = _number(turnover)
+    cap_value = _number(float_market_cap)
+    if turnover_value is None or cap_value is None or cap_value <= 0:
+        return None
+    return turnover_value / cap_value * 100
 
 
 def _row_at_offset(rows: list[dict[str, Any]], minutes: int) -> dict[str, Any] | None:
@@ -1172,20 +1262,23 @@ def _select_stock_sectors(
     stock_change_pct: float | None = None,
     profiles: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    maximum = min(maximum, 4)
     profile_map = {(row["sector_type"], row["sector_code"]): row for row in (profiles or [])}
     weights = {
-        "strategic_direction_priority": 0.35,
-        "intraday_co_movement": 0.25,
-        "stock_capacity_role": 0.20,
-        "sector_market_expression": 0.10,
-        "current_relative_fit": 0.10,
+        "strategic_direction_priority": 0.10,
+        "intraday_co_movement": 0.35,
+        "stock_capacity_role": 0.25,
+        "sector_market_expression": 0.15,
+        "current_relative_fit": 0.15,
     }
     current_rows = [row for row in rows if int(row.get("relative_row", 0)) == 1]
     for row in current_rows:
         profile = profile_map.get((row["sector_type"], row["sector_code"]), {})
         excess = _difference(stock_change_pct, row.get("index_change_ratio_pct"))
         watch_level = profile.get("watch_level")
-        strategic_raw = {"CORE": 1.0, "IMPORTANT": 0.6, "WATCH": 0.3}.get(str(watch_level), 0.0)
+        strategic_base = {"CORE": 1.0, "IMPORTANT": 0.6, "WATCH": 0.3}.get(
+            str(watch_level), 0.0
+        )
         corr_all = max(-1.0, min(1.0, _number(profile.get("corr_all")) or 0.0))
         corr_recent = _number(profile.get("corr_recent"))
         recent_observations = int(profile.get("recent_observations") or 0)
@@ -1206,6 +1299,19 @@ def _select_stock_sectors(
         )
         expression_raw = min(max(_sector_expression_score(row) / 3, 0), 1)
         relative_fit_raw = max(0.0, 1 - abs(excess or 0) / 3)
+        trading_relevance = max(
+            co_movement_raw,
+            capacity_role_raw,
+            expression_raw,
+            min(abs(excess or 0) / 2, 1),
+        )
+        strategic_raw = strategic_base if trading_relevance >= 0.2 else 0.0
+        row["primary_direction_eligible"] = bool(
+            co_movement_raw >= 0.15
+            or capacity_role_raw >= 0.20
+            or expression_raw >= 0.40
+            or abs(excess or 0) >= 0.75
+        )
         raw_components = {
             "strategic_direction_priority": strategic_raw,
             "intraday_co_movement": co_movement_raw,
@@ -1236,13 +1342,14 @@ def _select_stock_sectors(
                 "tracking_error_1m_pct": profile.get("tracking_error_1m_pct"),
             },
         }
+    eligible_rows = [row for row in current_rows if row["primary_direction_eligible"]]
     concepts = sorted(
-        (row for row in current_rows if row["sector_type"] == "concept"),
+        (row for row in eligible_rows if row["sector_type"] == "concept"),
         key=lambda row: row["selection_score"],
         reverse=True,
     )
     industries = sorted(
-        (row for row in current_rows if row["sector_type"] == "industry"),
+        (row for row in eligible_rows if row["sector_type"] == "industry"),
         key=lambda row: row["selection_score"],
         reverse=True,
     )
@@ -1250,13 +1357,6 @@ def _select_stock_sectors(
     selected = concepts[:concept_slots]
     if industries and len(selected) < maximum:
         selected.append(industries[0])
-    if len(selected) < min(2, maximum):
-        remaining = sorted(
-            (row for row in current_rows if row not in selected),
-            key=lambda row: row["selection_score"],
-            reverse=True,
-        )
-        selected.extend(remaining[: maximum - len(selected)])
     return selected[:maximum]
 
 
@@ -1272,7 +1372,6 @@ def _group_relative_rows(
 def _stock_current_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     current, prev_1m, prev_5m, prev_15m = _row_offsets(rows)
     prev_10m = _row_at_offset(rows, 10)
-    prev_30m = _row_at_offset(rows, 30)
     turnover_5m = _difference(
         current.get("turnover"), prev_5m.get("turnover") if prev_5m else None
     )
@@ -1281,13 +1380,8 @@ def _stock_current_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if prev_5m and prev_10m
         else None
     )
-    turnover_15m = _difference(
-        current.get("turnover"), prev_15m.get("turnover") if prev_15m else None
-    )
-    prev_turnover_15m = (
-        _difference(prev_15m.get("turnover"), prev_30m.get("turnover"))
-        if prev_15m and prev_30m
-        else None
+    turnover_15m, turnover_15m_valid_minutes, prev_turnover_15m, _ = (
+        _turnover_windows(rows, "turnover_delta_1m")
     )
     turnover_1m = current.get("turnover_delta_1m")
     prev_turnover_1m = prev_1m.get("turnover_delta_1m") if prev_1m else None
@@ -1295,6 +1389,11 @@ def _stock_current_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "price": current.get("last_price"),
         "change_pct": current.get("price_change_ratio_pct"),
         "turnover": current.get("turnover"),
+        "total_market_cap": current.get("total_market_cap"),
+        "float_market_cap": current.get("float_market_cap"),
+        "turnover_to_float_cap_pct": _turnover_to_float_cap_pct(
+            current.get("turnover"), current.get("float_market_cap")
+        ),
         "change_1m_pct": current.get("price_change_1m_pct"),
         "change_5m_pct": _pct_change(
             current.get("last_price"), prev_5m.get("last_price") if prev_5m else None
@@ -1305,6 +1404,13 @@ def _stock_current_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "turnover_1m": turnover_1m,
         "turnover_5m": turnover_5m,
         "turnover_15m": turnover_15m,
+        "turnover_15m_valid_minutes": turnover_15m_valid_minutes,
+        "turnover_1m_to_float_cap_pct": _turnover_to_float_cap_pct(
+            turnover_1m, current.get("float_market_cap")
+        ),
+        "turnover_15m_to_float_cap_pct": _turnover_to_float_cap_pct(
+            turnover_15m, current.get("float_market_cap")
+        ),
         "prev_turnover_1m": prev_turnover_1m,
         "prev_turnover_5m": prev_turnover_5m,
         "prev_turnover_15m": prev_turnover_15m,
@@ -1337,6 +1443,9 @@ def _public_member(row: dict[str, Any]) -> dict[str, Any]:
         "change_1m_pct": row.get("price_change_1m_pct"),
         "turnover": row.get("turnover"),
         "turnover_1m": row.get("turnover_delta_1m"),
+        "total_market_cap": row.get("total_market_cap"),
+        "float_market_cap": row.get("float_market_cap"),
+        "turnover_to_float_cap_pct": row.get("turnover_to_float_cap_pct"),
         "turnover_rank": row.get("turnover_rank"),
         "turnover_1m_rank": row.get("turnover_1m_rank"),
         "gain_rank": row.get("gain_rank"),
@@ -1393,6 +1502,98 @@ def _member_groups(rows: list[dict[str, Any]], limit: int) -> dict[str, list[dic
     }
 
 
+def _positive_number(value: Any) -> float | None:
+    number = _number(value)
+    return number if number is not None and number > 0 else None
+
+
+def _top_share(
+    rows: list[dict[str, Any]], field: str, denominator: Any, count: int
+) -> float | None:
+    total = _positive_number(denominator)
+    if total is None:
+        return None
+    values = sorted(
+        (
+            value
+            for row in rows
+            if (value := _positive_number(row.get(field))) is not None
+        ),
+        reverse=True,
+    )
+    if not values:
+        return None
+    return sum(values[:count]) / total * 100
+
+
+def _sector_structure_blocks(
+    rows: list[dict[str, Any]], current: dict[str, Any]
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    sample = rows[0] if rows else {}
+    float_total = sample.get("sector_float_market_cap_sum")
+    total_total = sample.get("sector_total_market_cap_sum")
+    market_cap_structure = {
+        "valid_member_count": current.get("valid_member_count"),
+        "float_market_cap_valid_member_count": sample.get(
+            "float_market_cap_valid_member_count"
+        ),
+        "total_market_cap_valid_member_count": sample.get(
+            "total_market_cap_valid_member_count"
+        ),
+        **{
+            f"float_cap_top{count}_share_pct": _top_share(
+                rows, "float_market_cap", float_total, count
+            )
+            for count in (1, 3, 5)
+        },
+        **{
+            f"total_cap_top{count}_share_pct": _top_share(
+                rows, "total_market_cap", total_total, count
+            )
+            for count in (1, 3, 5)
+        },
+    }
+    largest_members = [
+        {
+            "ticker": row.get("thscode") or row.get("ticker"),
+            "name": row.get("stock_name"),
+            "float_market_cap": row.get("float_market_cap"),
+            "total_market_cap": row.get("total_market_cap"),
+            "change_pct": row.get("price_change_ratio_pct"),
+            "turnover": row.get("turnover"),
+            "turnover_to_float_cap_pct": row.get("turnover_to_float_cap_pct"),
+        }
+        for row in sorted(
+            (
+                row
+                for row in rows
+                if _positive_number(row.get("float_market_cap")) is not None
+            ),
+            key=lambda row: _number(row.get("float_market_cap")) or 0,
+            reverse=True,
+        )[:5]
+    ]
+    turnover_denominator = sample.get("sector_turnover_sum")
+    turnover_structure = {
+        **{
+            f"turnover_top{count}_share_pct": _top_share(
+                rows, "turnover", turnover_denominator, count
+            )
+            for count in (1, 3, 5)
+        },
+        "turnover_1m_top1_share_pct": current.get(
+            "turnover_1m_top1_share_pct"
+        ),
+        "turnover_1m_top3_share_pct": current.get(
+            "turnover_1m_top3_share_pct"
+        ),
+        "turnover_1m_top5_share_pct": current.get(
+            "turnover_1m_top5_share_pct"
+        ),
+    }
+    return market_cap_structure, largest_members, turnover_structure
+
+
 def _core_member_trajectories(
     reader: MarketContextReader,
     trade_date: date,
@@ -1439,6 +1640,7 @@ def _sector_metrics(
     prev_15m: dict[str, Any] | None,
     prev_10m: dict[str, Any] | None = None,
     prev_30m: dict[str, Any] | None = None,
+    timeline_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     turnover_1m = current.get("turnover_delta_1m_total")
     prev_turnover_1m = prev_1m.get("turnover_delta_1m_total") if prev_1m else None
@@ -1450,13 +1652,8 @@ def _sector_metrics(
         if prev_5m and prev_10m
         else None
     )
-    turnover_15m = _difference(
-        current.get("turnover_total"), prev_15m.get("turnover_total") if prev_15m else None
-    )
-    prev_turnover_15m = (
-        _difference(prev_15m.get("turnover_total"), prev_30m.get("turnover_total"))
-        if prev_15m and prev_30m
-        else None
+    turnover_15m, turnover_15m_valid_minutes, prev_turnover_15m, _ = (
+        _turnover_windows(timeline_rows or [current], "turnover_delta_1m_total")
     )
     return {
         "change_pct": current.get("index_change_ratio_pct"),
@@ -1493,9 +1690,18 @@ def _sector_metrics(
         "new_high_ratio": current.get("new_high_ratio"),
         "new_low_ratio": current.get("new_low_ratio"),
         "turnover": current.get("turnover_total"),
+        "total_market_cap": current.get("total_market_cap"),
+        "float_market_cap": current.get("float_market_cap"),
+        "turnover_to_float_cap_pct": _turnover_to_float_cap_pct(
+            current.get("turnover_total"), current.get("float_market_cap")
+        ),
         "turnover_1m": turnover_1m,
         "turnover_5m": turnover_5m,
         "turnover_15m": turnover_15m,
+        "turnover_15m_valid_minutes": turnover_15m_valid_minutes,
+        "turnover_15m_to_float_cap_pct": _turnover_to_float_cap_pct(
+            turnover_15m, current.get("float_market_cap")
+        ),
         "prev_turnover_1m": prev_turnover_1m,
         "prev_turnover_5m": prev_turnover_5m,
         "prev_turnover_15m": prev_turnover_15m,
@@ -1585,6 +1791,39 @@ def _stock_sector_contexts(
                 "turnover_rank": target.get("turnover_rank"),
                 "turnover_1m_rank": target.get("turnover_1m_rank"),
                 "gain_rank": target.get("gain_rank"),
+                "float_market_cap_rank": (
+                    target.get("float_market_cap_rank")
+                    if _number(target.get("float_market_cap")) not in {None, 0}
+                    else None
+                ),
+                "total_market_cap_rank": (
+                    target.get("total_market_cap_rank")
+                    if _number(target.get("total_market_cap")) not in {None, 0}
+                    else None
+                ),
+                "turnover_to_float_cap_rank": (
+                    target.get("turnover_to_float_cap_rank")
+                    if target.get("turnover_to_float_cap_pct") is not None
+                    else None
+                ),
+                "turnover_15m_to_float_cap_rank": (
+                    target.get("turnover_15m_to_float_cap_rank")
+                    if target.get("turnover_15m_to_float_cap_pct") is not None
+                    else None
+                ),
+                "valid_member_count": target.get("valid_member_count"),
+                "float_market_cap_valid_member_count": target.get(
+                    "float_market_cap_valid_member_count"
+                ),
+                "total_market_cap_valid_member_count": target.get(
+                    "total_market_cap_valid_member_count"
+                ),
+                "turnover_to_float_cap_valid_member_count": target.get(
+                    "turnover_to_float_cap_valid_member_count"
+                ),
+                "turnover_15m_to_float_cap_valid_member_count": target.get(
+                    "turnover_15m_to_float_cap_valid_member_count"
+                ),
                 "turnover_share_pct": _share(target.get("turnover"), current.get("turnover_total")),
                 "turnover_1m_share_pct": _share(
                     target.get("turnover_delta_1m"), current.get("turnover_delta_1m_total")
@@ -1618,7 +1857,13 @@ def _stock_sector_contexts(
                     ),
                 },
                 "current_state": _sector_metrics(
-                    current, prev_1m, prev_5m, prev_15m, prev_10m, prev_30m
+                    current,
+                    prev_1m,
+                    prev_5m,
+                    prev_15m,
+                    prev_10m,
+                    prev_30m,
+                    point_rows,
                 ),
                 "stock_position": position,
                 "reference_stocks": {
@@ -1801,6 +2046,9 @@ def _build_sector_context(
         group_limit=5,
     )
     groups = _member_groups(ranked, 5)
+    market_cap_structure, largest_members, turnover_structure = (
+        _sector_structure_blocks(ranked, current)
+    )
     core_member_trajectories = _core_member_trajectories(
         reader, trade_date, node["scheduled_time"], ranked
     )
@@ -1855,7 +2103,13 @@ def _build_sector_context(
         },
         "current_state": {
             **_sector_metrics(
-                current, prev_1m, prev_5m, prev_15m, prev_10m, prev_30m
+                current,
+                prev_1m,
+                prev_5m,
+                prev_15m,
+                prev_10m,
+                prev_30m,
+                timeline,
             ),
             "data_status": node.get("state_data_status"),
             "source_age_seconds": node.get("state_source_age_seconds"),
@@ -1875,6 +2129,9 @@ def _build_sector_context(
         },
         "key_trajectory": _compress_sector_trajectory(timeline),
         "key_stocks": groups,
+        "market_cap_structure": market_cap_structure,
+        "largest_members": largest_members,
+        "turnover_structure": turnover_structure,
         "core_stock_trajectories": core_member_trajectories,
         "strategic_relation": strategic_relation,
         "matched_sectors": matched_sectors,
@@ -2004,7 +2261,7 @@ def get_market_context_state(
             }
         )
         if target_type in {"stock", "stocks"}:
-            sector_limit = 5
+            sector_limit = 4
             reference_limit = 3
             contexts = [
                 _build_stock_context(

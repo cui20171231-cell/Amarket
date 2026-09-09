@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import date, timedelta
 from time import perf_counter
 
 from app.hithink.derive import calculate
@@ -24,6 +24,8 @@ class StateDeriver:
 
     def __init__(self, writer: ClickHouseWriter):
         self.writer = writer
+        self._share_counts_date: date | None = None
+        self._share_counts: dict[str, tuple[int | None, int | None]] = {}
 
     def derive(self, node: ScheduleNode, include_sector_states: bool = True) -> DerivationResult:
         """Use only facts already committed to ClickHouse for this collection ID."""
@@ -64,6 +66,10 @@ class StateDeriver:
         previous_trade_day_turnovers = (
             self.writer.previous_trade_day_turnovers(node) if node.sequence_no >= 12 else {}
         )
+        if self._share_counts_date != node.trade_date:
+            self._share_counts = self.writer.latest_stock_share_counts(node.trade_date)
+            self._share_counts_date = node.trade_date
+        share_counts = self._share_counts
         previous_limit_break_collection_id = self.writer.latest_limit_break_collection_before(node)
         limit_pool_available = self.writer.limit_pool_collected(node)
 
@@ -74,6 +80,7 @@ class StateDeriver:
                 previous.get(row.thscode),
                 comparison_enabled,
                 previous_trade_day_turnovers.get(row.thscode),
+                *(share_counts.get(row.thscode) or (None, None)),
             )
             for row in raw_rows
         ]

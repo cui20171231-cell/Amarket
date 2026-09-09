@@ -14,6 +14,7 @@ from app.hithink.api import (
     HithinkApiError,
     HithinkClient,
     LimitPoolSnapshot,
+    MarketIndexSnapshot,
     SectorIndexSnapshot,
 )
 from app.hithink.models import RawSnapshot
@@ -37,11 +38,14 @@ class RawCollectionResult:
     limit_up: LimitPoolSnapshot | None
     limit_down: LimitPoolSnapshot | None
     limit_break: LimitPoolSnapshot | None
+    market_index: MarketIndexSnapshot | None
     sector_index: SectorIndexSnapshot | None
     sectors: list[tuple[str, str, str, str]]
     raw_rows: list[RawSnapshot]
     raw_insert_count: int
     raw_insert_ms: int
+    market_index_insert_count: int
+    market_index_insert_ms: int
     sector_index_insert_count: int
     sector_index_insert_ms: int
     errors: dict[str, tuple[str, str]]
@@ -93,6 +97,7 @@ class RawCollector:
             "limit_up_pool": "limit_up_pool_status",
             "limit_down_pool": "limit_down_pool_status",
             "limit_break_pool": "limit_break_pool_status",
+            "market_index": "market_index_status",
             "sector_index": "sector_index_status",
         }
         pool_tasks = frozenset(
@@ -106,10 +111,13 @@ class RawCollector:
         limit_up: LimitPoolSnapshot | None = None
         limit_down: LimitPoolSnapshot | None = None
         limit_break: LimitPoolSnapshot | None = None
+        market_index: MarketIndexSnapshot | None = None
         sector_index: SectorIndexSnapshot | None = None
         raw_rows: list[RawSnapshot] = []
         raw_insert_count = 0
         raw_insert_ms = 0
+        market_index_insert_count = 0
+        market_index_insert_ms = 0
         sector_index_insert_count = 0
         sector_index_insert_ms = 0
 
@@ -152,10 +160,10 @@ class RawCollector:
             capture_error("sector_index", exc)
 
         try:
-            # Each endpoint owns its retries.  Five workers prevent a failed
-            # endpoint from queueing the other four behind it and consuming the
+            # Each endpoint owns its retries.  Six workers prevent a failed
+            # endpoint from queueing the other five behind it and consuming the
             # next minute's collection slot.
-            with ThreadPoolExecutor(max_workers=5) as executor:
+            with ThreadPoolExecutor(max_workers=6) as executor:
                 request_options: dict[str, Any] = {
                     "deadline": deadline,
                     "rate_limit_deadline": rate_limit_deadline,
@@ -169,6 +177,14 @@ class RawCollector:
                 called.add("all_a_snapshot")
                 prices_future = executor.submit(
                     self.api.fetch,
+                    **request_options,
+                )
+                pause_between_submissions()
+
+                called.add("market_index")
+                market_index_future = executor.submit(
+                    self.api.fetch_market_index_snapshot,
+                    node.trade_date,
                     **request_options,
                 )
                 if sectors or node.limit_pools_applicable:
@@ -231,6 +247,16 @@ class RawCollector:
                     raw_insert_count, raw_insert_ms = self.writer.insert_raw_once(raw_rows)
 
                 prices = resolve_and_write("all_a_snapshot", prices_future, write_prices)
+
+                def write_market_index(snapshot: MarketIndexSnapshot) -> None:
+                    nonlocal market_index_insert_count, market_index_insert_ms
+                    market_index_insert_count, market_index_insert_ms = (
+                        self.writer.insert_market_index_once(node, snapshot)
+                    )
+
+                market_index = resolve_and_write(
+                    "market_index", market_index_future, write_market_index
+                )
                 if sector_index_future is None:
                     if sector_catalog_error is None:
                         errors["sector_index"] = (
@@ -283,11 +309,14 @@ class RawCollector:
             limit_up=limit_up,
             limit_down=limit_down,
             limit_break=limit_break,
+            market_index=market_index,
             sector_index=sector_index,
             sectors=sectors,
             raw_rows=raw_rows,
             raw_insert_count=raw_insert_count,
             raw_insert_ms=raw_insert_ms,
+            market_index_insert_count=market_index_insert_count,
+            market_index_insert_ms=market_index_insert_ms,
             sector_index_insert_count=sector_index_insert_count,
             sector_index_insert_ms=sector_index_insert_ms,
             errors=errors,

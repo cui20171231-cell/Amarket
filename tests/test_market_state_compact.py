@@ -23,6 +23,19 @@ def test_opening_auction_core_stocks_keep_the_dedicated_shape() -> None:
     assert compact_core_stocks(source) == source
 
 
+def test_intraday_core_stocks_rank_turnover_relative_to_float_cap() -> None:
+    source = [
+        {"thscode": "A", "turnover_to_float_cap_pct": 2.0},
+        {"thscode": "B", "turnover_to_float_cap_pct": None},
+        {"thscode": "C", "turnover_to_float_cap_pct": 5.0},
+    ]
+
+    compact = compact_core_stocks(source)
+    rank_at = compact["schema"].index("turnover_to_float_cap_rank")
+
+    assert [row[rank_at] for row in compact["rows"]] == [2, None, 1]
+
+
 def test_opening_auction_market_compaction_keeps_only_business_facts() -> None:
     source = {
         "data_context": "OPEN_AUCTION",

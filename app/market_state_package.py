@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from app.hithink.candidate_config import CAPITAL_SECTOR_TYPES, CORE_SECTOR_TYPES
 from app.hithink.config import Settings
+from app.hithink.market_indices import MARKET_INDEX_BY_CODE
 from app.hithink.schedule import MARKET_REVIEW_NODE_SEQUENCES
 from app.hithink.writer import ClickHouseWriter
 
@@ -205,6 +206,40 @@ OPEN_AUCTION_MARKET_TRAJECTORY_SCHEMA = [
     "yesterday_ratio_gt_200_count",
 ]
 
+MARKET_INDEX_CURRENT_SCHEMA = [
+    "index_code",
+    "index_name",
+    "last_price",
+    "prev_price",
+    "price_change_ratio_pct",
+    "open_price",
+    "high_price",
+    "low_price",
+    "turnover",
+]
+MARKET_INDEX_TRAJECTORY_SCHEMA = [
+    "time",
+    "sh_comp_pct",
+    "sz50_pct",
+    "csi300_pct",
+    "star50_pct",
+    "csi500_pct",
+    "csi1000_pct",
+    "chinext_pct",
+    "ths_all_a_pct",
+]
+MARKET_INDEX_TRAJECTORY_CODES = (
+    "000001.SH",
+    "000016.SH",
+    "000300.SH",
+    "000688.SH",
+    "000905.SH",
+    "000852.SH",
+    "399006.SZ",
+    "883957.TI",
+)
+MARKET_INDEX_KEY_NODE_SEQUENCES = (12, 27, 42, 72, 132, 163, 223, 254)
+
 
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -256,6 +291,14 @@ def _subtract(current: Any, base: Any) -> Any:
     if current is None or base is None:
         return None
     return current - base
+
+
+def _turnover_to_float_cap_pct(turnover: Any, float_market_cap: Any) -> float | None:
+    turnover_value = _number(turnover)
+    cap_value = _number(float_market_cap)
+    if turnover_value is None or cap_value is None or cap_value <= 0:
+        return None
+    return turnover_value / cap_value * 100
 
 
 def _pick(row: dict[str, Any] | None, fields: tuple[str, ...]) -> dict[str, Any] | None:
@@ -424,6 +467,138 @@ class MarketStatePackageBuilder:
             """,
             {"trade_date": trade_date_value, "target": target},
         )
+
+    def _market_indices(
+        self,
+        trade_date_value: date,
+        target: datetime,
+        target_node_seq: int,
+        requested: datetime,
+    ) -> dict[str, Any]:
+        expected_count = len(MARKET_INDEX_BY_CODE)
+        batches = self._rows(
+            """
+            SELECT toString(collection_id) AS collection_id,node_seq,
+                   min(scheduled_time) AS batch_scheduled_time,
+                   max(source_time) AS batch_source_time,
+                   uniqExact(index_code) AS index_count
+            FROM market.hithink_market_index_snapshot FINAL
+            WHERE trade_date={trade_date:Date}
+              AND scheduled_time<={target:DateTime64(3,'Asia/Shanghai')}
+            GROUP BY collection_id,node_seq
+            HAVING index_count={expected_count:UInt8}
+            ORDER BY batch_scheduled_time DESC
+            """,
+            {
+                "trade_date": trade_date_value,
+                "target": target,
+                "expected_count": expected_count,
+            },
+        )
+        current_batch = batches[0] if batches else None
+        current_rows: list[list[Any]] = []
+        values: dict[str, Any] = {}
+        quality = {
+            "target_time": requested,
+            "scheduled_time": target,
+            "source_time": None,
+            "source_age_seconds": None,
+            "status": "MISSING",
+        }
+        if current_batch:
+            selected = self._rows(
+                """
+                SELECT index_code,index_name,last_price,prev_price,
+                       price_change_ratio_pct,open_price,high_price,low_price,turnover
+                FROM market.hithink_market_index_snapshot FINAL
+                WHERE trade_date={trade_date:Date}
+                  AND toString(collection_id)={collection_id:String}
+                ORDER BY index_code
+                """,
+                {
+                    "trade_date": trade_date_value,
+                    "collection_id": current_batch["collection_id"],
+                },
+            )
+            for row in selected:
+                values[str(row["index_code"])] = row.get("price_change_ratio_pct")
+                current_rows.append([row.get(field) for field in MARKET_INDEX_CURRENT_SCHEMA])
+            source_time = current_batch.get("batch_source_time")
+            quality = {
+                "target_time": requested,
+                "scheduled_time": target,
+                "source_time": source_time,
+                "source_age_seconds": (
+                    (target - source_time).total_seconds() if source_time else None
+                ),
+                "status": (
+                    "CURRENT"
+                    if int(current_batch["node_seq"]) == int(target_node_seq)
+                    else "FALLBACK"
+                ),
+            }
+
+        key_sequences = [
+            sequence
+            for sequence in MARKET_INDEX_KEY_NODE_SEQUENCES
+            if sequence <= target_node_seq
+        ]
+        if target_node_seq not in key_sequences:
+            key_sequences.append(target_node_seq)
+        trajectory_rows = self._rows(
+            """
+            SELECT node_seq,min(scheduled_time) AS scheduled_time,index_code,
+                   argMax(price_change_ratio_pct,version_time) AS price_change_ratio_pct
+            FROM market.hithink_market_index_snapshot
+            WHERE trade_date={trade_date:Date}
+              AND node_seq IN {node_sequences:Array(UInt16)}
+            GROUP BY node_seq,index_code
+            ORDER BY node_seq,index_code
+            """,
+            {"trade_date": trade_date_value, "node_sequences": key_sequences},
+        ) if key_sequences else []
+        trajectory_map: dict[int, dict[str, Any]] = defaultdict(dict)
+        trajectory_times: dict[int, datetime] = {}
+        for row in trajectory_rows:
+            sequence = int(row["node_seq"])
+            trajectory_times[sequence] = row["scheduled_time"]
+            trajectory_map[sequence][str(row["index_code"])] = row.get(
+                "price_change_ratio_pct"
+            )
+        wide_rows = []
+        for sequence in key_sequences:
+            code_values = trajectory_map.get(sequence, {})
+            if len(code_values) != expected_count:
+                continue
+            wide_rows.append(
+                [
+                    trajectory_times[sequence].strftime("%H:%M"),
+                    *[code_values.get(code) for code in MARKET_INDEX_TRAJECTORY_CODES],
+                ]
+            )
+
+        def spread(left: str, right: str) -> float | None:
+            left_value = _number(values.get(left))
+            right_value = _number(values.get(right))
+            return (
+                left_value - right_value
+                if left_value is not None and right_value is not None
+                else None
+            )
+
+        return {
+            "quality": quality,
+            "current": {"schema": MARKET_INDEX_CURRENT_SCHEMA, "rows": current_rows},
+            "relative_strength": {
+                "large_small_spread_pct_point": spread("000300.SH", "000852.SH"),
+                "chinext_sz50_spread_pct_point": spread("399006.SZ", "000016.SH"),
+                "star50_allA_spread_pct_point": spread("000688.SH", "883957.TI"),
+            },
+            "trajectory": {
+                "schema": MARKET_INDEX_TRAJECTORY_SCHEMA,
+                "rows": wide_rows,
+            },
+        }
 
     def _market_intraday_trajectory(
         self,
@@ -1417,6 +1592,12 @@ class MarketStatePackageBuilder:
         intraday_nodes = self._intraday_target_nodes(
             trade_date_value, target_scheduled_time
         )
+        market_indices = self._market_indices(
+            trade_date_value,
+            target_scheduled_time,
+            int(target["node_seq"]),
+            requested,
+        )
 
         delta = self._table_row(
             "market.hithink_market_delta_15m", trade_date_value, collection_id
@@ -1467,6 +1648,36 @@ class MarketStatePackageBuilder:
             (_text(row["sector_type"]), row["sector_code"]): row
             for row in core_sector_rows
         }
+        sector_cap_map: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for sector_type, table in CORE_STATE_TABLES.items():
+            relevant = [
+                row for row in core_sector_rows if _text(row["sector_type"]) == sector_type
+            ]
+            source_ids = sorted(
+                {
+                    _text(row.get("state_source_collection_id")) or collection_id
+                    for row in relevant
+                }
+            )
+            codes = sorted({str(row["sector_code"]) for row in relevant})
+            if not source_ids or not codes:
+                continue
+            for cap_row in self._rows(
+                f"""
+                SELECT toString(collection_id) AS collection_id,sector_code,
+                       total_market_cap,float_market_cap,turnover_total
+                FROM {table} FINAL
+                WHERE trade_date={{trade_date:Date}}
+                  AND toString(collection_id) IN {{collection_ids:Array(String)}}
+                  AND sector_code IN {{sector_codes:Array(String)}}
+                """,
+                {
+                    "trade_date": trade_date_value,
+                    "collection_ids": source_ids,
+                    "sector_codes": codes,
+                },
+            ):
+                sector_cap_map[(sector_type, cap_row["collection_id"], cap_row["sector_code"])] = cap_row
         candidate_histories = self._candidate_histories(trade_date_value, target_nodes)
         selected_core_sector_rows = [
             row
@@ -1493,6 +1704,13 @@ class MarketStatePackageBuilder:
             items = []
             for row in rows:
                 item = _strip_internal(row) or {}
+                source_id = _text(row.get("state_source_collection_id")) or collection_id
+                cap_row = sector_cap_map.get((sector_type, source_id, row["sector_code"])) or {}
+                item["total_market_cap"] = cap_row.get("total_market_cap")
+                item["float_market_cap"] = cap_row.get("float_market_cap")
+                item["turnover_to_float_cap_pct"] = _turnover_to_float_cap_pct(
+                    cap_row.get("turnover_total"), cap_row.get("float_market_cap")
+                )
                 item["candidate_reasons"] = [
                     label for field, label in SECTOR_REASON_FIELDS.items() if row.get(field) == 1
                 ]
@@ -1536,6 +1754,32 @@ class MarketStatePackageBuilder:
             {"trade_date": trade_date_value, "collection_id": collection_id},
         )
         stock_codes = [_text(row["thscode"]) or "" for row in all_stock_rows]
+        stock_source_ids = sorted(
+            {
+                _text(row.get("state_source_collection_id")) or collection_id
+                for row in all_stock_rows
+            }
+        )
+        stock_cap_map: dict[tuple[str, str], dict[str, Any]] = {}
+        if stock_codes and stock_source_ids:
+            cap_rows = self._rows(
+                """
+                SELECT toString(collection_id) AS collection_id,thscode,turnover,
+                       total_market_cap,float_market_cap
+                FROM market.hithink_snapshot_derived FINAL
+                WHERE trade_date={trade_date:Date}
+                  AND toString(collection_id) IN {collection_ids:Array(String)}
+                  AND thscode IN {stock_codes:Array(String)}
+                """,
+                {
+                    "trade_date": trade_date_value,
+                    "collection_ids": stock_source_ids,
+                    "stock_codes": stock_codes,
+                },
+            )
+            stock_cap_map = {
+                (row["collection_id"], str(row["thscode"])): row for row in cap_rows
+            }
         memberships = self._stock_memberships(
             trade_date_value, collection_id, stock_codes
         )
@@ -1551,6 +1795,13 @@ class MarketStatePackageBuilder:
             for row in all_stock_rows[:stock_top_n]:
                 item = _strip_internal(row) or {}
                 thscode = _text(row["thscode"]) or ""
+                source_id = _text(row.get("state_source_collection_id")) or collection_id
+                cap_row = stock_cap_map.get((source_id, thscode)) or {}
+                item["total_market_cap"] = cap_row.get("total_market_cap")
+                item["float_market_cap"] = cap_row.get("float_market_cap")
+                item["turnover_to_float_cap_pct"] = _turnover_to_float_cap_pct(
+                    cap_row.get("turnover"), cap_row.get("float_market_cap")
+                )
                 item["candidate_reasons"] = [
                     label
                     for field, label in STOCK_REASON_FIELDS.items()
@@ -1809,6 +2060,7 @@ class MarketStatePackageBuilder:
                 ),
                 "intraday_trajectory": market_intraday_trajectory,
             },
+            "market_indices": market_indices,
             **({"auction_market": auction_market} if auction_market is not None else {}),
             "emotion": {
                 "intraday_trajectory": emotion_intraday_trajectory,

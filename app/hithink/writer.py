@@ -9,7 +9,13 @@ from typing import Any
 
 import clickhouse_connect
 
-from app.hithink.api import AuctionApiSnapshot, LimitPoolSnapshot, SectorIndexSnapshot
+from app.hithink.api import (
+    AuctionApiSnapshot,
+    LimitPoolSnapshot,
+    MarketIndexSnapshot,
+    SectorIndexSnapshot,
+)
+from app.hithink.market_indices import MARKET_INDEX_BY_CODE
 from app.hithink.models import DerivedSnapshot, RawSnapshot
 from app.hithink.schedule import ScheduleNode
 
@@ -25,13 +31,16 @@ CALENDAR = "market.trading_calendar"
 DAILY_STATUS = "market.hithink_daily_sync_status"
 DAILY_TASKS = (
     "calendar_gate",
+    "tencent_stock_basic_sync",
     "sector_catalog_sync",
     "sector_membership_sync",
     "hithink_daily_k_raw_sync",
     "hithink_adjustment_events_sync",
 )
 SECTOR_INDEX = "market.hithink_sector_index_snapshot"
+MARKET_INDEX = "market.hithink_market_index_snapshot"
 AUCTION_SNAPSHOT = "market.hithink_auction_snapshot"
+TENCENT_STOCK_BASIC = "market.tencent_stock_basic_info"
 SECTOR_STATES = {
     "concept": "market.hithink_concept_state",
     "industry": "market.hithink_industry_state",
@@ -338,6 +347,7 @@ class ClickHouseWriter:
             "limit_up_pool_status",
             "limit_down_pool_status",
             "limit_break_pool_status",
+            "market_index_status",
             "sector_index_status",
             "emotion_state_status",
             "market_delta_15m_status",
@@ -360,6 +370,7 @@ class ClickHouseWriter:
                  OR limit_up_pool_status = 'RUNNING'
                  OR limit_down_pool_status = 'RUNNING'
                  OR limit_break_pool_status = 'RUNNING'
+                 OR market_index_status = 'RUNNING'
                  OR sector_index_status = 'RUNNING'
                  OR emotion_state_status = 'RUNNING'
                  OR market_delta_15m_status = 'RUNNING'
@@ -501,6 +512,8 @@ class ClickHouseWriter:
             "is_limit_down",
             "is_limit_break",
             "limit_break_open_times",
+            "total_market_cap",
+            "float_market_cap",
         ]
         result = self.client.query(
             f"SELECT {', '.join(columns)} FROM {DERIVED} WHERE collection_id = {{collection_id:String}}",
@@ -558,6 +571,58 @@ class ClickHouseWriter:
     def insert_raw_once(self, rows: list[RawSnapshot]) -> tuple[int, int]:
         return self._insert_once(RAW, rows, [field for field in RawSnapshot.__dataclass_fields__])
 
+    def insert_tencent_stock_basic_once(
+        self, rows: list[Any], *, batch_id: str
+    ) -> tuple[int, int]:
+        columns = (
+            "snapshot_date",
+            "scheduled_time",
+            "source_time",
+            "batch_id",
+            "thscode",
+            "ticker",
+            "stock_name",
+            "total_shares",
+            "float_shares",
+            "source_tag",
+        )
+        if not rows:
+            return 0, 0
+        existing = {
+            str(thscode): (
+                (
+                    ticker.decode("ascii").rstrip("\x00")
+                    if isinstance(ticker, bytes)
+                    else str(ticker).rstrip("\x00")
+                ),
+                str(stock_name),
+                _optional_int(total_shares),
+                _optional_int(float_shares),
+            )
+            for thscode, ticker, stock_name, total_shares, float_shares
+            in self.client.query(
+                f"""
+                SELECT thscode, ticker, stock_name, total_shares, float_shares
+                FROM {TENCENT_STOCK_BASIC} FINAL
+                """
+            ).result_rows
+        }
+        changed = [
+            row
+            for row in rows
+            if existing.get(row.thscode)
+            != (row.ticker, row.stock_name, row.total_shares, row.float_shares)
+        ]
+        if not changed:
+            return 0, 0
+        started = perf_counter()
+        self.client.insert(
+            TENCENT_STOCK_BASIC,
+            [tuple(getattr(row, column) for column in columns) for row in changed],
+            column_names=list(columns),
+        )
+        return len(changed), round((perf_counter() - started) * 1000)
+
     def latest_all_a_codes_before(self, trade_date: object) -> list[str]:
         result = self.client.query(
             f"""
@@ -574,6 +639,37 @@ class ClickHouseWriter:
             parameters={"trade_date": trade_date},
         )
         return [str(row[0]) for row in result.result_rows]
+
+    def latest_stock_share_counts(
+        self, trade_date: object
+    ) -> dict[str, tuple[int | None, int | None]]:
+        result = self.client.query(
+            f"""
+            SELECT
+                thscode,
+                argMaxIf(
+                    total_shares,
+                    tuple(snapshot_date, version_time),
+                    total_shares IS NOT NULL
+                ) AS total_shares,
+                argMaxIf(
+                    float_shares,
+                    tuple(snapshot_date, version_time),
+                    float_shares IS NOT NULL
+                ) AS float_shares
+            FROM {TENCENT_STOCK_BASIC} FINAL
+            WHERE snapshot_date <= {{trade_date:Date}}
+            GROUP BY thscode
+            """,
+            parameters={"trade_date": trade_date},
+        )
+        return {
+            str(thscode): (
+                _optional_int(total_shares),
+                _optional_int(float_shares),
+            )
+            for thscode, total_shares, float_shares in result.result_rows
+        }
 
     def auction_snapshot_count(self, collection_id: str) -> int:
         return self._scalar(
@@ -595,9 +691,13 @@ class ClickHouseWriter:
         error_message: str | None = None,
     ) -> tuple[int, int]:
         row_count = sum(snapshot.total for snapshot in snapshots)
+        share_counts = self.latest_stock_share_counts(node.trade_date)
         rows: list[tuple[Any, ...]] = []
         for snapshot in snapshots:
             for item in snapshot.items:
+                thscode = str(item["thscode"])
+                total_shares, float_shares = share_counts.get(thscode, (None, None))
+                auction_price = _optional_float(item.get("auction_price"))
                 rows.append(
                     (
                         node.trade_date,
@@ -625,10 +725,10 @@ class ClickHouseWriter:
                         snapshot.retry_count,
                         error_code,
                         error_message,
-                        str(item["thscode"]),
+                        thscode,
                         str(item["ticker"]),
                         str(item.get("name") or ""),
-                        _optional_float(item.get("auction_price")),
+                        auction_price,
                         _optional_float(item.get("auction_pct")),
                         _optional_int(item.get("auction_volume")),
                         _optional_float(item.get("auction_amount")),
@@ -639,7 +739,8 @@ class ClickHouseWriter:
                         _optional_float(item.get("pre_close_price")),
                         _optional_float(item.get("open_price")),
                         _optional_float(item.get("last_price")),
-                        _optional_float(item.get("float_market_cap")),
+                        _market_cap(auction_price, total_shares),
+                        _market_cap(auction_price, float_shares),
                     )
                 )
         columns = [
@@ -653,7 +754,7 @@ class ClickHouseWriter:
             "auction_volume", "auction_amount", "auction_unmatched",
             "auction_turnover_pct", "auction_yesterday_ratio_pct",
             "auction_volume_ratio", "pre_close_price", "open_price", "last_price",
-            "float_market_cap",
+            "total_market_cap", "float_market_cap",
         ]
         return self._insert_once(
             AUCTION_SNAPSHOT,
@@ -681,6 +782,8 @@ class ClickHouseWriter:
                 row.is_limit_down,
                 row.is_limit_break,
                 row.limit_break_open_times,
+                row.total_market_cap,
+                row.float_market_cap,
             )
             for row in rows
         ]
@@ -856,6 +959,56 @@ class ClickHouseWriter:
             SECTOR_INDEX, rows, columns, batch_id=f"{node.collection_id}-sector-index"
         )
 
+    def insert_market_index_once(
+        self,
+        node: ScheduleNode,
+        snapshot: MarketIndexSnapshot,
+    ) -> tuple[int, int]:
+        if snapshot.total != len(MARKET_INDEX_BY_CODE):
+            raise RuntimeError(
+                f"Market index batch is incomplete: {snapshot.total}/{len(MARKET_INDEX_BY_CODE)}"
+            )
+        records = {record.index_code: record for record in snapshot.items}
+        if set(records) != set(MARKET_INDEX_BY_CODE):
+            raise RuntimeError("Market index records do not match the fixed index catalog")
+        batch_id = f"{node.collection_id}-market-index"
+        rows = []
+        for index_code, definition in MARKET_INDEX_BY_CODE.items():
+            record = records[index_code]
+            item = record.item
+            rows.append(
+                (
+                    node.trade_date,
+                    node.collection_id,
+                    node.scheduled_time,
+                    record.source_timestamp,
+                    record.source_time,
+                    node.session,
+                    batch_id,
+                    index_code,
+                    definition.index_name,
+                    definition.index_group,
+                    definition.source_tag,
+                    _optional_float(item.get("last_price")),
+                    _optional_float(item.get("price_change")),
+                    _optional_float(item.get("price_change_ratio_pct")),
+                    _optional_float(item.get("open_price")),
+                    _optional_float(item.get("high_price")),
+                    _optional_float(item.get("low_price")),
+                    _optional_float(item.get("prev_price")),
+                    _optional_int(item.get("volume")),
+                    _optional_float(item.get("turnover")),
+                )
+            )
+        columns = [
+            "trade_date", "collection_id", "scheduled_time", "source_timestamp",
+            "source_time", "session", "batch_id", "index_code", "index_name",
+            "index_group", "source_tag", "last_price", "price_change",
+            "price_change_ratio_pct", "open_price", "high_price", "low_price",
+            "prev_price", "volume", "turnover",
+        ]
+        return self._insert_once(MARKET_INDEX, rows, columns, batch_id=batch_id)
+
     def limit_pool_collected(self, node: ScheduleNode) -> bool:
         return bool(
             self._scalar(
@@ -946,7 +1099,8 @@ class ClickHouseWriter:
                 down_0_to_1_count, down_1_to_5_count, down_5_to_limit_count, limit_down_count,
                 limit_break_count, limit_break_count_delta_prev_available,
                 turnover_total, turnover_delta_1m_total, prev_turnover_delta_1m_total,
-                turnover_growth_1m, volume_total, volume_delta_1m_total,
+                turnover_growth_1m, total_market_cap, float_market_cap,
+                volume_total, volume_delta_1m_total,
                 turnover_market_share_pct, turnover_1m_market_share_pct,
                 prev_day_same_time_turnover, turnover_vs_prev_day_delta, turnover_vs_prev_day_pct,
                 turnover_accel_count, turnover_decel_count, turnover_accel_50_count,
@@ -1014,6 +1168,8 @@ class ClickHouseWriter:
                         derived.volume_delta_1m AS volume_delta_1m,
                         derived.turnover_growth_1m AS turnover_growth_1m,
                         derived.volume_ratio_1m AS volume_ratio_1m,
+                        derived.total_market_cap AS total_market_cap,
+                        derived.float_market_cap AS float_market_cap,
                         derived.new_high_flag AS new_high_flag,
                         derived.new_low_flag AS new_low_flag,
                         derived.price_delta_1m AS price_delta_1m
@@ -1075,6 +1231,10 @@ class ClickHouseWriter:
                         toFloat64(sum(turnover)) AS turnover_total,
                         if(countIf(turnover_delta_1m IS NOT NULL) = 0,
                             CAST(NULL, 'Nullable(Float64)'), toFloat64(sum(turnover_delta_1m))) AS turnover_delta_1m_total,
+                        if(countIf(total_market_cap IS NOT NULL) = 0,
+                            CAST(NULL, 'Nullable(Float64)'), toFloat64(sum(total_market_cap))) AS total_market_cap,
+                        if(countIf(float_market_cap IS NOT NULL) = 0,
+                            CAST(NULL, 'Nullable(Float64)'), toFloat64(sum(float_market_cap))) AS float_market_cap,
                         toUInt64(sum(volume)) AS volume_total,
                         if(countIf(volume_delta_1m IS NOT NULL) = 0,
                             CAST(NULL, 'Nullable(Int64)'), toInt64(sum(volume_delta_1m))) AS volume_delta_1m_total,
@@ -1165,6 +1325,8 @@ class ClickHouseWriter:
                     AND current.turnover_delta_1m_total IS NOT NULL AND previous.turnover_delta_1m_total > 0,
                     current.turnover_delta_1m_total / previous.turnover_delta_1m_total - 1,
                     CAST(NULL, 'Nullable(Float64)')),
+                current.total_market_cap,
+                current.float_market_cap,
                 current.volume_total,
                 current.volume_delta_1m_total,
                 if(market.turnover_total > 0, current.turnover_total / toFloat64(market.turnover_total) * 100, CAST(NULL, 'Nullable(Float64)')),
@@ -2144,3 +2306,9 @@ def _optional_int(value: Any) -> int | None:
 
 def _optional_float(value: Any) -> float | None:
     return None if value is None else float(value)
+
+
+def _market_cap(price: float | None, shares: int | None) -> float | None:
+    if price is None or shares is None:
+        return None
+    return price * shares

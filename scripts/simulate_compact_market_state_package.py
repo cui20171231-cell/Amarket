@@ -50,6 +50,9 @@ CORE_SECTOR_SCHEMA = [
     "limit_up",
     "limit_break",
     "new_high_ratio",
+    "total_market_cap",
+    "float_market_cap",
+    "turnover_to_float_cap_pct",
     "reasons",
 ]
 
@@ -80,6 +83,10 @@ CORE_STOCK_SCHEMA = [
     "change_1m_pct",
     "turnover",
     "turnover_1m",
+    "total_market_cap",
+    "float_market_cap",
+    "turnover_to_float_cap_pct",
+    "turnover_to_float_cap_rank",
     "turnover_rank",
     "turnover_1m_rank",
     "new_high",
@@ -357,6 +364,9 @@ def compact_core_sectors(source: dict[str, Any]) -> dict[str, Any]:
                     item.get("limit_up_count"),
                     item.get("limit_break_count"),
                     item.get("new_high_ratio"),
+                    item.get("total_market_cap"),
+                    item.get("float_market_cap"),
+                    item.get("turnover_to_float_cap_pct"),
                     item.get("candidate_reasons") or [],
                 ]
             )
@@ -652,8 +662,18 @@ def compact_core_stocks(source: Any) -> dict[str, Any]:
             "trajectory_rows": list(source.get("trajectory_rows") or []),
         }
 
+    selected = source[:20]
+    ratio_values = sorted(
+        {
+            float(item["turnover_to_float_cap_pct"])
+            for item in selected
+            if item.get("turnover_to_float_cap_pct") is not None
+        },
+        reverse=True,
+    )
+    ratio_ranks = {value: rank for rank, value in enumerate(ratio_values, 1)}
     rows: list[list[Any]] = []
-    for item in source[:20]:
+    for item in selected:
         memberships = [
             membership.get("sector_name")
             for membership in (item.get("core_sector_memberships") or [])
@@ -670,6 +690,12 @@ def compact_core_stocks(source: Any) -> dict[str, Any]:
                 item.get("price_change_1m_pct"),
                 item.get("turnover"),
                 item.get("turnover_delta_1m"),
+                item.get("total_market_cap"),
+                item.get("float_market_cap"),
+                item.get("turnover_to_float_cap_pct"),
+                ratio_ranks.get(float(item["turnover_to_float_cap_pct"]))
+                if item.get("turnover_to_float_cap_pct") is not None
+                else None,
                 item.get("turnover_rank_market"),
                 item.get("turnover_delta_1m_rank_market"),
                 item.get("new_high_flag"),
@@ -951,6 +977,18 @@ def build_compact(
         },
         "quality": compact_quality(full),
         "market": compact_market(full.get("market") or {}),
+        "market_indices": full.get("market_indices") or {
+            "quality": {
+                "target_time": target.get("requested_time"),
+                "scheduled_time": target.get("resolved_scheduled_time"),
+                "source_time": None,
+                "source_age_seconds": None,
+                "status": "MISSING",
+            },
+            "current": {"schema": [], "rows": []},
+            "relative_strength": {},
+            "trajectory": {"schema": [], "rows": []},
+        },
         **(
             {"auction_market": compact_auction_market(full["auction_market"])}
             if isinstance(full.get("auction_market"), dict)

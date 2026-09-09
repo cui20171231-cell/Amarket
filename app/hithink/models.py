@@ -70,3 +70,5 @@ class DerivedSnapshot:
     is_limit_down: int | None = None
     is_limit_break: int | None = None
     limit_break_open_times: int | None = None
+    total_market_cap: float | None = None
+    float_market_cap: float | None = None

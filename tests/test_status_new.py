@@ -64,6 +64,7 @@ def _row(node, raw="SUCCESS", derivation="SUCCESS", **values) -> dict:
         "limit_up_pool_status": "SUCCESS" if raw == "SUCCESS" else raw,
         "limit_down_pool_status": "SUCCESS" if raw == "SUCCESS" else raw,
         "limit_break_pool_status": "SUCCESS" if raw == "SUCCESS" else raw,
+        "market_index_status": "SUCCESS" if raw == "SUCCESS" else raw,
         "sector_index_status": "SUCCESS" if raw == "SUCCESS" else raw,
         "sector_state_status": "SUCCESS" if derivation == "SUCCESS" else derivation,
         "emotion_state_status": emotion,

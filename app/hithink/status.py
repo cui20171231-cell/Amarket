@@ -34,6 +34,7 @@ RAW_ITEMS = {
     "limit_up_pool_status": "涨停池",
     "limit_down_pool_status": "跌停池",
     "limit_break_pool_status": "炸板池",
+    "market_index_status": "市场指数",
     "sector_index_status": "板块指数",
 }
 DERIVED_ITEMS = (
@@ -273,6 +274,7 @@ NODE_COLUMNS = (
     "limit_up_pool_status",
     "limit_down_pool_status",
     "limit_break_pool_status",
+    "market_index_status",
     "sector_index_status",
     "sector_state_status",
     "emotion_state_status",

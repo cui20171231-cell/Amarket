@@ -73,7 +73,7 @@ TOOLS = [
         "name": "get_market_context_state",
         "title": "读取个股或板块上下文",
         "description": (
-            "按需读取单只股票、最多5只股票或单个板块的1分钟上下文。"
+            "按需读取单只股票、最多50只股票或单个板块的1分钟上下文。"
             "不传时间时读取继承交易日的最新有效分钟，传时间时恢复指定分钟并允许向前回退；"
             "stock模式返回连续分钟轨迹、自动筛选的主要方向及板块内实时地位；"
             "stocks模式分别返回各股票自己的方向上下文；"
@@ -89,7 +89,7 @@ TOOLS = [
                     "type": ["array", "null"],
                     "items": {"type": "string"},
                     "minItems": 2,
-                    "maxItems": 5,
+                    "maxItems": 50,
                 },
                 "sector_id": {"type": ["string", "null"]},
                 "sector_name": {"type": ["string", "null"]},

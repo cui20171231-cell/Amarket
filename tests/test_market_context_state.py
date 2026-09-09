@@ -7,6 +7,7 @@ from pathlib import Path
 from app.market_context_compact import compact_market_context_response
 from app.market_context_state import (
     AUCTION_TRAJECTORY_SCHEMA,
+    MAX_STOCKS,
     _compress_sector_trajectory,
     _compress_stock_trajectory,
     _normalize_sector_name,
@@ -14,6 +15,7 @@ from app.market_context_state import (
     _requested_time_quality,
     _row_offsets,
     _sector_metrics,
+    _sector_structure_blocks,
     _select_stock_sectors,
     _stock_auction_context,
     _stock_current_block,
@@ -41,6 +43,15 @@ def test_invalid_mode_inputs_are_rejected_before_database_connection() -> None:
         get_market_context_state(target_type="stocks", tickers=["000977"], target_time="10:30")[
             "status"
         ]
+        == "INVALID_REQUEST"
+    )
+    assert MAX_STOCKS == 50
+    assert (
+        get_market_context_state(
+            target_type="stocks",
+            tickers=[f"{index:06d}" for index in range(MAX_STOCKS + 1)],
+            target_time="10:30",
+        )["status"]
         == "INVALID_REQUEST"
     )
     assert (
@@ -89,8 +100,8 @@ def test_stock_sector_selection_reserves_one_industry_slot() -> None:
 
     selected = _select_stock_sectors(rows, 5)
 
-    assert len(selected) == 5
-    assert sum(row["sector_type"] == "concept" for row in selected) == 4
+    assert len(selected) == 4
+    assert sum(row["sector_type"] == "concept" for row in selected) == 3
     assert sum(row["sector_type"] == "industry" for row in selected) == 1
 
 
@@ -115,6 +126,9 @@ def test_strategic_core_direction_has_auditable_priority_component() -> None:
             "sector_code": "CORE",
             "watch_level": "CORE",
             "valid_members": 100,
+            "corr_all": 0.5,
+            "corr_recent": 0.5,
+            "recent_observations": 30,
         },
         {
             "sector_type": "concept",
@@ -130,6 +144,68 @@ def test_strategic_core_direction_has_auditable_priority_component() -> None:
     breakdown = selected[0]["selection_score_breakdown"]
     assert breakdown["raw_components"]["strategic_direction_priority"] == 1
     assert set(breakdown) == {"weights", "raw_components", "weighted_components", "profile_facts"}
+
+
+def test_strategic_label_alone_does_not_enter_primary_directions() -> None:
+    rows = [
+        {
+            "sector_type": "concept",
+            "sector_code": "LABEL_ONLY",
+            "relative_row": 1,
+            "index_change_ratio_pct": 0,
+            "index_change_1m_pct": 0,
+            "up_ratio": 0.5,
+            "valid_member_count": 1000,
+            "limit_up_count": 0,
+            "limit_break_count": 0,
+        }
+    ]
+    profiles = [
+        {
+            "sector_type": "concept",
+            "sector_code": "LABEL_ONLY",
+            "watch_level": "CORE",
+            "valid_members": 1000,
+        }
+    ]
+
+    assert _select_stock_sectors(rows, 4, 0, profiles) == []
+
+
+def test_sector_structure_blocks_keep_market_cap_and_turnover_order_independent() -> None:
+    rows = [
+        {
+            "thscode": "A",
+            "stock_name": "A",
+            "float_market_cap": 60,
+            "total_market_cap": 100,
+            "turnover": 10,
+            "turnover_to_float_cap_pct": 16.67,
+            "sector_float_market_cap_sum": 100,
+            "sector_total_market_cap_sum": 200,
+            "sector_turnover_sum": 100,
+            "float_market_cap_valid_member_count": 3,
+            "total_market_cap_valid_member_count": 3,
+        },
+        {"thscode": "B", "float_market_cap": 30, "total_market_cap": 20, "turnover": 70},
+        {"thscode": "C", "float_market_cap": 10, "total_market_cap": 80, "turnover": 20},
+        {"thscode": "D", "float_market_cap": None, "total_market_cap": 0, "turnover": 0},
+    ]
+    current = {
+        "valid_member_count": 4,
+        "turnover_1m_top1_share_pct": 50,
+        "turnover_1m_top3_share_pct": 90,
+        "turnover_1m_top5_share_pct": 100,
+    }
+
+    caps, largest, turnover = _sector_structure_blocks(rows, current)
+
+    assert caps["float_market_cap_valid_member_count"] == 3
+    assert caps["float_cap_top1_share_pct"] == 60
+    assert caps["total_cap_top1_share_pct"] == 50
+    assert [row["ticker"] for row in largest] == ["A", "B", "C"]
+    assert turnover["turnover_top1_share_pct"] == 70
+    assert turnover["turnover_1m_top3_share_pct"] == 90
 
 
 def test_minute_offsets_use_1_5_15_minutes_across_session_labels() -> None:
@@ -213,7 +289,32 @@ def test_stock_current_uses_minute_windows_and_turnover_comparisons() -> None:
     assert current["comparison_window"]["prev_5m_time"].strftime("%H:%M") == "09:55"
     assert current["comparison_window"]["prev_15m_time"].strftime("%H:%M") == "09:45"
     assert current["turnover_5m"] == 500
-    assert current["prev_turnover_15m"] == 1500
+    assert current["turnover_15m"] == sum(100 + index for index in range(16, 31))
+    assert current["turnover_15m_valid_minutes"] == 15
+    assert current["prev_turnover_15m"] == sum(100 + index for index in range(1, 16))
+
+
+def test_stock_turnover_15m_does_not_cross_lunch_break() -> None:
+    rows = [
+        {
+            "scheduled_time": datetime(2026, 9, 1, 11, 30, tzinfo=UTC),
+            "last_price": 10,
+            "turnover_delta_1m": 999,
+        },
+        *[
+            {
+                "scheduled_time": datetime(2026, 9, 1, 13, minute, tzinfo=UTC),
+                "last_price": 10,
+                "turnover_delta_1m": 100,
+            }
+            for minute in range(4)
+        ],
+    ]
+
+    current = _stock_current_block(rows)
+
+    assert current["turnover_15m"] == 400
+    assert current["turnover_15m_valid_minutes"] == 4
     assert current["turnover_1m_change_pct"] is not None
 
 
@@ -395,5 +496,8 @@ def test_new_tool_is_wired_into_both_mcp_entries_without_replacing_market_packag
     assert "def get_market_context_state(" in gateway
     assert '"name": "get_market_context_state"' in plugin
     assert '"required": ["target_type"]' in plugin
+    assert '"maxItems": 50' in plugin
+    assert "最多50只股票" in gateway
+    assert "最多50只股票" in plugin
     assert "def get_market_state_package(" in gateway
     assert '"name": "get_market_state_package"' in plugin

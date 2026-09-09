@@ -16,6 +16,7 @@ from app.hithink.api import (
     HithinkApiError,
     HithinkClient,
     LimitPoolSnapshot,
+    MarketIndexSnapshot,
     SectorIndexItem,
     SectorIndexSnapshot,
     _EndpointRateLimiter,
@@ -254,6 +255,9 @@ class Writer:
     def insert_sector_index_once(self, *args):
         return 1, 1
 
+    def insert_market_index_once(self, *args):
+        return 8, 1
+
     def upsert_emotion_state(self, node):
         return None
 
@@ -286,6 +290,12 @@ class PartialApi:
             duration_ms=100,
             retry_count=0,
         )
+
+    def fetch_market_index_snapshot(
+        self, trade_date, *, deadline=None, rate_limit_deadline=None, allow_retries=True
+    ):
+        self.calls.append("market_index")
+        return MarketIndexSnapshot(total=8, items=[], duration_ms=100, retry_count=0)
 
     def fetch_limit_pool(
         self, name, trade_date, *, deadline=None, rate_limit_deadline=None
@@ -323,12 +333,13 @@ def test_one_failed_interface_keeps_the_other_four_and_marks_partial(
 
     assert api.calls == [
         "all_a_snapshot",
+        "market_index",
         "sector_index",
         "limit-up-pool",
         "limit-down-pool",
         "limit-break-pool",
     ]
-    assert pauses == [1.0, 1.0, 1.0, 1.0]
+    assert pauses == [1.0, 1.0, 1.0, 1.0, 1.0]
     assert result.prices is None
     assert result.sector_index is not None
     assert result.limit_up is not None
@@ -350,8 +361,46 @@ def test_one_failed_interface_keeps_the_other_four_and_marks_partial(
     assert values["api_duration_ms"] == 3200
     assert values["retry_count"] == 2
     assert "all_a_snapshot:UPSTREAM_HTTP_429" in values["raw_error_code"]
-    assert worker_counts == [5]
+    assert worker_counts == [6]
     assert raw_module.NODE_COLLECTION_BUDGET_SECONDS < 60
+
+
+def test_market_index_failure_does_not_block_existing_raw_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MarketIndexFailedApi(PartialApi):
+        def fetch(self, *, deadline=None, rate_limit_deadline=None):
+            self.calls.append("all_a_snapshot")
+            source_time = datetime(2026, 8, 28, 10, 30, tzinfo=SHANGHAI)
+            return api_module.ApiSnapshot(0, 1_787_814_000_000, source_time, 0, [], 1, 0)
+
+        def fetch_market_index_snapshot(
+            self,
+            trade_date,
+            *,
+            deadline=None,
+            rate_limit_deadline=None,
+            allow_retries=True,
+        ):
+            self.calls.append("market_index")
+            raise HithinkApiError(
+                None,
+                "market indices unavailable",
+                error_code="MARKET_INDEX_BATCH_INCOMPLETE",
+            )
+
+    monkeypatch.setattr(raw_module, "sleep", lambda seconds: None)
+    node = build_daily_schedule(date(2026, 8, 28))[20]
+    writer = Writer()
+
+    result = RawCollector(MarketIndexFailedApi(), writer).collect(
+        node, node.collection_id
+    )
+
+    assert result.market_index is None
+    assert result.raw_status == "SUCCESS"
+    assert result.errors["market_index"][0] == "MARKET_INDEX_BATCH_INCOMPLETE"
+    assert any(status.get("market_index_status") == "FAILED" for status in writer.statuses)
 
 
 def test_145653_node_disables_all_api_retries(
@@ -372,6 +421,22 @@ def test_145653_node_disables_all_api_retries(
             self.options.append(allow_retries)
             return super().fetch_sector_index_snapshot(
                 codes, deadline=deadline, rate_limit_deadline=rate_limit_deadline
+            )
+
+        def fetch_market_index_snapshot(
+            self,
+            trade_date,
+            *,
+            deadline=None,
+            rate_limit_deadline=None,
+            allow_retries=True,
+        ):
+            self.options.append(allow_retries)
+            return super().fetch_market_index_snapshot(
+                trade_date,
+                deadline=deadline,
+                rate_limit_deadline=rate_limit_deadline,
+                allow_retries=allow_retries,
             )
 
         def fetch_limit_pool(
@@ -398,7 +463,7 @@ def test_145653_node_disables_all_api_retries(
     RawCollector(api, Writer()).collect(node, node.collection_id)
 
     assert node.scheduled_time.strftime("%H:%M:%S") == "14:56:53"
-    assert api.options == [False, False, False, False, False]
+    assert api.options == [False, False, False, False, False, False]
 
 
 def test_api_no_retry_mode_stops_after_first_429(
@@ -462,6 +527,7 @@ def test_unhandled_raw_failure_closes_every_child_status() -> None:
     assert final["limit_up_pool_status"] == "SKIPPED"
     assert final["limit_down_pool_status"] == "SKIPPED"
     assert final["limit_break_pool_status"] == "SKIPPED"
+    assert final["market_index_status"] == "FAILED"
     assert final["sector_index_status"] == "FAILED"
     assert final["sector_state_status"] == "BLOCKED"
     assert all(value != "RUNNING" for key, value in final.items() if key.endswith("_status"))
