@@ -33,7 +33,7 @@ market.hithink_market_state
 | 10:45:08 | 087 | 14:15:08 | 208 |
 | 11:00:08 | 102 | 14:30:08 | 223 |
 | 11:15:08 | 117 | 14:45:08 | 238 |
-|  |  | 15:00:08（自2026-09-04起） | 254 |
+|  |  | 15:30:08（自2026-09-14起） | 254 |
 
 ## 3. 基准选择
 
@@ -47,7 +47,7 @@ market.hithink_market_state
 09:25：上午原始基线，比较字段为NULL
 09:30：与09:25比较，正常跨度300秒
 13:00：下午原始基线，比较字段为NULL
-15:00：与14:45:08比较，正常跨度892秒
+15:30：与14:45:08比较，实际跨度2700秒
 ```
 
 `delta_type` 固定区分三种业务含义：
@@ -156,11 +156,11 @@ contract_price_down_count_delta_15m
 254号必须满足：
 
 ```text
-scheduled_time = 当天15:00:08（自2026-09-04起）
+scheduled_time = 当天15:30:08（自2026-09-14起）
 delta_status = VALID
 state_data_status = CURRENT
 state_source_collection_id = 当前254号collection_id
-state_source_scheduled_time = 当天15:00:08（自2026-09-04起）
+state_source_scheduled_time = 当天15:30:08（自2026-09-14起）
 state_source_age_seconds = 0
 state_is_fallback = 0
 base_collection_id必须属于当天下午此前真实检查点

@@ -204,6 +204,12 @@ MARKET_TRAJECTORY_SCHEMA = [
     "flat_count",
     "up_ratio",
     "limit_up",
+    "up_5_to_limit",
+    "up_1_to_5",
+    "up_0_to_1",
+    "down_0_to_1",
+    "down_1_to_5",
+    "down_5_to_limit",
     "limit_down",
     "limit_break",
     "turnover",
@@ -280,7 +286,7 @@ def minute_metric_context(value: Any) -> str:
         return "OPEN_TRANSITION"
     if time_text == "13:00":
         return "AFTER_LUNCH_BASE"
-    if time_text == "15:00":
+    if time_text in {"15:00", "15:30"}:
         return "CLOSE_AUCTION"
     return "NORMAL"
 
@@ -800,6 +806,12 @@ def compact_market(source: dict[str, Any]) -> dict[str, Any]:
                 node.get("flat_count"),
                 node.get("up_ratio"),
                 node.get("limit_up_count"),
+                node.get("up_5_to_limit_count"),
+                node.get("up_1_to_5_count"),
+                node.get("up_0_to_1_count"),
+                node.get("down_0_to_1_count"),
+                node.get("down_1_to_5_count"),
+                node.get("down_5_to_limit_count"),
                 node.get("limit_down_count"),
                 node.get("limit_break_count"),
                 node.get("turnover_total"),
@@ -1011,6 +1023,12 @@ def build_compact(
 
 
 def validate_compact(compact: dict[str, Any]) -> None:
+    market_trajectory = compact["market"]["trajectory"]
+    market_schema = market_trajectory["schema"]
+    if market_schema != MARKET_TRAJECTORY_SCHEMA:
+        raise ValueError("市场轨迹结构不正确")
+    if any(len(row) != len(market_schema) for row in market_trajectory["rows"]):
+        raise ValueError("市场轨迹字段与数据列数不一致")
     core_sector_rows = compact["core_sectors"]["current_top20"]["rows"]
     core_stock_block = compact["core_stocks"]
     strategic_rows = compact["strategic_watch"]["rows"]

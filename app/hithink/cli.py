@@ -226,17 +226,17 @@ def parser() -> argparse.ArgumentParser:
     baseline.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
     raw_closing = sub.add_parser(
         "raw-all-a-closing-snapshot",
-        help="write only one current all-A raw snapshot to the 15:00 collection ID",
+        help="write only one current all-A raw snapshot to the 15:30 collection ID",
     )
     raw_closing.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
     sector_closing = sub.add_parser(
         "raw-sector-closing-snapshot",
-        help="write only current concept, industry, and style index facts to the 15:00 collection ID",
+        help="write only current concept, industry, and style index facts to the 15:30 collection ID",
     )
     sector_closing.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
     pools_closing = sub.add_parser(
         "raw-limit-pools-closing-snapshot",
-        help="write only current limit-up, limit-down, and limit-break raw pools to the 15:00 collection ID",
+        help="write only current limit-up, limit-down, and limit-break raw pools to the 15:30 collection ID",
     )
     pools_closing.add_argument("--trade-date", type=lambda value: datetime.fromisoformat(value).date())
     api_test = sub.add_parser(

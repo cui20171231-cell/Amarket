@@ -18,7 +18,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
-from app.hithink.schedule import SHANGHAI
+from app.hithink.schedule import SCHEDULE_V3_EFFECTIVE_DATE, SHANGHAI
 from app.hithink.status import check_status
 from app.logging_utils import configure_bounded_root_logging
 
@@ -39,6 +39,8 @@ STATE_PATH = Path(
 LOG_PATH = ROOT / "data" / "logs" / "email_notifier.log"
 COLLECTOR_PID_PATH = ROOT / "data" / "hithink_snapshot_collector.pid"
 CLOSE_SUMMARY_TIME = time(16, 20)
+CLOSING_NODE_RETRY_CUTOFF_TIME = time(16, 0)
+CLOSING_NODE_V3_RETRY_CUTOFF_TIME = time(15, 50, 8)
 LOG = logging.getLogger(__name__)
 
 
@@ -147,6 +149,11 @@ def _trading_day(report: dict[str, Any]) -> bool | None:
     return bool(progress.get("is_trading_day"))
 
 
+def _schedule_count(report: dict[str, Any]) -> int | None:
+    value = _progress(report).get("schedule_count")
+    return int(value) if value is not None else None
+
+
 def _status_text(status: object) -> str:
     return {
         "HEALTHY": "正常",
@@ -223,7 +230,7 @@ def _summary_body(report: dict[str, Any], *, morning: bool) -> str:
         return "\n".join(lines)
     lines.extend(
         [
-            f"254节点计划：{len(nodes)}/254",
+            f"254节点计划：{_schedule_count(report) or 0}/254",
             (
                 "板块映射：目录"
                 f"{_status_text(daily.get('sector_catalog_sync'))}，成员关系"
@@ -286,10 +293,10 @@ def _issues(report: dict[str, Any], now: datetime) -> dict[str, str]:
     if trading_day is not True:
         return issues
 
-    nodes = _progress(report).get("nodes", [])
-    if now.time() >= time(9, 10) and len(nodes) != 254:
+    schedule_count = _schedule_count(report)
+    if now.time() >= time(9, 10) and schedule_count != 254:
         issues[f"PLAN_INCOMPLETE:{report_date}"] = (
-            f"今日254节点计划只有{len(nodes)}条，计划不完整。"
+            f"今日254节点计划只有{schedule_count or 0}条，计划不完整。"
         )
     first = _node(report, 1)
     if now.time() >= time(9, 20) and first.get("status") not in {
@@ -300,7 +307,12 @@ def _issues(report: dict[str, Any], now: datetime) -> dict[str, str]:
     }:
         issues[f"FIRST_NODE_LATE:{report_date}"] = "第1号采集节点尚未结束。"
     closing = _node(report, 254)
-    if now.time() >= time(15, 5) and closing.get("status") != "SUCCESS":
+    closing_retry_cutoff = (
+        CLOSING_NODE_V3_RETRY_CUTOFF_TIME
+        if now.date() >= SCHEDULE_V3_EFFECTIVE_DATE
+        else CLOSING_NODE_RETRY_CUTOFF_TIME
+    )
+    if now.time() >= closing_retry_cutoff and closing.get("status") != "SUCCESS":
         issues[f"CLOSING_NODE_FAILED:{report_date}"] = (
             f"第254号收盘节点状态为{_status_text(closing.get('status'))}。"
         )
@@ -411,7 +423,7 @@ def monitor_once(
         body = (
             f"发生时间：{now:%Y-%m-%d %H:%M:%S}\n\n"
             + "\n".join(f"- {item}" for item in new_alerts)
-            + "\n\n系统仍会继续自动恢复；如恢复成功，将另发恢复邮件。"
+            + "\n\n系统将继续定时检查；如状态恢复，将另发恢复邮件。"
         )
         send(subject, body)
         sent.append(subject)

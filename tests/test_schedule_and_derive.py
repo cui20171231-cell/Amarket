@@ -115,6 +115,30 @@ def test_closing_auction_nodes_switch_to_second_08_without_rewriting_history():
     )
 
 
+def test_schedule_v3_removes_old_250_and_appends_1530_node():
+    previous = build_daily_schedule(date(2026, 9, 11))
+    current = build_daily_schedule(date(2026, 9, 14))
+
+    assert [
+        node.scheduled_time.timetz().replace(tzinfo=None)
+        for node in current[248:254]
+    ] == [
+        time(14, 56, 8),
+        time(14, 57, 8),
+        time(14, 58, 8),
+        time(14, 59, 8),
+        time(15, 0, 8),
+        time(15, 30, 8),
+    ]
+    assert current[248].scheduled_time == previous[248].scheduled_time.replace(
+        year=2026, month=9, day=14
+    )
+    assert [node.sequence_no for node in current[249:254]] == [250, 251, 252, 253, 254]
+    assert all(not node.limit_pools_applicable for node in current[249:253])
+    assert current[248].limit_pools_applicable
+    assert current[253].limit_pools_applicable
+
+
 def test_limit_pools_run_only_at_meaningful_nodes():
     nodes = build_daily_schedule(date(2026, 8, 27))
     applicable = [node.sequence_no for node in nodes if node.limit_pools_applicable]

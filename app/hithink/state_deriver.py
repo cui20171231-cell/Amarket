@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from time import perf_counter
 
 from app.hithink.derive import calculate
-from app.hithink.schedule import ScheduleNode
+from app.hithink.schedule import SCHEDULE_V3_EFFECTIVE_DATE, ScheduleNode
 from app.hithink.sector_pipeline import SectorPipeline
 from app.hithink.writer import ClickHouseWriter
 
@@ -47,7 +47,12 @@ class StateDeriver:
         if is_continuous:
             previous = self.writer.latest_derived_before(node)
         elif node.sequence_no == 254:
-            previous = self.writer.derived_for_successful_sequence(node, 250)
+            comparison_sequence = (
+                249 if node.trade_date >= SCHEDULE_V3_EFFECTIVE_DATE else 250
+            )
+            previous = self.writer.derived_for_successful_sequence(
+                node, comparison_sequence
+            )
         else:
             previous = {}
 

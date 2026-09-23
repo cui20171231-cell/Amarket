@@ -14,7 +14,12 @@ from app.hithink.api import HithinkApiError, HithinkClient
 from app.hithink.daily_pipeline import DailyPipeline
 from app.hithink.post_derivation import PostDerivationPipeline, PostDerivationResult
 from app.hithink.raw_collector import RawCollectionResult, RawCollector
-from app.hithink.schedule import SHANGHAI, ScheduleNode, build_daily_schedule
+from app.hithink.schedule import (
+    SCHEDULE_V3_EFFECTIVE_DATE,
+    SHANGHAI,
+    ScheduleNode,
+    build_daily_schedule,
+)
 from app.hithink.sector_mapping import SectorMappingSync
 from app.hithink.state_deriver import DerivationResult, StateDeriver
 from app.hithink.trading_day_gate import SharedTradingDayGate
@@ -25,6 +30,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ACTIVE_NODE_PATH = ROOT / ".runtime" / "hithink_snapshot_active_node.json"
 CLOSING_NODE_RETRY_SECONDS = 60
 CLOSING_NODE_RETRY_CUTOFF_TIME = time(16, 0)
+CLOSING_NODE_V3_RETRY_CUTOFF_TIME = time(15, 50, 8)
 COLLECTOR_PREPARE_TIME = time(8, 50)
 DAILY_COLLECTION_TIME = time(16, 0)
 DAILY_RETRY_DEADLINE_TIME = time(16, 15)
@@ -135,7 +141,7 @@ class CollectorRunner:
             raise RuntimeError("Closing baseline is only allowed for the current trading day")
         node = build_daily_schedule(trade_date)[-1]
         if datetime.now(SHANGHAI) < node.scheduled_time:
-            raise RuntimeError("Closing baseline is only allowed after the 15:00 planned node")
+            raise RuntimeError("Closing baseline is only allowed after the 15:30 planned node")
         if self.writer.statuses(trade_date).get(node.scheduled_time) == "SUCCESS":
             LOG.info("Closing baseline already exists collection_id=%s", node.collection_id)
             return
@@ -144,9 +150,14 @@ class CollectorRunner:
     def _run_closing_node_until_success(self, node: ScheduleNode) -> None:
         if node.sequence_no != 254:
             raise ValueError("Persistent closing execution is only valid for node 254")
+        retry_cutoff_time = (
+            CLOSING_NODE_V3_RETRY_CUTOFF_TIME
+            if node.trade_date >= SCHEDULE_V3_EFFECTIVE_DATE
+            else CLOSING_NODE_RETRY_CUTOFF_TIME
+        )
         retry_cutoff = datetime.combine(
             node.trade_date,
-            CLOSING_NODE_RETRY_CUTOFF_TIME,
+            retry_cutoff_time,
             tzinfo=SHANGHAI,
         )
         while True:
@@ -154,7 +165,7 @@ class CollectorRunner:
             if now >= retry_cutoff:
                 LOG.critical(
                     "CLOSING_NODE_RETRY_CUTOFF collection_id=%s cutoff=%s; "
-                    "stopping retries after the one-hour closing window",
+                    "stopping retries after the 20-minute closing window",
                     node.collection_id,
                     retry_cutoff,
                 )
@@ -441,10 +452,10 @@ class CollectorRunner:
                 "第一号节点尚未结束",
             ),
             (
-                time(15, 5),
-                "15:05",
+                time(15, 35),
+                "15:35",
                 lambda state: state.get("closing_node_status") == "SUCCESS",
-                "第254号节点尚未成功，程序将每分钟重试到16:00",
+                "第254号节点尚未成功，程序将每分钟重试到15:50:08",
             ),
             (
                 time(16, 5),

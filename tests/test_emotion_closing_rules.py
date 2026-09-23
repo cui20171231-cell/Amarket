@@ -260,6 +260,26 @@ def test_254_retry_stops_at_1600_after_one_hour(
     assert calls == []
 
 
+def test_v3_254_retry_stops_at_155008_after_twenty_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = build_daily_schedule(date(2026, 9, 14))[-1]
+    calls: list[str] = []
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 14, 15, 50, 8, tzinfo=tz)
+
+    monkeypatch.setattr(runner_module, "datetime", FixedDateTime)
+    runner = object.__new__(CollectorRunner)
+    runner.run_node = lambda current_node: calls.append(current_node.collection_id)
+
+    runner._run_closing_node_until_success(node)
+
+    assert calls == []
+
+
 def test_254_database_constraint_requires_own_collection_id() -> None:
     ddl = Path("sql/hithink_snapshot.sql").read_text(encoding="utf-8")
 

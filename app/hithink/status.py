@@ -18,7 +18,7 @@ from typing import Any
 
 from app.hithink.aggregation import TARGET_NODE_SEQUENCES
 from app.hithink.config import Settings
-from app.hithink.schedule import SHANGHAI, build_daily_schedule
+from app.hithink.schedule import SCHEDULE_V3_EFFECTIVE_DATE, SHANGHAI, build_daily_schedule
 from app.hithink.writer import ClickHouseWriter
 
 TASK_NAMES = (
@@ -322,8 +322,14 @@ def _query_progress(as_of: datetime) -> dict[str, Any]:
                      WHERE trade_date = {{trade_date:Date}}),
                     toUInt8(1)
                 ) AS is_trading_day,
-                count() AS due_node_count,
-                groupArray(tuple({tuple_expression})) AS nodes
+                count() AS schedule_count,
+                countIf(
+                    scheduled_time <= {{as_of:DateTime64(3, 'Asia/Shanghai')}}
+                ) AS due_node_count,
+                groupArrayIf(
+                    tuple({tuple_expression}),
+                    scheduled_time <= {{as_of:DateTime64(3, 'Asia/Shanghai')}}
+                ) AS nodes
             FROM
             (
                 SELECT {latest_columns}
@@ -332,14 +338,13 @@ def _query_progress(as_of: datetime) -> dict[str, Any]:
                 ORDER BY updated_at DESC
                 LIMIT 1 BY collection_id
             )
-            WHERE scheduled_time <= {{as_of:DateTime64(3, 'Asia/Shanghai')}}
             """,
             parameters={"trade_date": as_of.date(), "as_of": as_of},
             settings={"max_execution_time": 1},
         )
         server_elapsed_values.append(int(snapshot.summary.get("elapsed_ns", 0)))
         first = snapshot.result_rows[0]
-        nodes = [dict(zip(NODE_COLUMNS, row, strict=True)) for row in first[2]]
+        nodes = [dict(zip(NODE_COLUMNS, row, strict=True)) for row in first[3]]
         daily = writer.client.query(
             """
             SELECT task_name, status, request_start_time, request_end_time,
@@ -372,6 +377,8 @@ def _query_progress(as_of: datetime) -> dict[str, Any]:
         server_elapsed_values.append(int(sector.summary.get("elapsed_ns", 0)))
         return {
             "is_trading_day": bool(first[0]),
+            "schedule_count": int(first[1]),
+            "due_node_count": int(first[2]),
             "nodes": nodes,
             "daily": [dict(zip(daily.column_names, row, strict=True)) for row in daily.result_rows],
             "sector": [dict(zip(sector.column_names, row, strict=True)) for row in sector.result_rows],
@@ -479,7 +486,10 @@ def _count_states(
 
 def _pool_applicable(row: dict[str, Any]) -> bool:
     sequence = int(row.get("sequence_no") or 0)
-    return not (1 <= sequence <= 10 or 251 <= sequence <= 253)
+    scheduled = row.get("scheduled_time")
+    trade_date = scheduled.date() if isinstance(scheduled, datetime) else None
+    closing_auction_start = 250 if trade_date and trade_date >= SCHEDULE_V3_EFFECTIVE_DATE else 251
+    return not (1 <= sequence <= 10 or closing_auction_start <= sequence <= 253)
 
 
 def _next_schedule(as_of: datetime) -> datetime | None:

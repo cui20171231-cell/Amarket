@@ -159,6 +159,23 @@ def test_explicit_hyphenated_date_and_consistent_time_and_node(tmp_path: Path) -
     assert result["time_offset_seconds"] == 0
 
 
+def test_v3_19th_package_is_generated_for_new_node_254_time(tmp_path: Path) -> None:
+    root = tmp_path / "packages"
+    trade_date = date(2026, 9, 14)
+    _write_package(root, 254, trade_date=trade_date)
+
+    result = get_market_state_package(
+        target_time="15:30:08",
+        node_seq=254,
+        trade_date="2026-09-14",
+        package_root=root,
+    )
+
+    assert result["status"] == "OK"
+    assert result["actual_time"] == "15:30:08"
+    assert result["node_seq"] == 254
+
+
 def test_missing_time_returns_nearest_nodes_without_substitution(tmp_path: Path) -> None:
     root = tmp_path / "packages"
     _write_package(root, 57)

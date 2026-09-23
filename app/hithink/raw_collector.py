@@ -18,7 +18,7 @@ from app.hithink.api import (
     SectorIndexSnapshot,
 )
 from app.hithink.models import RawSnapshot
-from app.hithink.schedule import ScheduleNode
+from app.hithink.schedule import SCHEDULE_V3_EFFECTIVE_DATE, ScheduleNode
 from app.hithink.writer import ClickHouseWriter
 
 CLOSING_POOL_RETRY_SECONDS = 60
@@ -168,7 +168,11 @@ class RawCollector:
                     "deadline": deadline,
                     "rate_limit_deadline": rate_limit_deadline,
                 }
-                if node.sequence_no == 250 and node.scheduled_time.second == 53:
+                if (
+                    node.trade_date < SCHEDULE_V3_EFFECTIVE_DATE
+                    and node.sequence_no == 250
+                    and node.scheduled_time.second == 53
+                ):
                     request_options["allow_retries"] = False
 
                 def pause_between_submissions() -> None:

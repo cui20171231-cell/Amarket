@@ -43,7 +43,7 @@
 | `trade_date` | 文本或空 | 否 | `YYYY-MM-DD`或`YYYYMMDD`；不传时读取最近有效目录 |
 | `wait_for_ready` | 布尔值 | 否 | 默认false；true时在一次调用内等待正式JSON就绪 |
 | `retry_interval_seconds` | 整数 | 否 | 默认10，允许5至30秒 |
-| `max_wait_seconds` | 整数 | 否 | 默认120，允许1至300秒；15:00任务使用300 |
+| `max_wait_seconds` | 整数 | 否 | 默认120，允许1至300秒；15:30任务使用300 |
 
 `/ai 时间`、`/AI 时间`、指定盘中时间或恢复盘中状态时优先调用本工具，不先绕到自由SQL。
 
@@ -102,7 +102,7 @@ SELECT, WITH, SHOW, DESCRIBE, DESC, EXPLAIN, EXISTS
 所有成交指标只表示成交承载、关注度和份额，不表示真实净资金流入或流出。
 
 15分钟比较按同一上午或下午内最接近“目标时间减15分钟”和“目标时间减30分钟”的有效节点取值，
-允许计划节点存在15秒偏移，但不跨午休。11:30和15:00等节点因此仍能稳定返回比较值。
+允许计划节点存在秒级偏移，但不跨午休。11:30和15:30等节点因此仍能稳定返回比较值。
 
 ## 3. 本地标准输入输出入口
 
@@ -153,9 +153,9 @@ hithink-snapshot
 | `rederive-existing` | 根据已有原始快照重建派生结果 |
 | `migrate-collection-ids` | 为历史数据补齐固定采集编号 |
 | `closing-baseline` | 生成当前交易日的收盘基线 |
-| `raw-all-a-closing-snapshot` | 写入当前交易日 15:00 全 A 原始快照 |
-| `raw-sector-closing-snapshot` | 写入当前交易日 15:00 板块指数事实 |
-| `raw-limit-pools-closing-snapshot` | 写入当前交易日 15:00 三类池事实 |
+| `raw-all-a-closing-snapshot` | 写入当前交易日 15:30 全 A 原始快照 |
+| `raw-sector-closing-snapshot` | 写入当前交易日 15:30 板块指数事实 |
+| `raw-limit-pools-closing-snapshot` | 写入当前交易日 15:30 三类池事实 |
 
 数据变更类命令不得仅因“文档里有这个命令”就执行，仍需用户明确授权。
 

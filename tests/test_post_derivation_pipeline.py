@@ -91,6 +91,22 @@ def test_fixed_target_axis_contains_the_19_business_nodes() -> None:
     ]
 
 
+def test_v3_changes_only_the_19th_package_time_to_new_node_254() -> None:
+    sequences = sorted(TARGET_NODE_SEQUENCES)
+    previous = build_daily_schedule(date(2026, 9, 11))
+    current = build_daily_schedule(date(2026, 9, 14))
+
+    assert [
+        current[value - 1].scheduled_time.strftime("%H:%M:%S")
+        for value in sequences[:-1]
+    ] == [
+        previous[value - 1].scheduled_time.strftime("%H:%M:%S")
+        for value in sequences[:-1]
+    ]
+    assert sequences[-1] == 254
+    assert current[253].scheduled_time.strftime("%H:%M:%S") == "15:30:08"
+
+
 def test_post_derivatives_run_in_fixed_dependency_order() -> None:
     pipeline = RecordingPipeline(FakeWriter())
 

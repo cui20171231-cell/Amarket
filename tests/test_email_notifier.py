@@ -41,6 +41,8 @@ def _report(*, collector: str = "RUNNING", clickhouse: str = "HEALTHY") -> dict:
                 "status": "OK",
                 "data": {
                     "is_trading_day": True,
+                    "schedule_count": 254,
+                    "due_node_count": 254,
                     "nodes": nodes,
                     "daily": [
                         {"task_name": "sector_catalog_sync", "status": "SUCCESS"},
@@ -68,6 +70,51 @@ def test_infrastructure_issues_are_plain_and_bounded(monkeypatch) -> None:
     issues = _issues(_report(collector="STOPPED", clickhouse="UNHEALTHY"), now)
     assert "COLLECTOR_DOWN" in issues
     assert "CLICKHOUSE_DOWN" in issues
+
+
+def test_due_nodes_are_not_mistaken_for_an_incomplete_daily_plan() -> None:
+    report = _report()
+    progress = report["steps"][0]["data"]
+    progress["nodes"] = progress["nodes"][:5]
+    progress["due_node_count"] = 5
+
+    issues = _issues(
+        report,
+        datetime(2026, 9, 14, 9, 19, 45, tzinfo=SHANGHAI),
+    )
+
+    assert "PLAN_INCOMPLETE:2026-09-14" not in issues
+
+
+def test_closing_node_is_not_failed_before_its_retry_window_ends() -> None:
+    report = _report()
+    progress = report["steps"][0]["data"]
+    progress["nodes"] = progress["nodes"][:253]
+    progress["due_node_count"] = 253
+
+    before_cutoff = _issues(
+        report,
+        datetime(2026, 9, 14, 15, 49, 59, tzinfo=SHANGHAI),
+    )
+    after_cutoff = _issues(
+        report,
+        datetime(2026, 9, 14, 15, 50, 8, tzinfo=SHANGHAI),
+    )
+
+    assert "CLOSING_NODE_FAILED:2026-09-14" not in before_cutoff
+    assert "CLOSING_NODE_FAILED:2026-09-14" in after_cutoff
+
+
+def test_actual_incomplete_daily_plan_is_still_reported() -> None:
+    report = _report()
+    report["steps"][0]["data"]["schedule_count"] = 253
+
+    issues = _issues(
+        report,
+        datetime(2026, 9, 14, 9, 19, 45, tzinfo=SHANGHAI),
+    )
+
+    assert "PLAN_INCOMPLETE:2026-09-14" in issues
 
 
 def test_first_monitor_run_seeds_state_without_historical_email(tmp_path: Path) -> None:
@@ -126,6 +173,9 @@ def test_new_issue_alerts_after_two_checks_and_then_recovers(
         send=send,
     )
     assert any("[异常]" in subject for subject, _ in sent)
+    alert_body = next(body for subject, body in sent if "[异常]" in subject)
+    assert "系统将继续定时检查" in alert_body
+    assert "系统仍会继续自动恢复" not in alert_body
     monitor_once(
         now=first.replace(minute=15), report=_report(), state_path=state_path, send=send
     )

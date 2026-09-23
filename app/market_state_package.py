@@ -73,6 +73,8 @@ MARKET_INTRADAY_FIELDS = (
     "limit_up_count",
     "up_5_to_limit_count",
     "up_1_to_5_count",
+    "up_0_to_1_count",
+    "down_0_to_1_count",
     "down_1_to_5_count",
     "down_5_to_limit_count",
     "limit_down_count",
@@ -337,11 +339,11 @@ def _business_period(target: datetime) -> tuple[str, datetime, datetime]:
             datetime.combine(target.date(), time(9, 25), SHANGHAI),
             datetime.combine(target.date(), time(11, 30, 59), SHANGHAI),
         )
-    if time(13, 0) <= value <= time(15, 0):
+    if time(13, 0) <= value <= time(15, 30, 8):
         return (
             "PM",
             datetime.combine(target.date(), time(13, 0), SHANGHAI),
-            datetime.combine(target.date(), time(15, 0), SHANGHAI),
+            datetime.combine(target.date(), time(15, 30, 8), SHANGHAI),
         )
     return (
         "OUTSIDE",
@@ -2085,7 +2087,7 @@ class MarketStatePackageBuilder:
 
 def build_market_state_package(
     trade_date: str | None = None,
-    target_time: str = "15:00",
+    target_time: str = "15:30:08",
     capital_top_n: int = 10,
     sector_top_n: int = 10,
     stock_top_n: int = 20,
@@ -2115,7 +2117,7 @@ def build_market_state_package(
 def main() -> int:
     parser = argparse.ArgumentParser(description="生成只读市场状态恢复聚合包")
     parser.add_argument("--trade-date", default=None, help="YYYY-MM-DD，默认最近可用交易日")
-    parser.add_argument("--target-time", default="15:00", help="HH:MM或HH:MM:SS")
+    parser.add_argument("--target-time", default="15:30:08", help="HH:MM或HH:MM:SS")
     parser.add_argument("--capital-top-n", type=int, default=10)
     parser.add_argument("--sector-top-n", type=int, default=10)
     parser.add_argument("--stock-top-n", type=int, default=20)
